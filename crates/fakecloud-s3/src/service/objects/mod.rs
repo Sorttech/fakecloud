@@ -106,6 +106,153 @@ pub(crate) fn replace_null_version(
     versions.push(obj.clone());
 }
 
+/// Commit `obj` as the newest version of its key in `b` (the bucket named
+/// `bucket`), following the
+/// bucket's versioning state the way every S3 write does:
+///
+/// - Enabled: the object gets a version id (the caller's, when it already
+///   assigned a real one, otherwise a fresh one), a pre-versioning object at
+///   the key is preserved as the `"null"` version, and the new version is
+///   appended to the history.
+/// - Suspended: the object takes over the `"null"` version, replacing
+///   whatever held it (an older null object or a null delete marker).
+/// - Never enabled: the object replaces the current one and carries no id.
+///
+/// An object with no explicit retention of its own gets the bucket's default
+/// retention, measured from the commit.
+///
+/// The body is written through `store` (when one is configured) before the
+/// new version is recorded in memory, so a failed write returns the error and
+/// records no new version. A pre-versioning object relabelled as the null
+/// version stays relabelled (disk already says so). With no store, `obj.body`
+/// must already hold the payload. A caller-supplied id naming a version
+/// already in the history rewrites that version in place; it becomes the
+/// current object only if it is the newest.
+///
+/// Returns the version id to report to the writer: the new id on a
+/// versioning-enabled bucket, `None` otherwise.
+pub(crate) fn commit_object_version(
+    b: &mut crate::state::S3Bucket,
+    bucket: &str,
+    store: Option<&dyn fakecloud_persistence::S3Store>,
+    obj: S3Object,
+    body: BodySource,
+) -> fakecloud_persistence::StoreResult<Option<String>> {
+    commit_object_version_with(b, bucket, store, obj, |store, obj, meta| {
+        store.put_object(bucket, &obj.key, meta.version_id.as_deref(), body, meta)
+    })
+}
+
+/// [`commit_object_version`] with the body write supplied by the caller:
+/// `write_body` persists the new version's body (given the store, the object
+/// as it will be recorded and its metadata, carrying its final version id) and
+/// returns the body ref to keep in memory. CompleteMultipartUpload uses it to assemble
+/// the parts in the store instead of writing the object a second time.
+pub(crate) fn commit_object_version_with<F>(
+    b: &mut crate::state::S3Bucket,
+    bucket: &str,
+    store: Option<&dyn fakecloud_persistence::S3Store>,
+    mut obj: S3Object,
+    write_body: F,
+) -> fakecloud_persistence::StoreResult<Option<String>>
+where
+    F: FnOnce(
+        &dyn fakecloud_persistence::S3Store,
+        &S3Object,
+        &fakecloud_persistence::ObjectMeta,
+    ) -> fakecloud_persistence::StoreResult<fakecloud_persistence::BodyRef>,
+{
+    let key = obj.key.clone();
+    let versioning_enabled = b.versioning.as_deref() == Some("Enabled");
+    let versioning_suspended = b.versioning.as_deref() == Some("Suspended");
+
+    // The history position of an existing version the caller named again (a
+    // replica of a source version that was already replicated). Only a
+    // caller-supplied id can already be there; a freshly minted one cannot.
+    let mut existing_position = None;
+    if versioning_enabled {
+        if obj.version_id.as_deref().is_none_or(|v| v == "null") {
+            obj.version_id = Some(Uuid::new_v4().to_string());
+        } else if let Some(versions) = b.object_versions.get(&key) {
+            existing_position = versions.iter().position(|o| o.version_id == obj.version_id);
+            // Rewriting a version keeps its place in the history, which the
+            // loader rebuilds from LastModified.
+            if let Some(pos) = existing_position {
+                obj.last_modified = versions[pos].last_modified;
+            }
+        }
+        // The current object becomes the "null" version once a real version
+        // is stacked on top of it. Persist the rewritten sidecar BEFORE
+        // recording it in memory, so a failed write cannot leave a version in
+        // the history that disk lacks; once it is persisted, record it at
+        // once. It only relabels the object already there, so it is right
+        // whether or not the body write below succeeds, and memory keeps
+        // agreeing with disk if that write fails.
+        if let Some(preserved) = null_version_to_preserve(b, &key) {
+            if let Some(store) = store {
+                let preserved_meta = object_meta_snapshot(&preserved);
+                run_blocking_io(|| {
+                    store.put_object_meta(bucket, &key, Some("null"), &preserved_meta)
+                })?;
+            }
+            record_preserved_null(b, &key, preserved);
+        }
+    } else if versioning_suspended {
+        // Tagging it "null" also keeps the disk sidecar in the versioned set,
+        // so a restart-loaded bucket agrees with the live one about which
+        // object is current.
+        obj.version_id = Some("null".to_string());
+    } else {
+        obj.version_id = None;
+    }
+
+    // The one place a new version falls back to the bucket's default
+    // retention: an object that carries no explicit retention (request
+    // headers, or a replica's source lock) gets the default, measured from
+    // now, the moment the version is committed.
+    let lock = crate::state::ObjectLockSettings {
+        mode: obj.lock_mode.take(),
+        retain_until: obj.lock_retain_until.take(),
+        legal_hold: obj.lock_legal_hold.take(),
+    }
+    .or_bucket_default(b.object_lock_config.as_deref(), Utc::now());
+    obj.lock_mode = lock.mode;
+    obj.lock_retain_until = lock.retain_until;
+    obj.lock_legal_hold = lock.legal_hold;
+
+    if let Some(store) = store {
+        let meta = object_meta_snapshot(&obj);
+        obj.body = run_blocking_io(|| write_body(store, &obj, &meta))?;
+    }
+
+    // The body is persisted: only now record the new version in memory, so a
+    // failed write leaves no version in memory that disk lacks.
+    let mut becomes_current = true;
+    if versioning_enabled {
+        let versions = b.object_versions.entry(key.clone()).or_default();
+        match existing_position {
+            // A version written again keeps its place; it is the current
+            // object only if it is still the newest.
+            Some(pos) => {
+                becomes_current = pos + 1 == versions.len();
+                versions[pos] = obj.clone();
+            }
+            None => versions.push(obj.clone()),
+        }
+    } else if versioning_suspended {
+        replace_null_version(b, &key, &obj);
+    }
+    let reported = if versioning_enabled {
+        obj.version_id.clone()
+    } else {
+        None
+    };
+    if becomes_current {
+        b.objects.insert(key, obj);
+    }
+    Ok(reported)
+}
+
 /// Run a blocking closure (synchronous disk IO) without starving the async
 /// runtime. On a multi-threaded tokio runtime this uses `block_in_place` so
 /// the worker hands its other tasks to a sibling thread for the duration of

@@ -8,8 +8,13 @@
 //! the same `ValidationException` real AWS would return, instead of slipping
 //! through to the canned handlers.
 
+use std::collections::BTreeMap;
+use std::sync::OnceLock;
+
 use fakecloud_core::service::{AwsRequest, AwsServiceError};
 use http::StatusCode;
+use regex::Regex;
+use serde_json::Value;
 
 /// `@length: min=1 max=2048` on `InvokeModelIdentifier` / `ConversationalModelId`
 /// (used by InvokeModel, InvokeModelWithResponseStream,
@@ -161,4 +166,110 @@ pub(crate) fn validate_invoke_body_size(body: &[u8]) -> Result<(), AwsServiceErr
 /// by every runtime operation we care about here.
 pub(crate) fn validation<S: Into<String>>(message: S) -> AwsServiceError {
     AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "ValidationException", message)
+}
+
+/// Validated `requestMetadata` key-value pairs, recorded on the invocation.
+pub(crate) type RequestMetadata = BTreeMap<String, String>;
+
+/// Header carrying InvokeModel's `requestMetadata` (`RequestMetadataJson`).
+pub(crate) const REQUEST_METADATA_HEADER: &str = "x-amzn-bedrock-request-metadata";
+
+/// `@pattern` shared by the `RequestMetadata` map's key and value members.
+/// Inside the class, `,-.` is the range `,`..`.` (`,`, `-`, `.`), exactly as
+/// the Smithy model spells it.
+fn request_metadata_entry_regex(min: u32) -> &'static Regex {
+    static KEY: OnceLock<Regex> = OnceLock::new();
+    static VALUE: OnceLock<Regex> = OnceLock::new();
+    let (cell, pat) = if min == 1 {
+        (&KEY, r"^[a-zA-Z0-9\s:_@$#=/+,-.]{1,256}$")
+    } else {
+        (&VALUE, r"^[a-zA-Z0-9\s:_@$#=/+,-.]{0,256}$")
+    };
+    cell.get_or_init(|| Regex::new(pat).expect("static requestMetadata pattern"))
+}
+
+/// Validate a `RequestMetadata` map (`@length(1, 16)`; keys `@length(1, 256)`,
+/// values `@length(0, 256)`, both constrained by the model's `@pattern`) and
+/// return its pairs. The values are `@sensitive`, so messages never echo them.
+pub(crate) fn validate_request_metadata_map(
+    field: &str,
+    value: &Value,
+) -> Result<RequestMetadata, AwsServiceError> {
+    let Value::Object(map) = value else {
+        return Err(validation(format!(
+            "Value at '{field}' failed to satisfy constraint: Member must be a map of string keys to string values"
+        )));
+    };
+    if map.is_empty() {
+        return Err(validation(format!(
+            "Value at '{field}' failed to satisfy constraint: Member must have length greater than or equal to 1"
+        )));
+    }
+    if map.len() > 16 {
+        return Err(validation(format!(
+            "Value at '{field}' failed to satisfy constraint: Member must have length less than or equal to 16"
+        )));
+    }
+    let mut out = RequestMetadata::new();
+    for (key, v) in map {
+        let key_len = key.chars().count();
+        if key_len == 0 || key_len > 256 {
+            return Err(validation(format!(
+                "Value at '{field}' failed to satisfy constraint: Map keys must have length between 1 and 256"
+            )));
+        }
+        if !request_metadata_entry_regex(1).is_match(key) {
+            return Err(validation(format!(
+                "Value at '{field}' failed to satisfy constraint: Map keys must satisfy regular expression pattern: ^[a-zA-Z0-9\\s:_@$#=/+,-.]{{1,256}}$"
+            )));
+        }
+        let Value::String(v) = v else {
+            return Err(validation(format!(
+                "Value at '{field}.{key}' failed to satisfy constraint: Member must be a string"
+            )));
+        };
+        if v.chars().count() > 256 {
+            return Err(validation(format!(
+                "Value at '{field}.{key}' failed to satisfy constraint: Member must have length less than or equal to 256"
+            )));
+        }
+        if !request_metadata_entry_regex(0).is_match(v) {
+            return Err(validation(format!(
+                "Value at '{field}.{key}' failed to satisfy constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9\\s:_@$#=/+,-.]{{0,256}}$"
+            )));
+        }
+        out.insert(key.clone(), v.clone());
+    }
+    Ok(out)
+}
+
+/// Validate and parse InvokeModel's `X-Amzn-Bedrock-Request-Metadata` header:
+/// `RequestMetadataJson` `@length(max: 8500)`, carrying a JSON object of the
+/// same key-value pairs the Converse `requestMetadata` map holds. The length
+/// is measured on the raw header bytes (lossily decoded), so a header with
+/// non-ASCII bytes is still bounded rather than skipped.
+pub(crate) fn request_metadata_header(
+    req: &AwsRequest,
+) -> Result<Option<RequestMetadata>, AwsServiceError> {
+    let Some(raw) = req.headers.get(REQUEST_METADATA_HEADER) else {
+        return Ok(None);
+    };
+    let text = String::from_utf8_lossy(raw.as_bytes());
+    validate_length("requestMetadata", &text, 0, 8500)?;
+    let parsed: Value = serde_json::from_str(&text).map_err(|_| {
+        validation(
+            "Value at 'requestMetadata' failed to satisfy constraint: Member must be a JSON object of string keys to string values",
+        )
+    })?;
+    validate_request_metadata_map("requestMetadata", &parsed).map(Some)
+}
+
+/// Validate Converse / ConverseStream's optional `requestMetadata` body map.
+pub(crate) fn request_metadata_body(
+    body: &Value,
+) -> Result<Option<RequestMetadata>, AwsServiceError> {
+    match body.get("requestMetadata") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => validate_request_metadata_map("requestMetadata", v).map(Some),
+    }
 }

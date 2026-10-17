@@ -9,7 +9,7 @@ use fakecloud_aws::xml::xml_escape;
 use fakecloud_core::query::{optional_query_param, query_response_xml, required_query_param};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
-use fakecloud_s3::{memory_body, S3Object, SharedS3State};
+use fakecloud_s3::SharedS3State;
 
 use crate::runtime::ElastiCacheRuntime;
 use crate::state::{
@@ -190,6 +190,9 @@ pub struct ElastiCacheService {
     /// exported artifact into the target bucket, matching AWS. `None` in
     /// unit tests / when S3 isn't wired.
     s3: Option<SharedS3State>,
+    /// Durable S3 store, so an exported artifact is written through to disk
+    /// and survives a restart. `None` in memory mode / unit tests.
+    s3_store: Option<Arc<dyn fakecloud_persistence::S3Store>>,
     /// Durable data directory (the `<data-path>/elasticache` root) under which
     /// snapshot RDB artifacts are written so they survive a restart. `None` in
     /// memory mode / unit tests, where the RDB falls back to the platform temp
@@ -218,6 +221,7 @@ impl ElastiCacheService {
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
             s3: None,
+            s3_store: None,
             data_dir: None,
             ec2_state: None,
         }
@@ -246,6 +250,13 @@ impl ElastiCacheService {
 
     pub fn with_s3(mut self, s3: SharedS3State) -> Self {
         self.s3 = Some(s3);
+        self
+    }
+
+    /// Wire the durable S3 store so exported artifacts persist across a
+    /// restart, like any other object written to a bucket.
+    pub fn with_s3_store(mut self, store: Arc<dyn fakecloud_persistence::S3Store>) -> Self {
+        self.s3_store = Some(store);
         self
     }
 

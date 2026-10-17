@@ -98,7 +98,7 @@ impl LambdaService {
             "DeleteAlias" => self.delete_alias(res, req),
 
             // Layers
-            "PublishLayerVersion" => self.publish_layer_version(res, req),
+            "PublishLayerVersion" => self.publish_layer_version(req),
             "GetLayerVersion" => self.get_layer_version(req),
             "GetLayerVersionByArn" => self.get_layer_version_by_arn(req),
             "ListLayers" => {
@@ -107,20 +107,7 @@ impl LambdaService {
             }
             "ListLayerVersions" => {
                 validate_layer_filters(req)?;
-                if res.is_empty() {
-                    return Err(missing("LayerName"));
-                }
-                // Smithy `LayerName.length 1..140`; ARN form is longer
-                // (~200) but the probe drives the bare-name path.
-                let limit = if res.starts_with("arn:") { 200 } else { 140 };
-                if res.chars().count() > limit {
-                    return Err(AwsServiceError::aws_error(
-                        StatusCode::BAD_REQUEST,
-                        "InvalidParameterValueException",
-                        "LayerName exceeds the 140-character maximum",
-                    ));
-                }
-                self.list_layer_versions(res, aid, req)
+                self.list_layer_versions(aid, req)
             }
             "DeleteLayerVersion" => self.delete_layer_version(req),
             "GetLayerVersionPolicy" => self.get_layer_version_policy(req),

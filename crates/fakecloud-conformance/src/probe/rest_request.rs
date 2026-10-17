@@ -601,10 +601,12 @@ pub(super) fn rest_request_config(
                 None,
             ),
             "CopyObject" => (reqwest::Method::PUT, format!("/{}/{}", BUCKET, KEY), None),
-            // Object annotations. `AnnotationName` is an `@httpQuery` member,
-            // so `append_http_query_from_model` supplies it from the variant —
-            // which is also what separates GetObjectAnnotation (name present)
-            // from ListObjectAnnotations (name absent) on the shared URI.
+            // Object annotations. `AnnotationName` is bound to the
+            // `annotationName` query key (`@httpQuery`), so
+            // `append_http_query_from_model` supplies it from the variant under
+            // that wire key — which is also what separates GetObjectAnnotation
+            // (`annotationName` present) from ListObjectAnnotations (absent) on
+            // the shared URI.
             "PutObjectAnnotation" => (
                 reqwest::Method::PUT,
                 format!("/{}/{}", BUCKET, KEY),
@@ -824,7 +826,17 @@ pub(super) fn legacy_substitute_identifiers(
     };
     for (placeholder, member) in subs {
         match obj.get(*member) {
-            Some(serde_json::Value::String(value)) => {
+            // For Lambda an empty string is handled like an omitted label
+            // below: no Smithy client serializes an empty `@httpLabel`
+            // (smithy-rs fails the build with "cannot be empty or unset"), and
+            // substituting "" collapses the segment into another operation's
+            // URL -- `GET /2015-03-31/functions/` is ListFunctions (#1645), not
+            // GetFunction with a too-short name. S3 keeps the literal empty
+            // value: its sentinel is a well-formed object key, so an empty
+            // `Key` must not become a request for a real key.
+            Some(serde_json::Value::String(value))
+                if !value.is_empty() || service_name != "lambda" =>
+            {
                 // The legacy path is unencoded; the variant value may be raw
                 // ARN or already URL-encoded. Trust the variant — the
                 // id_forms strategy decides whether to URL-encode.
@@ -835,11 +847,12 @@ pub(super) fn legacy_substitute_identifiers(
                 // need to be stringified before the path substitution.
                 out = out.replace(placeholder, &value.to_string());
             }
-            None => {
+            None | Some(serde_json::Value::String(_)) => {
                 // The variant omitted this httpLabel member entirely
-                // (e.g. `negative_omit_FunctionName`). Real AWS would
-                // never see such a request — the SDK refuses to build
-                // one — but synthetic probes can. Substitute a
+                // (e.g. `negative_omit_FunctionName`) or, for Lambda, set it
+                // to "". Real
+                // AWS would never see such a request — the SDK refuses to
+                // build one — but synthetic probes can. Substitute a
                 // clearly-invalid sentinel for S3 so a path like
                 // `GET /{Bucket}?prefix=...` doesn't collapse to `/` and
                 // hit ListBuckets (a 200 happy-path response). Uppercase
@@ -855,16 +868,31 @@ pub(super) fn legacy_substitute_identifiers(
                 // the expected 4xx. Other services keep the empty-string
                 // collapse — their dispatchers reject empty path labels
                 // cleanly.
-                let sentinel = match service_name {
-                    "s3" | "lambda" => "INVALID_OMITTED_LABEL",
-                    _ => "",
-                };
-                out = out.replace(placeholder, sentinel);
+                out = out.replace(placeholder, omitted_label_sentinel(service_name, member));
             }
             _ => {}
         }
     }
     out
+}
+
+/// The value the legacy Lambda/S3 paths carry for an omitted (or empty)
+/// `@httpLabel`. It must target the operation's own route and make real AWS
+/// answer with a client error.
+///
+/// For most labels a well-formed name that does not exist does that
+/// (`GetFunction` -> ResourceNotFoundException). Lambda layer operations are
+/// different: `PublishLayerVersion` creates the layer and `DeleteLayerVersion`
+/// is idempotent, so no well-formed `LayerName` is an error there. Their
+/// sentinel instead violates the `LayerName` `@pattern`
+/// (`[a-zA-Z0-9-_]+` or a layer ARN), which Lambda rejects with
+/// InvalidParameterValueException before looking anything up.
+pub(super) fn omitted_label_sentinel(service_name: &str, member: &str) -> &'static str {
+    match (service_name, member) {
+        ("lambda", "LayerName") => "INVALID!OMITTED!LABEL",
+        ("s3" | "lambda", _) => "INVALID_OMITTED_LABEL",
+        _ => "",
+    }
 }
 
 /// Build an HTTP request for an operation from the `@http` / `@httpLabel` /
@@ -1022,7 +1050,17 @@ pub(super) fn substitute_uri_labels(
                 } else {
                     (inner, false)
                 };
+                // An empty-string label is unsendable: Smithy clients refuse to
+                // serialize an empty `@httpLabel` (smithy-rs fails the build
+                // with "cannot be empty or unset"), and the URL it would
+                // produce collapses the segment -- `GET /queryloggingconfig/{Id}`
+                // with `Id = ""` is byte-for-byte the trailing-slash form of
+                // `GET /queryloggingconfig` (ListQueryLoggingConfigs), which
+                // real AWS answers as the List op (#1645). Serialize it like an
+                // omitted label instead, so the variant still sends a request
+                // that targets this operation and is judged on the response.
                 let raw = labels.get(name).and_then(|v| match v {
+                    serde_json::Value::String(s) if s.is_empty() => None,
                     serde_json::Value::String(s) => Some(s.clone()),
                     serde_json::Value::Number(n) => Some(n.to_string()),
                     serde_json::Value::Bool(b) => Some(b.to_string()),

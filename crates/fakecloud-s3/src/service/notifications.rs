@@ -340,73 +340,39 @@ pub(crate) fn replicate_through_store(
             failed = true;
             continue;
         };
-        let dest_versioning_enabled;
-        let (dest_version_id, dest_meta) = {
-            let Some(dest_bucket) = dest_state.buckets.get_mut(&dest_bucket_name) else {
-                continue;
-            };
-            dest_versioning_enabled = dest_bucket.versioning.as_deref() == Some("Enabled");
-            let mut replica = src_obj.clone();
-            replica.storage_class = "STANDARD".to_string();
-            replica.replication_status = Some("REPLICA".to_string());
-            translate_replica_owner(&mut replica, dest_bucket, rule.owner_override);
-            // Seed the runtime replica body from whatever we have handy; it
-            // is overwritten after `put_object` returns the canonical ref.
-            let seed_body = match (&src_disk_path, &src_bytes_opt) {
-                (Some(_), _) => src_obj.body.clone(),
-                (None, Some(b)) => crate::state::memory_body(b.clone()),
-                (None, None) => src_obj.body.clone(),
-            };
-            if dest_versioning_enabled {
-                let vid = uuid::Uuid::new_v4().to_string();
-                replica.version_id = Some(vid.clone());
-                replica.body = seed_body;
-                dest_bucket
-                    .object_versions
-                    .entry(key.to_string())
-                    .or_default()
-                    .push(replica.clone());
-                dest_bucket.objects.insert(key.to_string(), replica.clone());
-                (
-                    Some(vid),
-                    crate::persistence::object_meta_snapshot(&replica),
-                )
-            } else {
-                replica.version_id = None;
-                replica.body = seed_body;
-                dest_bucket.objects.insert(key.to_string(), replica.clone());
-                (None, crate::persistence::object_meta_snapshot(&replica))
-            }
+        let Some(dest_bucket) = dest_state.buckets.get_mut(&dest_bucket_name) else {
+            continue;
         };
-
+        let mut replica = src_obj.clone();
+        replica.storage_class = "STANDARD".to_string();
+        replica.replication_status = Some("REPLICA".to_string());
+        translate_replica_owner(&mut replica, dest_bucket, rule.owner_override);
+        // The replica keeps the source version's id, as S3 replication does;
+        // the destination's own versioning state still decides how it is
+        // recorded (a source without a real id gets a fresh one on an enabled
+        // destination). It keeps the source version's lock; a source version
+        // that carries none takes the destination's default retention at
+        // commit. The replica is created now, in the destination: its
+        // LastModified (which also orders versions on reload) is the commit
+        // time, not the source's.
+        replica.last_modified = chrono::Utc::now();
+        replica.body = match (&src_disk_path, &src_bytes_opt) {
+            (Some(_), _) => src_obj.body.clone(),
+            (None, Some(b)) => crate::state::memory_body(b.clone()),
+            (None, None) => src_obj.body.clone(),
+        };
         let body_source = match (&src_disk_path, &src_bytes_opt) {
             (Some(path), _) => fakecloud_persistence::BodySource::FileCopy(path.clone()),
             (None, Some(b)) => fakecloud_persistence::BodySource::Bytes(b.clone()),
             (None, None) => fakecloud_persistence::BodySource::Bytes(bytes::Bytes::new()),
         };
-        let returned = store.put_object(
+        crate::service::commit_object_version(
+            dest_bucket,
             &dest_bucket_name,
-            key,
-            dest_version_id.as_deref(),
+            Some(store.as_ref()),
+            replica,
             body_source,
-            &dest_meta,
         )?;
-        if let Some(dest_bucket) = dest_state.buckets.get_mut(&dest_bucket_name) {
-            if let Some(o) = dest_bucket.objects.get_mut(key) {
-                o.body = returned.clone();
-            }
-            // Only rewrite the version-history entry when the destination
-            // bucket actually has versioning enabled. For Suspended or
-            // unversioned buckets the replica was only stored as the current
-            // object; rewriting stale history would corrupt it.
-            if dest_versioning_enabled {
-                if let Some(versions) = dest_bucket.object_versions.get_mut(key) {
-                    if let Some(last) = versions.last_mut() {
-                        last.body = returned;
-                    }
-                }
-            }
-        }
     }
     if applied {
         let status = if failed { "FAILED" } else { "COMPLETED" };

@@ -51,8 +51,25 @@ jobs:
 
       - name: Pre-pull images into the cluster
         run: |
+          # Docker Hub library images (bare names and their ECR Public copies
+          # under docker/library) come from Google's Docker Hub mirror first:
+          # anonymous ECR Public pulls hit "toomanyrequests: Data limit
+          # exceeded" under load, and Docker Hub rate-limits too. The mirror
+          # copy is tagged with the name the tests ask for; the original
+          # registry is the fallback.
+          mirror_for() {
+            case "$1" in
+              public.ecr.aws/docker/library/*) echo "mirror.gcr.io/library/${1#public.ecr.aws/docker/library/}" ;;
+              */*) ;;
+              *) echo "mirror.gcr.io/library/$1" ;;
+            esac
+          }
           pull() {
             for i in 1 2 3; do
+              src=$(mirror_for "$1")
+              if [ -n "$src" ] && docker pull -q "$src" && docker tag "$src" "$1"; then
+                return 0
+              fi
               docker pull "$1" && return 0
               echo "docker pull $1 attempt $i failed; retrying"; sleep $((i * 5))
             done

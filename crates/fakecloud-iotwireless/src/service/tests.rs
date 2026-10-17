@@ -1596,3 +1596,45 @@ fn inline_tags_migrate_into_tag_store() {
         .get("Tags")
         .is_none());
 }
+
+#[test]
+fn list_wireless_devices_projects_nested_list_shapes() {
+    // The list element's LoRaWAN is `LoRaWANListDevice` (DevEui only), not
+    // the full create-time `LoRaWANDevice`; Get still returns the full shape.
+    let s = svc();
+    let created = body_of(
+        &run(
+            &s,
+            "POST",
+            "/wireless-devices",
+            &[],
+            json!({
+                "Type": "LoRaWAN",
+                "Name": "dev1",
+                "DestinationName": "dest",
+                "LoRaWAN": {
+                    "DevEui": "ac1f09fffe000001",
+                    "DeviceProfileId": "dp-1",
+                    "ServiceProfileId": "sp-1",
+                    "OtaaV1_1": {"AppKey": "k", "NwkKey": "n", "JoinEui": "j"}
+                }
+            }),
+        )
+        .unwrap(),
+    );
+    let id = created["Id"].as_str().unwrap().to_string();
+    let listed = body_of(&run(&s, "GET", "/wireless-devices", &[], Value::Null).unwrap());
+    let dev = &listed["WirelessDeviceList"][0];
+    assert_eq!(dev["LoRaWAN"], json!({"DevEui": "ac1f09fffe000001"}));
+    let got = body_of(
+        &run(
+            &s,
+            "GET",
+            &format!("/wireless-devices/{id}?identifierType=WirelessDeviceId"),
+            &[],
+            Value::Null,
+        )
+        .unwrap(),
+    );
+    assert_eq!(got["LoRaWAN"]["DeviceProfileId"], "dp-1");
+}

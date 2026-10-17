@@ -993,6 +993,38 @@ fn lorawan_field<'a>(rec: &'a Value, field: &str) -> Option<&'a str> {
         .and_then(Value::as_str)
 }
 
+/// Members of `LoRaWANListDevice`: the list view of a LoRaWAN device carries
+/// only its DevEui, not the activation/profile settings `GetWirelessDevice`
+/// returns.
+const LORAWAN_LIST_DEVICE_MEMBERS: &[&str] = &["DevEui"];
+/// Members of `SidewalkListDevice`.
+const SIDEWALK_LIST_DEVICE_MEMBERS: &[&str] = &[
+    "AmazonId",
+    "SidewalkId",
+    "SidewalkManufacturingSn",
+    "DeviceCertificates",
+    "DeviceProfileId",
+    "Status",
+    "Positioning",
+];
+
+/// Narrow a stored device's nested `LoRaWAN` / `Sidewalk` structures to the
+/// `WirelessDeviceStatistics` list shapes. The stored record keeps the full
+/// create-time structures, which the list view does not expose.
+fn project_list_device(mut element: Value) -> Value {
+    if let Some(obj) = element.as_object_mut() {
+        for (key, members) in [
+            ("LoRaWAN", LORAWAN_LIST_DEVICE_MEMBERS),
+            ("Sidewalk", SIDEWALK_LIST_DEVICE_MEMBERS),
+        ] {
+            if let Some(Value::Object(inner)) = obj.get_mut(key) {
+                inner.retain(|k, _| members.contains(&k.as_str()));
+            }
+        }
+    }
+    element
+}
+
 /// `ListWirelessDevices` with the modelled query filters applied. The generic
 /// engine ignores them, which hides the membership edges that
 /// `AssociateWirelessDeviceWithMulticastGroup` / `WithFuotaTask` persist and
@@ -1062,7 +1094,7 @@ fn list_wireless_devices(
             }
             true
         })
-        .map(|(_, rec)| build_element(meta, &rec))
+        .map(|(_, rec)| project_list_device(build_element(meta, &rec)))
         .collect();
 
     let page_size = query_get(query, "maxResults")

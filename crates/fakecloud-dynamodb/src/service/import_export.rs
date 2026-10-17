@@ -168,8 +168,9 @@ fn open_source_objects(
     Ok(out)
 }
 
-/// Write one object into a bucket: through the durable store first (no S3
-/// lock held), then a short write guard to insert it into the bucket.
+/// Write one export object into a bucket. It is an ordinary new object
+/// version there: the bucket's versioning and default retention apply as for
+/// PutObject, and it is written through the durable store when one exists.
 fn put_s3_object(
     ctx: &JobContext,
     account: &str,
@@ -181,44 +182,23 @@ fn put_s3_object(
     let Some(s3) = &ctx.s3_state else {
         return Ok(());
     };
-    let bytes = bytes::Bytes::from(body);
-    let mut obj = fakecloud_s3::S3Object {
-        key: key.to_string(),
-        body: fakecloud_s3::memory_body(bytes.clone()),
-        content_type: content_type.to_string(),
-        etag: format!("{:x}", Md5::digest(&bytes)),
-        size: bytes.len() as u64,
-        last_modified: Utc::now(),
-        storage_class: "STANDARD".to_string(),
-        ..Default::default()
-    };
-    if let Some(store) = &ctx.s3_store {
-        let meta = fakecloud_s3::persistence::object_meta_snapshot(&obj);
-        obj.body = store
-            .put_object(
-                bucket,
-                key,
-                None,
-                fakecloud_persistence::BodySource::Bytes(bytes),
-                &meta,
-            )
-            .map_err(|e| SourceError::Read(format!("failed to write s3://{bucket}/{key}: {e}")))?;
-    }
-    let mut guard = s3.write();
-    let Some(b) = guard
-        .get_mut(account)
-        .and_then(|a| a.buckets.get_mut(bucket))
-    else {
-        // The bucket was deleted between our check and this write. Drop the
-        // durable copy too so no orphan is left on disk.
-        drop(guard);
-        if let Some(store) = &ctx.s3_store {
-            let _ = store.delete_object(bucket, key, None);
+    fakecloud_s3::delivery::put_object_via_store(
+        s3,
+        ctx.s3_store.as_deref(),
+        account,
+        bucket,
+        key,
+        body,
+        Some(content_type),
+    )
+    .map_err(|msg| {
+        // The bucket may have been deleted since the export started.
+        if bucket_exists(ctx, account, bucket) {
+            SourceError::Read(msg)
+        } else {
+            SourceError::NoSuchBucket
         }
-        return Err(SourceError::NoSuchBucket);
-    };
-    b.objects.insert(key.to_string(), obj);
-    Ok(())
+    })
 }
 
 fn bucket_exists(ctx: &JobContext, account: &str, bucket: &str) -> bool {

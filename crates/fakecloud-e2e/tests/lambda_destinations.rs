@@ -29,7 +29,7 @@ fn build_python_handler_zip(body: &str) -> Vec<u8> {
     let mut buf = Vec::new();
     {
         let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-        let opts: zip::write::FileOptions<'_, ()> =
+        let opts: zip::write::SimpleFileOptions =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
         zip.start_file("index.py", opts).unwrap();
         zip.write_all(body.as_bytes()).unwrap();

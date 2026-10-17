@@ -3543,8 +3543,19 @@ fn render_domain_info(api: Api, v: &Value) -> Value {
     let flat = Value::Object(flat);
     match api {
         Api::Es => flat,
+        // `DomainInformationContainer.AWSDomainInformation` is optional, but
+        // when present its `DomainName` is required. A container the caller
+        // sent without domain information is echoed back empty rather than
+        // as an `AWSDomainInformation` with no `DomainName`.
+        Api::OpenSearch if !has_domain_info(v) => json!({}),
         Api::OpenSearch => json!({ "AWSDomainInformation": flat }),
     }
+}
+
+/// Whether a stored domain-info container carries `AWSDomainInformation`
+/// (OpenSearch spelling) or the flat ES fields.
+fn has_domain_info(v: &Value) -> bool {
+    v.get("AWSDomainInformation").is_some_and(Value::is_object) || v.get("DomainName").is_some()
 }
 
 fn connection_create_json(api: Api, c: &Connection) -> Value {
@@ -4094,6 +4105,21 @@ mod domain_info_tests {
         let partial = json!({ "DomainName": "logs" });
         assert_eq!(
             render_domain_info(Api::OpenSearch, &partial),
+            json!({ "AWSDomainInformation": { "DomainName": "logs" } })
+        );
+    }
+
+    #[test]
+    fn domain_info_container_without_domain_information_echoes_empty() {
+        // `DomainInformationContainer.AWSDomainInformation` is optional; when
+        // the caller omits it the response container is empty, never an
+        // `AWSDomainInformation` missing its required `DomainName`.
+        assert_eq!(render_domain_info(Api::OpenSearch, &json!({})), json!({}));
+        assert_eq!(
+            render_domain_info(
+                Api::OpenSearch,
+                &json!({ "AWSDomainInformation": { "DomainName": "logs" } })
+            ),
             json!({ "AWSDomainInformation": { "DomainName": "logs" } })
         );
     }

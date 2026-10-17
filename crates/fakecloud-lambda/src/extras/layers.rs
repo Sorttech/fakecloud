@@ -8,24 +8,10 @@ impl LambdaService {
 
     pub(super) fn publish_layer_version(
         &self,
-        layer_name: &str,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
-        if layer_name.is_empty() {
-            return Err(missing("LayerName"));
-        }
-        let limit = if layer_name.starts_with("arn:") {
-            200
-        } else {
-            140
-        };
-        if layer_name.chars().count() > limit {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "InvalidParameterValueException",
-                "LayerName exceeds the 140-character maximum",
-            ));
-        }
+        let layer_name = layer_name_label(req)?;
+        let layer_name = layer_name.as_str();
         let body = body(req);
         // `Content` is `@required` on `PublishLayerVersionRequest` —
         // reject when missing rather than silently publishing a
@@ -199,11 +185,11 @@ impl LambdaService {
 
     pub(super) fn list_layer_versions(
         &self,
-        layer_name: &str,
         account_id: &str,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let target = layer_target(layer_name, account_id, &req.region)?;
+        let layer_name = layer_name_label(req)?;
+        let target = layer_target(&layer_name, account_id, &req.region)?;
         // A layer version policy can only grant `lambda:GetLayerVersion`, so
         // another account's version list is never readable.
         refuse_foreign(self, req, &target, "ListLayerVersions", &target.layer_arn())?;
@@ -244,7 +230,7 @@ impl LambdaService {
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let layer_name = req.path_segments.get(2).cloned().unwrap_or_default();
+        let layer_name = layer_name_label(req)?;
         let target = layer_target(&layer_name, &req.account_id, &req.region)?;
         let version = layer_version_number(req)?;
         self.layer_version_response(req, &target, version)
@@ -318,22 +304,7 @@ impl LambdaService {
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let layer_name = req.path_segments.get(2).cloned().unwrap_or_default();
-        if layer_name.is_empty() {
-            return Err(missing("LayerName"));
-        }
-        let limit = if layer_name.starts_with("arn:") {
-            200
-        } else {
-            140
-        };
-        if layer_name.chars().count() > limit {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "InvalidParameterValueException",
-                "LayerName exceeds the 140-character maximum",
-            ));
-        }
+        let layer_name = layer_name_label(req)?;
         let target = layer_target(&layer_name, &req.account_id, &req.region)?;
         let version = layer_version_number(req)?;
         refuse_foreign(
@@ -356,7 +327,7 @@ impl LambdaService {
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let layer_name = req.path_segments.get(2).cloned().unwrap_or_default();
+        let layer_name = layer_name_label(req)?;
         let target = layer_target(&layer_name, &req.account_id, &req.region)?;
         let version = layer_version_number(req)?;
         refuse_foreign(
@@ -377,7 +348,7 @@ impl LambdaService {
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let layer_name = req.path_segments.get(2).cloned().unwrap_or_default();
+        let layer_name = layer_name_label(req)?;
         let target = layer_target(&layer_name, &req.account_id, &req.region)?;
         let version = layer_version_number(req)?;
         refuse_foreign(
@@ -457,7 +428,7 @@ impl LambdaService {
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let layer_name = req.path_segments.get(2).cloned().unwrap_or_default();
+        let layer_name = layer_name_label(req)?;
         let target = layer_target(&layer_name, &req.account_id, &req.region)?;
         let version = layer_version_number(req)?;
         refuse_foreign(
@@ -1437,6 +1408,60 @@ mod tests {
         assert_eq!(f.layers[0].arn, v1);
         // The attached layer's content is what invoke mounts.
         assert_eq!(crate::state::attached_layer_zips(&accounts, f).len(), 1);
+    }
+
+    /// Under `--region local` another account's layer ARN (which does not
+    /// match AWS's region pattern) still names the shared layer, while a
+    /// malformed name is still refused by input validation.
+    #[tokio::test]
+    async fn a_shared_layer_is_addressable_by_arn_under_a_local_region() {
+        let s = svc();
+        let local = |method: Method, path: &str, body: Value, account: &str| {
+            let body = if body.is_null() {
+                String::new()
+            } else {
+                body.to_string()
+            };
+            request(method, path, &body, account, "local")
+        };
+        s.handle(local(
+            Method::POST,
+            "/2018-10-31/layers/lyr/versions",
+            json!({"Content": {"ZipFile": ""}}),
+            OWNER,
+        ))
+        .await
+        .unwrap();
+        s.handle(local(
+            Method::POST,
+            "/2018-10-31/layers/lyr/versions/1/policy",
+            json!({"StatementId": "x", "Action": "lambda:GetLayerVersion", "Principal": OTHER}),
+            OWNER,
+        ))
+        .await
+        .unwrap();
+        let arn = format!("arn:aws:lambda:local:{OWNER}:layer:lyr");
+        let got = s
+            .handle(local(
+                Method::GET,
+                &format!("/2018-10-31/layers/{}/versions/1", enc(&arn)),
+                Value::Null,
+                OTHER,
+            ))
+            .await
+            .expect("shared layer by ARN under --region local");
+        assert_eq!(json_of(&got)["LayerArn"], arn);
+        let err = s
+            .handle(local(
+                Method::GET,
+                "/2018-10-31/layers/bad!name/versions/1",
+                Value::Null,
+                OTHER,
+            ))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.code(), "ValidationException");
     }
 
     /// `--region local` with a non-AWS account id: the layer ARN fakecloud

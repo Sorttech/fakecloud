@@ -42,17 +42,50 @@ impl Route {
     }
 }
 
-/// Route a raw (undecoded) URI path. Splits and percent-decodes it the same
-/// way dispatch builds `AwsRequest::path_segments`.
+/// Route a raw (undecoded) URI path.
+///
+/// An empty `@httpLabel` is a real segment, not a separator artifact: on
+/// `DELETE /2013-04-01/hostedzone/` or `POST
+/// /2013-04-01/keysigningkey//name/activate` the empty id must reach the
+/// operation (which answers `NoSuchHostedZone`, `NoSuchKeySigningKey`, ...)
+/// instead of failing to route at all. A trailing slash is the one exception:
+/// `GET /2013-04-01/hostedzone/` is the collection root (botocore/AWS CLI <
+/// 1.40 and curl append that `/`), so it routes to the List op (#1645 shape;
+/// bug-audit 2026-06-20, 1.1). Resolution order:
+///
+/// 1. interior empty segments kept, trailing empty segments trimmed;
+/// 2. every segment kept, so a trailing empty label reaches an op that has no
+///    collection route for the method (`DELETE /hostedzone/`);
+/// 3. every empty segment dropped, tolerating doubled separators elsewhere
+///    (`//2013-04-01/hostedzone`).
+///
+/// Each segment is percent-decoded once, exactly like dispatch's
+/// `AwsRequest::path_segments`.
 pub fn route(method: &Method, path: &str, raw_query: &str) -> Option<Route> {
-    route_segments(
-        method,
-        &fakecloud_core::path::split_path_segments(path),
-        raw_query,
-    )
+    let exact: Vec<String> = path
+        .strip_prefix('/')
+        .unwrap_or(path)
+        .split('/')
+        .map(fakecloud_core::path::percent_decode_segment)
+        .collect();
+    let trimmed_len = exact.len() - exact.iter().rev().take_while(|s| s.is_empty()).count();
+    route_segments(method, &exact[..trimmed_len], raw_query)
+        .or_else(|| {
+            (trimmed_len < exact.len())
+                .then(|| route_segments(method, &exact, raw_query))
+                .flatten()
+        })
+        .or_else(|| {
+            route_segments(
+                method,
+                &fakecloud_core::path::split_path_segments(path),
+                raw_query,
+            )
+        })
 }
 
-/// Route already-decoded path segments (dispatch's `path_segments`).
+/// Route already-split, already-decoded path segments. Empty segments are
+/// matched as empty labels; [`route`] decides which empties to keep.
 pub fn route_segments(method: &Method, segments: &[String], _raw_query: &str) -> Option<Route> {
     // Real Route 53 only serves operations beneath `/2013-04-01/`. Refuse
     // anything else outright instead of permissively trimming a missing
@@ -61,10 +94,6 @@ pub fn route_segments(method: &Method, segments: &[String], _raw_query: &str) ->
     if crate::API_PREFIX.strip_prefix('/') != Some(first.as_str()) {
         return None;
     }
-    // Empty segments are already dropped, so a trailing slash (`/hostedzone/`,
-    // which botocore/AWS CLI < 1.40 and curl emit for a collection root)
-    // routes to the List op, not GetHostedZone(id="") -> NoSuchHostedZone (the
-    // #1645 shape; bug-audit 2026-06-20, 1.1).
     let segs: Vec<&str> = rest.iter().map(String::as_str).collect();
 
     match (method, segs.as_slice()) {
@@ -296,5 +325,69 @@ mod tests {
             route(&Method::GET, "/2013-04-01/hostedzone", ""),
             Some(Route::just("ListHostedZones"))
         );
+    }
+
+    #[test]
+    fn empty_trailing_label_reaches_the_op_when_no_collection_route_matches() {
+        // No DELETE on the collection root, so the trailing empty segment is
+        // the (empty) id label rather than a trailing slash.
+        assert_eq!(
+            route(&Method::DELETE, "/2013-04-01/hostedzone/", ""),
+            Some(Route::with_id("DeleteHostedZone", ""))
+        );
+        assert_eq!(
+            route(&Method::DELETE, "/2013-04-01/healthcheck/", ""),
+            Some(Route::with_id("DeleteHealthCheck", ""))
+        );
+        assert_eq!(
+            route(&Method::DELETE, "/2013-04-01/delegationset/", ""),
+            Some(Route::with_id("DeleteReusableDelegationSet", ""))
+        );
+        assert_eq!(
+            route(&Method::GET, "/2013-04-01/tags/healthcheck/", ""),
+            Some(Route::with_two("ListTagsForResource", "healthcheck", ""))
+        );
+    }
+
+    #[test]
+    fn empty_interior_label_is_kept_in_place() {
+        assert_eq!(
+            route(&Method::POST, "/2013-04-01/keysigningkey//ksk/activate", ""),
+            Some(Route::with_two("ActivateKeySigningKey", "", "ksk"))
+        );
+        assert_eq!(
+            route(&Method::DELETE, "/2013-04-01/keysigningkey//ksk", ""),
+            Some(Route::with_two("DeleteKeySigningKey", "", "ksk"))
+        );
+        assert_eq!(
+            route(
+                &Method::GET,
+                "/2013-04-01/hostedzonelimit//MAX_RRSETS_BY_ZONE",
+                ""
+            ),
+            Some(Route::with_two(
+                "GetHostedZoneLimit",
+                "",
+                "MAX_RRSETS_BY_ZONE"
+            ))
+        );
+        // Not shifted onto GetHostedZone("rrset").
+        assert_eq!(
+            route(&Method::GET, "/2013-04-01/hostedzone//rrset", ""),
+            Some(Route::with_id("ListResourceRecordSets", ""))
+        );
+    }
+
+    #[test]
+    fn labels_are_percent_decoded_once_and_doubled_separators_tolerated() {
+        assert_eq!(
+            route(&Method::GET, "/2013-04-01/hostedzone/Z%2525", ""),
+            Some(Route::with_id("GetHostedZone", "Z%25"))
+        );
+        assert_eq!(
+            route(&Method::GET, "//2013-04-01/hostedzone/Z1", ""),
+            Some(Route::with_id("GetHostedZone", "Z1"))
+        );
+        assert_eq!(route(&Method::GET, "/other/hostedzone", ""), None);
     }
 }

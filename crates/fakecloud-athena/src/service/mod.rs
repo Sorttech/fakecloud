@@ -1625,6 +1625,71 @@ mod tests {
         assert_eq!(status["Statistics"]["Progress"], "100%");
     }
 
+    /// A calculation whose result the bucket could not store (a persistence
+    /// failure, here a store rooted at a regular file) is FAILED with a reason
+    /// rather than COMPLETED, and advertises no result.
+    #[test]
+    fn calculation_fails_when_its_result_cannot_be_stored() {
+        let s3: fakecloud_s3::SharedS3State = std::sync::Arc::new(parking_lot::RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        s3.write().get_or_create("123456789012").buckets.insert(
+            "calc-results".to_string(),
+            fakecloud_s3::S3Bucket::new("calc-results", "us-east-1", "owner"),
+        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        let not_a_dir = tmp.path().join("s3");
+        std::fs::write(&not_a_dir, b"").unwrap();
+        let broken: std::sync::Arc<dyn fakecloud_persistence::S3Store> =
+            std::sync::Arc::new(fakecloud_persistence::s3::DiskS3Store::new(
+                not_a_dir,
+                std::sync::Arc::new(fakecloud_persistence::cache::BodyCache::new(1024)),
+            ));
+        let svc = AthenaService::new(SharedAthenaState::default())
+            .with_s3(s3.clone())
+            .with_s3_store(broken);
+        svc.create_work_group(&req(
+            "CreateWorkGroup",
+            json!({
+                "Name": "calc-wg",
+                "Configuration": {
+                    "ResultConfiguration": { "OutputLocation": "s3://calc-results/out/" }
+                }
+            }),
+        ))
+        .unwrap();
+        let sess = parse_json(
+            &svc.start_session(&req("StartSession", json!({ "WorkGroup": "calc-wg" })))
+                .unwrap(),
+        );
+        let calc = parse_json(
+            &svc.start_calculation_execution(&req(
+                "StartCalculationExecution",
+                json!({ "SessionId": sess["SessionId"], "CodeBlock": "print(1)" }),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(calc["State"], "FAILED");
+        let detail = parse_json(
+            &svc.get_calculation_execution(&req(
+                "GetCalculationExecution",
+                json!({ "CalculationExecutionId": calc["CalculationExecutionId"] }),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(detail["Status"]["State"], "FAILED");
+        assert!(detail["Status"]["StateChangeReason"]
+            .as_str()
+            .unwrap()
+            .starts_with("Failed to write the calculation result"));
+        assert!(detail.get("Result").is_none());
+        assert!(
+            s3.read().get("123456789012").unwrap().buckets["calc-results"]
+                .objects
+                .is_empty()
+        );
+    }
+
     #[test]
     fn start_query_execution_bumps_named_query_last_used_at() {
         let svc = AthenaService::new(SharedAthenaState::default());

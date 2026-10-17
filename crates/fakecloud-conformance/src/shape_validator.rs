@@ -42,6 +42,9 @@ pub enum ShapeViolation {
         sent: serde_json::Value,
         received: Option<serde_json::Value>,
     },
+    /// The round-trip's follow-up Get/Describe response itself does not
+    /// match the reader's output shape (missing/unexpected/mistyped member).
+    FollowupShapeMismatch { operation: String, message: String },
 }
 
 /// What went wrong when diffing a response against a documented `@examples` output.
@@ -88,6 +91,9 @@ impl std::fmt::Display for ShapeViolation {
                     path, expected, got
                 ),
             },
+            ShapeViolation::FollowupShapeMismatch { operation, message } => {
+                write!(f, "followup {} shape mismatch: {}", operation, message)
+            }
             ShapeViolation::RoundTripFieldNotEchoed {
                 field,
                 sent,
@@ -112,14 +118,24 @@ impl std::fmt::Display for ShapeViolation {
 /// returned for the same-named field on the corresponding Get/Describe
 /// output. Used by the `round_trip` strategy.
 ///
-/// Equality is `serde_json::Value` deep-equality. The intent is to catch
-/// fakecloud silently dropping a field at the input layer or at the
-/// storage layer; the diff is binary. Treat `null` and "field absent"
-/// the same on the output side because some protocols omit nulls.
+/// `output_target` is the Smithy shape of the echoed field on the reader's
+/// output (the member target), resolved against `model`. With it, the
+/// comparison is schema-aware (see [`echo_matches`]): a structure on the
+/// read side may carry additional members the output shape declares -- the
+/// members the service fills in itself, like apigatewayv2's
+/// `DomainNameConfiguration.HostedZoneId` -- while maps, lists, unions and
+/// scalars must echo exactly and an undeclared extra member still fails.
+/// Without a model/target everything compares exactly. Object keys tolerate
+/// first-letter case differences (restJson1 `@jsonName` camelCase on the
+/// wire vs. PascalCase Smithy member names on the probe input). `null` and
+/// "field absent" are the same on the output side because some protocols
+/// omit nulls.
 pub fn echo_check(
     field: &str,
     sent: &serde_json::Value,
     output: &serde_json::Value,
+    model: Option<&ServiceModel>,
+    output_target: Option<&str>,
 ) -> Option<ShapeViolation> {
     let received = match output {
         serde_json::Value::Object(map) => crate::probe::lookup_field_any_case(map, field),
@@ -131,7 +147,7 @@ pub fn echo_check(
             sent: sent.clone(),
             received: None,
         }),
-        Some(v) if values_match_ignoring_key_case(v, sent) => None,
+        Some(v) if echo_matches(model, output_target, v, sent) => None,
         Some(v) => Some(ShapeViolation::RoundTripFieldNotEchoed {
             field: field.to_string(),
             sent: sent.clone(),
@@ -140,33 +156,102 @@ pub fn echo_check(
     }
 }
 
-/// Compare two JSON values for equality while tolerating first-letter
-/// case differences on object keys. restJson1 services with `@jsonName`
-/// (apigatewayv2) emit camelCase keys on the wire while the probe input
-/// is keyed under the Smithy member names (PascalCase). The structural
-/// payload is identical — only the first letter of each key differs.
-fn values_match_ignoring_key_case(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Object(am), Value::Object(bm)) => {
-            if am.len() != bm.len() {
-                return false;
+/// Find a structure member by its Smithy name or `@jsonName`, tolerating a
+/// first-letter case difference.
+fn structure_member<'a>(
+    members: &'a [crate::smithy::Member],
+    key: &str,
+) -> Option<&'a crate::smithy::Member> {
+    let same = |a: &str, b: &str| {
+        a == b
+            || (a.len() == b.len()
+                && a.chars().next().map(|c| c.to_ascii_lowercase())
+                    == b.chars().next().map(|c| c.to_ascii_lowercase())
+                && a[1..] == b[1..])
+    };
+    members
+        .iter()
+        .find(|m| same(&m.name, key) || m.traits.json_name.as_deref().is_some_and(|j| same(j, key)))
+}
+
+/// Does the value read back (`received`) echo what was sent (`sent`), given
+/// the Smithy shape `target` of the value on the read side?
+///
+/// - Structure: every sent member must come back with an echoing value. The
+///   read side may additionally carry members the structure *declares* (the
+///   service-populated ones -- Smithy reuses one structure for input and
+///   output and has no output-only trait); a member the structure does not
+///   declare fails.
+/// - Map: the same keys, each value echoing.
+/// - List: the same length, element-for-element.
+/// - Union / scalar / unknown shape: exact (key-case tolerant) equality.
+fn echo_matches(
+    model: Option<&ServiceModel>,
+    target: Option<&str>,
+    received: &Value,
+    sent: &Value,
+) -> bool {
+    let ty = match (model, target) {
+        (Some(m), Some(t)) => effective_shape_type(m, t),
+        _ => None,
+    };
+    match (received, sent) {
+        (Value::Object(rm), Value::Object(sm)) => match ty {
+            Some(ShapeType::Structure { members }) => {
+                let sent_ok = sm.iter().all(|(k, sv)| {
+                    let member = structure_member(&members, k);
+                    let rv = member
+                        .and_then(|m| m.traits.json_name.as_deref())
+                        .and_then(|j| rm.get(j))
+                        .or_else(|| crate::probe::lookup_field_any_case(rm, k));
+                    rv.is_some_and(|rv| {
+                        echo_matches(model, member.map(|m| m.target.as_str()), rv, sv)
+                    })
+                });
+                let extras_declared = rm.keys().all(|k| {
+                    structure_member(&members, k).is_some()
+                        || crate::probe::lookup_field_any_case(sm, k).is_some()
+                });
+                sent_ok && extras_declared
             }
-            for (k, v) in am {
-                match crate::probe::lookup_field_any_case(bm, k) {
-                    Some(bv) if values_match_ignoring_key_case(v, bv) => continue,
-                    _ => return false,
-                }
+            Some(ShapeType::Map { value_target, .. }) => {
+                rm.len() == sm.len()
+                    && sm.iter().all(|(k, sv)| {
+                        rm.get(k)
+                            .is_some_and(|rv| echo_matches(model, Some(&value_target), rv, sv))
+                    })
             }
-            true
-        }
-        (Value::Array(aa), Value::Array(bb)) => {
-            aa.len() == bb.len()
-                && aa
+            _ => exact_match(received, sent),
+        },
+        (Value::Array(ra), Value::Array(sa)) => {
+            let member_target = match ty {
+                Some(ShapeType::List { member_target }) => Some(member_target),
+                _ => None,
+            };
+            ra.len() == sa.len()
+                && ra
                     .iter()
-                    .zip(bb.iter())
-                    .all(|(x, y)| values_match_ignoring_key_case(x, y))
+                    .zip(sa.iter())
+                    .all(|(r, s)| echo_matches(model, member_target.as_deref(), r, s))
         }
-        _ => a == b,
+        _ => received == sent,
+    }
+}
+
+/// Exact equality, tolerating only first-letter case differences on object
+/// keys.
+fn exact_match(received: &Value, sent: &Value) -> bool {
+    match (received, sent) {
+        (Value::Object(rm), Value::Object(sm)) => {
+            rm.len() == sm.len()
+                && sm.iter().all(|(k, sv)| {
+                    crate::probe::lookup_field_any_case(rm, k).is_some_and(|rv| exact_match(rv, sv))
+                })
+        }
+        (Value::Array(ra), Value::Array(sa)) => {
+            ra.len() == sa.len() && ra.iter().zip(sa.iter()).all(|(r, s)| exact_match(r, s))
+        }
+        _ => received == sent,
     }
 }
 
@@ -1101,6 +1186,77 @@ mod tests {
             operations: Vec::new(),
             shapes,
         }
+    }
+
+    fn apigatewayv2_model() -> ServiceModel {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../aws-models/apigatewayv2.json");
+        crate::smithy::parse_model(&path).expect("parse apigatewayv2 model")
+    }
+
+    #[test]
+    fn echo_check_allows_declared_service_populated_members_only() {
+        use serde_json::json;
+        let model = apigatewayv2_model();
+        let target = Some("com.amazonaws.apigatewayv2#DomainNameConfigurations");
+        let check = |sent: &Value, got: &Value| {
+            echo_check("domainNameConfigurations", sent, got, Some(&model), target)
+        };
+        // GetDomainName returns the sent configuration with the members the
+        // service fills in, all declared on `DomainNameConfiguration`.
+        let sent = json!([{"CertificateArn": "arn:aws:acm:us-east-1:1:certificate/x"}]);
+        let got = json!({"domainNameConfigurations": [{
+            "certificateArn": "arn:aws:acm:us-east-1:1:certificate/x",
+            "apiGatewayDomainName": "d-1.execute-api.us-east-1.amazonaws.com",
+            "hostedZoneId": "Z1UJRXOUMOOFQ8",
+            "domainNameStatus": "AVAILABLE"
+        }]});
+        assert!(check(&sent, &got).is_none());
+        assert!(check(&json!([{}]), &got).is_none());
+
+        // A member the structure does not declare still fails.
+        let undeclared = json!({"domainNameConfigurations": [{
+            "certificateArn": "arn:aws:acm:us-east-1:1:certificate/x",
+            "bogus": "x"
+        }]});
+        assert!(check(&sent, &undeclared).is_some());
+        // A sent member that is dropped or altered fails.
+        let dropped = json!({"domainNameConfigurations": [{"hostedZoneId": "Z1"}]});
+        assert!(check(&sent, &dropped).is_some());
+        let altered = json!({"domainNameConfigurations": [{"certificateArn": "other"}]});
+        assert!(check(&sent, &altered).is_some());
+        // Lists keep their length.
+        let extra = json!({"domainNameConfigurations": [
+            {"certificateArn": "arn:aws:acm:us-east-1:1:certificate/x"},
+            {"certificateArn": "arn:aws:acm:us-east-1:1:certificate/x"}
+        ]});
+        assert!(check(&sent, &extra).is_some());
+
+        // Maps echo exactly: an added key fails.
+        let tags = Some("com.amazonaws.apigatewayv2#Tags");
+        let sent_tags = json!({"a": "1"});
+        assert!(echo_check(
+            "tags",
+            &sent_tags,
+            &json!({"tags": {"a": "1"}}),
+            Some(&model),
+            tags
+        )
+        .is_none());
+        assert!(echo_check(
+            "tags",
+            &sent_tags,
+            &json!({"tags": {"a": "1", "b": "2"}}),
+            Some(&model),
+            tags
+        )
+        .is_some());
+
+        // Without a model everything is exact.
+        assert!(echo_check("domainNameConfigurations", &sent, &got, None, None).is_some());
+        // Scalars compare by value, key case tolerant.
+        assert!(echo_check("Name", &json!("a"), &json!({"Name": "b"}), None, None).is_some());
+        assert!(echo_check("Name", &json!("a"), &json!({"name": "a"}), None, None).is_none());
     }
 
     #[test]

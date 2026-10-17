@@ -78,6 +78,13 @@ pub struct Stack {
     /// previous write-only `termination_protection` map is gone).
     #[serde(default)]
     pub enable_termination_protection: bool,
+    /// Logical ids a failed update already changed in their backing service
+    /// (in place or by replacement) before another resource failed. A failed
+    /// update keeps the previous template, which no longer describes these
+    /// resources, so the next update re-applies them instead of skipping them
+    /// as unchanged. Cleared by a successful update.
+    #[serde(default)]
+    pub reapply_logical_ids: std::collections::BTreeSet<String>,
 }
 
 /// One account's CloudFormation state in one region.
@@ -539,6 +546,7 @@ mod tests {
             notification_arns: vec![],
             outputs: vec![],
             enable_termination_protection: false,
+            reapply_logical_ids: Default::default(),
         }
     }
 

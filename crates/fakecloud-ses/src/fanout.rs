@@ -29,6 +29,9 @@ pub struct SesDeliveryContext {
 pub struct SendScope<'a> {
     pub account_id: &'a str,
     pub region: &'a str,
+    /// The tenant the send was made on behalf of (`TenantName`), if any. Its
+    /// suppression list applies alongside the account's.
+    pub tenant_name: Option<&'a str>,
 }
 
 /// Mailbox simulator addresses.
@@ -233,8 +236,9 @@ fn recipient_event_types(recipient: &str) -> (&'static [SesEventType], bool) {
     }
 }
 
-/// Check if any recipient is on the suppression list AND the stored
-/// reason is enforced under the effective `SuppressedReasons` filter
+/// Check if any recipient is on the suppression list (the account's, plus
+/// the sending tenant's when `tenant_name` is set) AND the stored reason is
+/// enforced under the effective `SuppressedReasons` filter
 /// (configuration-set scope first, then account-level fallback). Lookup
 /// is case-insensitive. Returns the suppressed address if found.
 pub fn check_suppression_list(
@@ -242,11 +246,15 @@ pub fn check_suppression_list(
     account_id: &str,
     recipients: &[String],
     config_set_name: Option<&str>,
+    tenant_name: Option<&str>,
 ) -> Option<String> {
     let mas = ses_state.read();
     let state = mas.get(account_id)?;
     for addr in recipients {
-        if state.suppressed_match(addr, config_set_name).is_some() {
+        if state
+            .suppressed_match_for_tenant(addr, config_set_name, tenant_name)
+            .is_some()
+        {
             return Some(addr.clone());
         }
     }
@@ -588,6 +596,7 @@ pub fn process_send_events(
                     scope.account_id,
                     std::slice::from_ref(recipient),
                     Some(cs),
+                    scope.tenant_name,
                 )
                 .is_some()
             }) {
@@ -607,13 +616,21 @@ pub fn process_send_events(
         state.suppressed_drops_total = state.suppressed_drops_total.saturating_add(1);
     }
 
-    // Handle suppression list addition
+    // Handle suppression list addition: a send made on behalf of an existing
+    // tenant suppresses into that tenant's list, otherwise into the account's.
     if add_to_suppression {
         let mut mas = ctx.ses_state.write();
         let state = mas.get_or_create(scope.account_id);
+        let list = match scope.tenant_name {
+            Some(t) if state.tenants.contains_key(t) => state
+                .tenant_suppressed_destinations
+                .entry(t.to_string())
+                .or_default(),
+            _ => &mut state.suppressed_destinations,
+        };
         for addr in &recipients {
             if addr == SUPPRESSION_ADDR {
-                state.suppressed_destinations.insert(
+                list.insert(
                     addr.clone(),
                     SuppressedDestination {
                         email_address: addr.clone(),
@@ -840,6 +857,7 @@ mod tests {
                 SendScope {
                     account_id: "123456789012",
                     region: "us-east-1",
+                    tenant_name: None,
                 },
                 &event,
                 SesEventType::Send,
@@ -882,6 +900,7 @@ mod tests {
                 SendScope {
                     account_id: "123456789012",
                     region: "us-east-1",
+                    tenant_name: None,
                 },
                 &event,
                 SesEventType::Send,
@@ -961,6 +980,7 @@ mod tests {
                 "blocked@example.com".to_string(),
             ],
             None,
+            None,
         );
         assert_eq!(hit.as_deref(), Some("blocked@example.com"));
     }
@@ -972,6 +992,7 @@ mod tests {
             &state,
             "123456789012",
             &["ok@example.com".to_string()],
+            None,
             None,
         );
         assert!(hit.is_none());
@@ -1017,6 +1038,7 @@ mod tests {
             "123456789012",
             &["blocked@example.com".to_string()],
             Some("bounce-only"),
+            None,
         );
         assert!(hit.is_none());
     }
@@ -1062,6 +1084,7 @@ mod tests {
             "123456789012",
             &["blocked@example.com".to_string()],
             Some("passthrough"),
+            None,
         );
         assert!(hit.is_none());
     }
@@ -1081,6 +1104,7 @@ mod tests {
             &state,
             "123456789012",
             &["BLOCKED@example.COM".to_string()],
+            None,
             None,
         );
         assert_eq!(hit.as_deref(), Some("BLOCKED@example.COM"));
@@ -1285,6 +1309,7 @@ mod tests {
             SendScope {
                 account_id: "111111111111",
                 region: "eu-west-1",
+                tenant_name: None,
             },
             &mut email,
             Some("cs"),
@@ -1373,10 +1398,112 @@ mod tests {
             SendScope {
                 account_id: "123456789012",
                 region: "us-east-1",
+                tenant_name: None,
             },
             &event,
             SesEventType::Send,
             "cs",
         );
+    }
+
+    fn add_tenant(state: &SharedSesState, name: &str) {
+        let mut mas = state.write();
+        mas.default_mut().tenants.insert(
+            name.to_string(),
+            crate::state::Tenant {
+                tenant_name: name.to_string(),
+                tenant_id: format!("id-{name}"),
+                tenant_arn: format!("arn:aws:ses:us-east-1:123456789012:tenant/{name}"),
+                created_timestamp: Utc::now(),
+                sending_status: "ENABLED".to_string(),
+                tags: Vec::new(),
+                suppression_attributes: None,
+            },
+        );
+    }
+
+    #[test]
+    fn check_suppression_list_honors_tenant_list_and_reason_filter() {
+        let state = shared_state();
+        add_tenant(&state, "t1");
+        {
+            let mut mas = state.write();
+            let st = mas.default_mut();
+            st.tenant_suppressed_destinations
+                .entry("t1".to_string())
+                .or_default()
+                .insert(
+                    "Tenant@Example.com".to_string(),
+                    SuppressedDestination {
+                        email_address: "Tenant@Example.com".to_string(),
+                        reason: "COMPLAINT".to_string(),
+                        last_update_time: Utc::now(),
+                    },
+                );
+        }
+        let rcpt = ["tenant@example.com".to_string()];
+        // Only the tenant's sends see the tenant list.
+        assert!(check_suppression_list(&state, "123456789012", &rcpt, None, None).is_none());
+        assert!(check_suppression_list(&state, "123456789012", &rcpt, None, Some("t1")).is_some());
+        // The effective SuppressedReasons filter applies to tenant entries too.
+        state
+            .write()
+            .default_mut()
+            .account_settings
+            .suppressed_reasons = vec!["BOUNCE".to_string()];
+        assert!(check_suppression_list(&state, "123456789012", &rcpt, None, Some("t1")).is_none());
+    }
+
+    #[test]
+    fn simulator_suppression_add_targets_the_sending_tenant() {
+        let state = shared_state();
+        add_tenant(&state, "t1");
+        let ctx = SesDeliveryContext {
+            ses_state: state.clone(),
+            delivery_bus: Arc::new(DeliveryBus::new()),
+        };
+        let send = |tenant: Option<&str>| {
+            let mut email = SentEmail {
+                message_id: "m".to_string(),
+                from: "sender@example.com".to_string(),
+                to: vec![SUPPRESSION_ADDR.to_string()],
+                cc: vec![],
+                bcc: vec![],
+                subject: None,
+                html_body: None,
+                text_body: None,
+                raw_data: None,
+                template_name: None,
+                template_data: None,
+                dkim_signature: None,
+                headers: Vec::new(),
+                timestamp: Utc::now(),
+                email_tags: Vec::new(),
+                delivery_insights: Vec::new(),
+            };
+            process_send_events(
+                &ctx,
+                SendScope {
+                    account_id: "123456789012",
+                    region: "us-east-1",
+                    tenant_name: tenant,
+                },
+                &mut email,
+                None,
+            );
+        };
+        send(Some("t1"));
+        {
+            let mas = state.read();
+            let st = mas.default_ref();
+            assert!(st.suppressed_destinations.is_empty());
+            assert!(st.tenant_suppressed_destinations["t1"].contains_key(SUPPRESSION_ADDR));
+        }
+        send(None);
+        assert!(state
+            .read()
+            .default_ref()
+            .suppressed_destinations
+            .contains_key(SUPPRESSION_ADDR));
     }
 }

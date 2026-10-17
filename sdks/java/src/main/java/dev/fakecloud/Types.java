@@ -799,7 +799,12 @@ public final class Types {
     // ── Bedrock ────────────────────────────────────────────────────
     @JsonIgnoreProperties(ignoreUnknown = true)
     public record BedrockInvocation(
-            String modelId, String input, String output, String timestamp, String error) {}
+            String modelId,
+            String input,
+            String output,
+            String timestamp,
+            String error,
+            Map<String, String> requestMetadata) {}
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     public record BedrockInvocationsResponse(List<BedrockInvocation> invocations) {}

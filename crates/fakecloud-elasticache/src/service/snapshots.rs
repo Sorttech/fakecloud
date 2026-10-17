@@ -1,9 +1,6 @@
 //! ElastiCache `snapshots` family handlers extracted from service.rs
 //! by audit-2026-05-19 file-split.
 
-use bytes::Bytes;
-use md5::{Digest, Md5};
-
 use super::*;
 
 /// Per-snapshot RDB dump path.
@@ -743,32 +740,36 @@ impl ElastiCacheService {
         .to_string()
         .into_bytes();
 
-        let mut hasher = Md5::new();
-        hasher.update(&body_bytes);
-        let etag = format!("\"{:x}\"", hasher.finalize());
-        let size = body_bytes.len() as u64;
-
-        let mut s3_state = s3.write();
-        let s3_account = s3_state.get_or_create(account_id);
-        let bucket_state = s3_account.buckets.get_mut(bucket).ok_or_else(|| {
-            AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "InvalidParameterValue",
-                format!("The S3 bucket {bucket} does not exist or is not owned by you."),
-            )
-        })?;
-        let object = S3Object {
-            key: object_key.clone(),
-            body: memory_body(Bytes::from(body_bytes)),
-            content_type: "application/octet-stream".to_string(),
-            etag,
-            size,
-            last_modified: chrono::Utc::now(),
-            storage_class: "STANDARD".to_string(),
-            ..Default::default()
-        };
-        bucket_state.objects.insert(object_key, object);
-        Ok(())
+        // A new object version in the target bucket, written as PutObject
+        // writes one (versioning, default retention, durable store).
+        fakecloud_s3::delivery::put_object_via_store(
+            s3,
+            self.s3_store.as_deref(),
+            account_id,
+            bucket,
+            &object_key,
+            body_bytes,
+            Some("application/octet-stream"),
+        )
+        .map_err(|err| {
+            let exists = s3
+                .read()
+                .get(account_id)
+                .is_some_and(|a| a.buckets.contains_key(bucket));
+            if exists {
+                AwsServiceError::aws_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalServerError",
+                    err,
+                )
+            } else {
+                AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidParameterValue",
+                    format!("The S3 bucket {bucket} does not exist or is not owned by you."),
+                )
+            }
+        })
     }
 }
 

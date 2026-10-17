@@ -30,7 +30,7 @@ use lock::{has_object_lock_headers, has_payload_integrity_header};
 mod multipart;
 pub(crate) mod notifications;
 mod objects;
-pub(crate) use objects::run_blocking_io;
+pub(crate) use objects::{commit_object_version, run_blocking_io};
 mod tags;
 
 // Re-export notification helpers for use in sub-modules
@@ -1459,9 +1459,12 @@ impl AwsService for S3Service {
                 }
                 (&Method::GET, Some(b), Some(k)) => {
                     if req.query_params.contains_key("annotation") {
-                        // Both `?annotation` reads share a URI; `AnnotationName`
+                        // Both `?annotation` reads share a URI; `annotationName`
                         // selects one annotation, its absence lists them.
-                        if req.query_params.contains_key("AnnotationName") {
+                        if req
+                            .query_params
+                            .contains_key(annotations::ANNOTATION_NAME_QUERY)
+                        {
                             self.get_object_annotation(account_id, &req, b, k)
                         } else {
                             self.list_object_annotations(account_id, &req, b, k)
@@ -2374,9 +2377,9 @@ fn s3_detect_action(
     if has_key {
         if has("annotation") {
             return Some(match method {
-                // One URI serves both reads; `AnnotationName` picks a single
+                // One URI serves both reads; `annotationName` picks a single
                 // annotation, its absence lists them.
-                "GET" if has("AnnotationName") => "GetObjectAnnotation",
+                "GET" if has(annotations::ANNOTATION_NAME_QUERY) => "GetObjectAnnotation",
                 "GET" => "ListObjectAnnotations",
                 "PUT" => "PutObjectAnnotation",
                 "DELETE" => "DeleteObjectAnnotation",
@@ -5069,6 +5072,41 @@ mod s3_detect_action_tests {
             &q(&[("select", ""), ("select-type", "2")]),
         );
         assert_eq!(action, Some("GetObject"));
+    }
+
+    #[test]
+    fn annotation_reads_split_on_the_annotation_name_wire_key() {
+        // GET /bucket/key?annotation&annotationName=n reads one annotation;
+        // without `annotationName` the same URI lists them. The member-name
+        // spelling `AnnotationName` is not the wire key and must not select
+        // the single-annotation read.
+        let get = s3_detect_action(
+            "GET",
+            Some("bucket"),
+            Some("key"),
+            &q(&[
+                ("annotation", ""),
+                (super::annotations::ANNOTATION_NAME_QUERY, "n"),
+            ]),
+        );
+        assert_eq!(get, Some("GetObjectAnnotation"));
+        let list = s3_detect_action(
+            "GET",
+            Some("bucket"),
+            Some("key"),
+            &q(&[("annotation", ""), ("AnnotationName", "n")]),
+        );
+        assert_eq!(list, Some("ListObjectAnnotations"));
+        let delete = s3_detect_action(
+            "DELETE",
+            Some("bucket"),
+            Some("key"),
+            &q(&[
+                ("annotation", ""),
+                (super::annotations::ANNOTATION_NAME_QUERY, "n"),
+            ]),
+        );
+        assert_eq!(delete, Some("DeleteObjectAnnotation"));
     }
 
     #[test]

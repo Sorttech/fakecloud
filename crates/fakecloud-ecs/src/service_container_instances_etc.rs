@@ -921,22 +921,27 @@ impl EcsService {
 
         let session_id = format!("ecs-execute-command-{}", uuid::Uuid::new_v4());
         if let (Some(id), Some(rt)) = (container_id.clone(), self.runtime.as_ref()) {
-            // Best-effort proxy: shell the command through `<cli> exec`. We
-            // don't stream back stdout/stderr in this ExecuteCommand response
-            // (real AWS returns a Session token for the SSM sidecar), so log
-            // the result server-side for visibility. Use the runtime's
-            // detected CLI (docker or podman) rather than hardcoding docker
-            // so podman-only hosts work too (issue #1539 family, bug 0.5).
-            let out = tokio::process::Command::new(rt.cli_name())
-                .args(["exec", &id, "sh", "-c", &command])
-                .output()
-                .await
-                .map_err(|e| client_exception(format!("docker exec failed: {e}")))?;
-            tracing::info!(
-                task = %task_ref,
-                exit = out.status.code().unwrap_or(-1),
-                "ExecuteCommand via docker exec"
-            );
+            // As on ECS, the command is run as given, not through a shell
+            // (`/bin/sh -c '...'` when one is wanted), so it works in images
+            // with no shell at all. Split it the way a shell would quote it.
+            let argv = shlex::split(&command)
+                .filter(|argv| !argv.is_empty())
+                .ok_or_else(|| {
+                    invalid_parameter(format!(
+                        "The command \"{command}\" could not be split into a program and its arguments."
+                    ))
+                })?;
+            // Run it through `<cli> exec` (docker or podman, issue #1539) in
+            // the background: as on ECS, the response hands back the session
+            // without waiting for the command, so a long-running or hung
+            // command can't hold the API call open.
+            rt.spawn_exec_command(
+                &task_id_from_ref(&task_ref),
+                &id,
+                argv,
+                crate::runtime::EXEC_COMMAND_TIMEOUT,
+            )
+            .map_err(client_exception)?;
         }
 
         Ok(AwsResponse::ok_json(json!({

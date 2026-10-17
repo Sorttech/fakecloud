@@ -645,6 +645,89 @@ mod tests {
     }
 
     #[test]
+    fn empty_label_is_serialized_like_an_omitted_one() {
+        // An empty `@httpLabel` is unsendable (Smithy clients refuse it) and
+        // would collapse `/queryloggingconfig/{Id}` into the List op's URL.
+        let op = op_with_http(
+            "GetQueryLoggingConfig",
+            "GET",
+            "/2013-04-01/queryloggingconfig/{Id}",
+            "#Input",
+        );
+        let model = model_with(
+            op.clone(),
+            vec![
+                structure_shape("#Input", vec![member("Id", "#String", label_traits())]),
+                string_shape("#String", ShapeTraits::default()),
+            ],
+        );
+        let (_, url, _, _) =
+            build_http_request_from_model(&op, &model, &serde_json::json!({"Id": ""})).unwrap();
+        assert_eq!(url, "/2013-04-01/queryloggingconfig/{Id}");
+        // A non-empty value still substitutes normally.
+        let (_, url, _, _) =
+            build_http_request_from_model(&op, &model, &serde_json::json!({"Id": "q1"})).unwrap();
+        assert_eq!(url, "/2013-04-01/queryloggingconfig/q1");
+    }
+
+    #[test]
+    fn legacy_lambda_empty_or_omitted_label_uses_the_sentinel() {
+        use super::rest_request::legacy_substitute_identifiers;
+        let path = "/2015-03-31/functions/test-conformance-function";
+        for input in [
+            serde_json::json!({}),
+            serde_json::json!({"FunctionName": ""}),
+        ] {
+            assert_eq!(
+                legacy_substitute_identifiers(path, "lambda", &input),
+                "/2015-03-31/functions/INVALID_OMITTED_LABEL",
+                "{input}"
+            );
+        }
+        assert_eq!(
+            legacy_substitute_identifiers(
+                path,
+                "lambda",
+                &serde_json::json!({"FunctionName": "f1"})
+            ),
+            "/2015-03-31/functions/f1"
+        );
+    }
+
+    #[test]
+    fn legacy_s3_empty_key_is_not_replaced_by_a_real_key() {
+        use super::rest_request::legacy_substitute_identifiers;
+        // The S3 sentinel is a well-formed object key, so an empty `Key`
+        // keeps its literal (empty) form rather than naming a real object.
+        assert_eq!(
+            legacy_substitute_identifiers(
+                "/test-conformance-bucket/test-key",
+                "s3",
+                &serde_json::json!({"Bucket": "b", "Key": ""})
+            ),
+            "/b/"
+        );
+    }
+
+    #[test]
+    fn legacy_lambda_layer_sentinel_violates_the_layer_name_pattern() {
+        use super::rest_request::legacy_substitute_identifiers;
+        // Layer ops can't 4xx on a well-formed-but-unknown name (Publish
+        // creates it, Delete is idempotent), so the sentinel must break the
+        // `[a-zA-Z0-9-_]+` pattern instead.
+        let out = legacy_substitute_identifiers(
+            "/2018-10-31/layers/test-layer/versions",
+            "lambda",
+            &serde_json::json!({}),
+        );
+        let name = out.split('/').nth(3).unwrap();
+        assert!(!name.is_empty());
+        assert!(!name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+    }
+
+    #[test]
     fn literal_query_in_template_merged_with_computed() {
         let op = op_with_http("X", "GET", "/x?action=foo", "#Input");
         let model = model_with(
@@ -896,6 +979,26 @@ mod tests {
                 "{code} should pass for ssm"
             );
         }
+    }
+
+    #[test]
+    fn classify_lambda_validation_exception_passes() {
+        let body = r#"{"__type":"ValidationException","message":"1 validation error detected"}"#;
+        let declared = Some(&["InvalidParameterValueException".to_string()][..]);
+        let result = classify_response(
+            "v1",
+            400,
+            body,
+            &Expectation::Success,
+            0,
+            declared,
+            "lambda",
+        );
+        assert_eq!(result.status, ProbeStatus::Pass);
+        // Still an undeclared error anywhere it is not a common error.
+        let result =
+            classify_response("v1", 400, body, &Expectation::Success, 0, declared, "pipes");
+        assert_ne!(result.status, ProbeStatus::Pass);
     }
 
     #[test]

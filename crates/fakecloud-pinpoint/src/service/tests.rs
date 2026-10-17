@@ -227,6 +227,31 @@ fn template_versioning() {
 }
 
 #[test]
+fn list_templates_items_carry_metadata_not_content() {
+    // A ListTemplates item is a `TemplateResponse`: metadata only. The
+    // channel content stays on the Get*Template response.
+    let svc = service();
+    let ctx = ctx();
+    svc.create_template(
+        &ctx,
+        "tmpl",
+        "EMAIL",
+        &json!({ "Subject": "hi", "HtmlPart": "<p>x</p>", "TemplateDescription": "d" }),
+    )
+    .unwrap();
+    let list = body_of(&svc.list_templates(&ctx, &[]).unwrap());
+    let item = &list["Item"][0];
+    assert_eq!(item["TemplateName"], "tmpl");
+    assert_eq!(item["TemplateType"], "EMAIL");
+    assert_eq!(item["TemplateDescription"], "d");
+    assert!(item["Arn"].is_string());
+    assert!(item.get("Subject").is_none(), "{item}");
+    assert!(item.get("HtmlPart").is_none(), "{item}");
+    let got = body_of(&svc.get_template(&ctx, "tmpl", "EMAIL", &[]).unwrap());
+    assert_eq!(got["HtmlPart"], "<p>x</p>");
+}
+
+#[test]
 fn import_job_completes() {
     let svc = service();
     let ctx = ctx();

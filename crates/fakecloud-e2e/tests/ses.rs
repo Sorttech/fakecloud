@@ -1447,7 +1447,8 @@ async fn ses_identity_dkim_signing_attributes() {
         .unwrap();
 
     assert_eq!(resp.dkim_status().unwrap().as_str(), "SUCCESS");
-    assert!(!resp.dkim_tokens().is_empty());
+    // BYODKIM reports the caller's selector as the DKIM token.
+    assert_eq!(resp.dkim_tokens(), ["selector1"]);
 
     // Verify the origin changed
     let get = client
@@ -1464,6 +1465,7 @@ async fn ses_identity_dkim_signing_attributes() {
             .as_str(),
         "EXTERNAL"
     );
+    assert_eq!(get.dkim_attributes().unwrap().tokens(), ["selector1"]);
 }
 
 #[tokio::test]

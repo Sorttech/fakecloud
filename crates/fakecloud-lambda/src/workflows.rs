@@ -462,13 +462,53 @@ fn execution_arn(region: &str, account: &str, id: &str) -> String {
     .to_string()
 }
 
+/// Smithy `CallbackId` `@pattern` `^[A-Za-z0-9+/]+={0,2}$`: a base64 token
+/// (callback ids are minted as base64), padding only at the end.
+fn is_callback_id(id: &str) -> bool {
+    let body = id.trim_end_matches('=');
+    id.len() - body.len() <= 2
+        && !body.is_empty()
+        && body
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+}
+
+/// `CallbackId` constraints (`@length 1..1024`, base64 `@pattern`), refused
+/// by input validation like every Lambda member constraint.
+fn validate_callback_id(callback_id: &str) -> Result<(), AwsServiceError> {
+    use crate::extras::constraint_violation;
+    let len = callback_id.chars().count();
+    if len < 1 {
+        return Err(constraint_violation(
+            callback_id,
+            "callbackId",
+            "Member must have length greater than or equal to 1",
+        ));
+    }
+    if len > 1024 {
+        return Err(constraint_violation(
+            callback_id,
+            "callbackId",
+            "Member must have length less than or equal to 1024",
+        ));
+    }
+    if !is_callback_id(callback_id) {
+        return Err(constraint_violation(
+            callback_id,
+            "callbackId",
+            "Member must satisfy regular expression pattern: ^[A-Za-z0-9+/]+={0,2}$",
+        ));
+    }
+    Ok(())
+}
+
 fn record_callback(
     state: &SharedLambdaState,
     req: &AwsRequest,
     callback_id: &str,
     outcome: &str,
 ) -> Result<AwsResponse, AwsServiceError> {
-    check_len("CallbackId", callback_id, 1, 1024)?;
+    validate_callback_id(callback_id)?;
     let mut accts = state.write();
     let s = accts.regional_mut(&req.account_id, &req.region);
     // AWS mints a callback token when a task suspends waiting on one, and
@@ -791,9 +831,9 @@ mod tests {
     fn send_callback_records_an_unknown_token() {
         let s = shared();
         for (i, call) in [
-            send_callback_success(&s, &req(), "never-issued-1"),
-            send_callback_failure(&s, &req(), "never-issued-2"),
-            send_callback_heartbeat(&s, &req(), "never-issued-3"),
+            send_callback_success(&s, &req(), "bmV2ZXItaXNzdWVkLTE="),
+            send_callback_failure(&s, &req(), "bmV2ZXItaXNzdWVkLTI="),
+            send_callback_heartbeat(&s, &req(), "bmV2ZXItaXNzdWVkLTM="),
         ]
         .into_iter()
         .enumerate()
@@ -803,9 +843,9 @@ mod tests {
         let accts = s.read();
         let st = accts.regional("123456789012", "us-east-1").unwrap();
         for (id, outcome) in [
-            ("never-issued-1", "Succeeded"),
-            ("never-issued-2", "Failed"),
-            ("never-issued-3", "Heartbeat"),
+            ("bmV2ZXItaXNzdWVkLTE=", "Succeeded"),
+            ("bmV2ZXItaXNzdWVkLTI=", "Failed"),
+            ("bmV2ZXItaXNzdWVkLTM=", "Heartbeat"),
         ] {
             let cb = st
                 .durable_execution_callbacks
@@ -814,6 +854,43 @@ mod tests {
             assert_eq!(cb.outcome, outcome);
             assert!(!cb.execution_arn.is_empty());
         }
+    }
+
+    #[test]
+    fn callback_id_must_match_the_base64_pattern() {
+        for ok in ["cb1", "a+b/c", "YWJj", "YWI=", "YQ=="] {
+            assert!(is_callback_id(ok), "{ok} should be accepted");
+        }
+        for bad in [
+            "",
+            "=",
+            "a===",
+            "a_b",
+            "a-b",
+            "a=b",
+            "INVALID_OMITTED_LABEL",
+        ] {
+            assert!(!is_callback_id(bad), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn send_callback_rejects_a_malformed_callback_id() {
+        let s = shared();
+        for call in [
+            send_callback_success(&s, &req(), "bad_id"),
+            send_callback_failure(&s, &req(), "bad-id"),
+            send_callback_heartbeat(&s, &req(), "bad!id"),
+        ] {
+            let err = call
+                .err()
+                .expect("a malformed callback id must be rejected");
+            assert_eq!(err.code(), "ValidationException");
+        }
+        let accts = s.read();
+        assert!(accts
+            .regional("123456789012", "us-east-1")
+            .is_none_or(|st| st.durable_execution_callbacks.is_empty()));
     }
 
     #[test]

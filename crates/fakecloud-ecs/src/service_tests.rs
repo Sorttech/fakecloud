@@ -793,6 +793,50 @@ mod scheduler_reconcile {
     }
 
     #[tokio::test]
+    async fn daemon_task_definition_persists_pid_and_ipc_modes() {
+        let svc = EcsService::new(empty_state());
+        for (field, bad) in [("pidMode", "host"), ("ipcMode", "task")] {
+            let mut body = json!({
+                "family": "agent",
+                "containerDefinitions": [{"name": "a", "image": "busybox"}]
+            });
+            body[field] = json!(bad);
+            let err = svc
+                .register_daemon_task_definition(&ecs_request("RegisterDaemonTaskDefinition", body))
+                .err()
+                .expect("off-enum mode must be rejected");
+            assert_eq!(err.code(), "InvalidParameterException", "{field}");
+        }
+        let resp = svc
+            .register_daemon_task_definition(&ecs_request(
+                "RegisterDaemonTaskDefinition",
+                json!({
+                    "family": "agent",
+                    "containerDefinitions": [{"name": "a", "image": "busybox"}],
+                    "pidMode": "shared",
+                    "ipcMode": "none"
+                }),
+            ))
+            .unwrap();
+        let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let arn = v["daemonTaskDefinitionArn"].as_str().unwrap().to_string();
+        let resp = svc
+            .describe_daemon_task_definition(&ecs_request(
+                "DescribeDaemonTaskDefinition",
+                json!({"daemonTaskDefinition": arn}),
+            ))
+            .unwrap();
+        let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let def = &v["daemonTaskDefinition"];
+        assert_eq!(def["daemonTaskDefinitionArn"], json!(arn));
+        assert_eq!(def["pidMode"], "shared");
+        assert_eq!(def["ipcMode"], "none");
+        // Tags live behind ListTagsForResource, not on the definition shape.
+        assert!(def.get("tags").is_none());
+        assert!(def.get("taskDefinitionArn").is_none());
+    }
+
+    #[tokio::test]
     async fn daemons_daemon_task_definitions_and_express_gateway_services_are_taggable() {
         let svc = EcsService::new(empty_state());
         svc.create_cluster(&ecs_request("CreateCluster", json!({"clusterName": "c1"})))

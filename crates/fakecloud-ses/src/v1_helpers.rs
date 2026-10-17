@@ -1503,6 +1503,7 @@ fn record_sent_email(
             crate::fanout::SendScope {
                 account_id: &req.account_id,
                 region: &req.region,
+                tenant_name: None,
             },
             &mut sent,
             config_set_name,

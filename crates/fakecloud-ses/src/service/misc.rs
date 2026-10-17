@@ -1611,6 +1611,7 @@ impl SesV2Service {
         }
 
         state.tenant_resource_associations.remove(tenant_name);
+        state.tenant_suppressed_destinations.remove(tenant_name);
 
         Ok(AwsResponse::json(StatusCode::OK, "{}"))
     }

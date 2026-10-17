@@ -911,6 +911,12 @@ pub struct DaemonTaskDefinition {
     pub deregistered_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub tags: Vec<TagEntry>,
+    /// `pidMode` (`none` | `shared`).
+    #[serde(default)]
+    pub pid_mode: Option<String>,
+    /// `ipcMode` (`none` | `shared`).
+    #[serde(default)]
+    pub ipc_mode: Option<String>,
 }
 
 /// Daemon resource. Daemons run one task per matching capacity

@@ -32,5 +32,10 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
+[features]
+# Fake container CLIs and polling helpers for other crates' unit tests
+# (`crate::test_support`); enable from `[dev-dependencies]` only.
+test-support = []
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

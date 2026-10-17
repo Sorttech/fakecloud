@@ -65,11 +65,8 @@ impl S3Service {
 
         // --- Read lock phase: validate preconditions and read bucket config ---
         let (
-            versioning_enabled,
-            versioning_suspended,
             acl_owner_id,
             encryption_config,
-            object_lock_config,
             notification_config,
             region,
             bucket_region,
@@ -121,11 +118,8 @@ impl S3Service {
             }
 
             (
-                b.versioning.as_deref() == Some("Enabled"),
-                b.versioning.as_deref() == Some("Suspended"),
                 b.acl_owner_id.clone(),
                 b.encryption_config.clone(),
-                b.object_lock_config.clone(),
                 b.notification_config.clone(),
                 state.region.clone(),
                 b.region.clone(),
@@ -216,11 +210,6 @@ impl S3Service {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("binary/octet-stream")
             .to_string();
-        let version_id = if versioning_enabled {
-            Some(uuid::Uuid::new_v4().to_string())
-        } else {
-            None
-        };
         let content_encoding = fakecloud_core::service::strip_aws_chunked_encoding(
             req.headers
                 .get("content-encoding")
@@ -431,9 +420,6 @@ impl S3Service {
             }
         }
 
-        // Object lock - explicit headers or bucket default
-        let lock = explicit_lock.or_bucket_default(object_lock_config.as_deref(), Utc::now());
-
         // SSE-KMS: read the spool back into memory so the KMS hook can
         // produce an envelope-encrypted blob (AES-GCM needs the whole
         // plaintext at once — chunked AEAD isn't part of the AWS S3
@@ -458,11 +444,11 @@ impl S3Service {
         } else {
             BodySource::File(spooled.path)
         };
-        let mut obj = S3Object {
+        let obj = S3Object {
             key: key.to_string(),
             size: plaintext_size,
-            // The runtime body is filled in below with the BodyRef
-            // returned from self.store.put_object — for memory mode that
+            // The runtime body is filled in at commit with the BodyRef
+            // the store returns (`commit_object_version`) — for memory mode that
             // is a `Memory` variant, for persistent mode a `Disk`
             // variant pointing at the freshly written .bin file.
             // Constructing with an empty placeholder means streamed
@@ -479,7 +465,8 @@ impl S3Service {
             sse_algorithm: sse_algorithm.clone(),
             sse_kms_key_id: sse_kms_key_id.clone(),
             bucket_key_enabled,
-            version_id: version_id.clone(),
+            // Assigned at commit from the bucket's versioning state.
+            version_id: None,
             content_encoding,
             cache_control,
             content_disposition,
@@ -488,14 +475,16 @@ impl S3Service {
             website_redirect_location,
             checksum_algorithm: checksum_algorithm.clone(),
             checksum_value: checksum_value.clone(),
-            lock_mode: lock.mode,
-            lock_retain_until: lock.retain_until,
-            lock_legal_hold: lock.legal_hold,
+            // The explicit lock headers; the bucket's default retention is
+            // applied at commit when none was asked for.
+            lock_mode: explicit_lock.mode,
+            lock_retain_until: explicit_lock.retain_until,
+            lock_legal_hold: explicit_lock.legal_hold,
             ..Default::default()
         };
 
         // --- Write lock phase: insert object and handle versioning/replication ---
-        {
+        let version_id = {
             let mut accts = self.state.write();
             let state = accts.get_or_create(account_id);
             let b = state
@@ -523,70 +512,11 @@ impl S3Service {
                 }
             }
 
-            if versioning_enabled {
-                // The current object becomes the "null" version once a real
-                // version is stacked on top of it. Persist the rewritten
-                // sidecar BEFORE recording it in memory, so a failed write
-                // cannot leave a version in the history that disk lacks.
-                if let Some(preserved) = super::null_version_to_preserve(b, key) {
-                    let preserved_meta = crate::persistence::object_meta_snapshot(&preserved);
-                    super::run_blocking_io(|| {
-                        self.store
-                            .put_object_meta(bucket, key, Some("null"), &preserved_meta)
-                    })
+            // Write the body through the store, then record the new version
+            // as the bucket's versioning state dictates.
+            let version_id =
+                super::commit_object_version(b, bucket, Some(&*self.store), obj, body_source)
                     .map_err(crate::service::persistence_error)?;
-                    super::record_preserved_null(b, key, preserved);
-                }
-                b.object_versions
-                    .entry(key.to_string())
-                    .or_default()
-                    .push(obj.clone());
-            } else if versioning_suspended {
-                // A suspended write takes over the null version, replacing
-                // whatever held it (an older null object or a null delete
-                // marker), as on AWS. Tagging it "null" also keeps the disk
-                // sidecar in the versioned set, so a restart-loaded bucket
-                // agrees with the live one about which object is current.
-                obj.version_id = Some("null".to_string());
-                super::replace_null_version(b, key, &obj);
-            }
-            b.objects.insert(key.to_string(), obj);
-
-            // Snapshot + persist + rewrite runtime body to the returned BodyRef.
-            let meta_version = {
-                let b2 = state
-                    .buckets
-                    .get(bucket)
-                    .ok_or_else(|| no_such_bucket(bucket))?;
-                let o = b2.objects.get(key).ok_or_else(|| no_such_key(key))?;
-                object_meta_snapshot(o)
-            };
-            let returned_body = super::run_blocking_io(|| {
-                self.store.put_object(
-                    bucket,
-                    key,
-                    meta_version.version_id.as_deref(),
-                    body_source,
-                    &meta_version,
-                )
-            })
-            .map_err(crate::service::persistence_error)?;
-            if let Some(b2) = state.buckets.get_mut(bucket) {
-                if let Some(o) = b2.objects.get_mut(key) {
-                    o.body = returned_body.clone();
-                }
-                // The entry this write just appended -- the new version on an
-                // enabled bucket, the replaced null version on a suspended one
-                // -- has to point at the file the store actually wrote, or a
-                // read of it serves the pre-write placeholder body.
-                if versioning_enabled || versioning_suspended {
-                    if let Some(versions) = b2.object_versions.get_mut(key) {
-                        if let Some(last) = versions.last_mut() {
-                            last.body = returned_body;
-                        }
-                    }
-                }
-            }
             // Replicate (in-memory copy) then persist replicas via the store.
             replicate_through_store(
                 &mut accts,
@@ -597,7 +527,8 @@ impl S3Service {
                 self.iam_mode,
             )
             .map_err(crate::service::persistence_error)?;
-        } // write lock dropped
+            version_id
+        }; // write lock dropped
 
         // --- Response phase: build response headers ---
         let mut headers = HeaderMap::new();
@@ -1137,17 +1068,6 @@ impl S3Service {
             .get_mut(dest_bucket)
             .ok_or_else(|| no_such_bucket(dest_bucket))?;
 
-        let version_id = if db.versioning.as_deref() == Some("Enabled") {
-            Some(uuid::Uuid::new_v4().to_string())
-        } else {
-            None
-        };
-
-        // The destination's current default retention, measured from now, when
-        // the version is created.
-        let dest_lock =
-            explicit_lock.or_bucket_default(db.object_lock_config.as_deref(), Utc::now());
-
         // The destination's ACL comes from this request, never from the source:
         // S3 treats a copy as a new object, so an unspecified ACL is the default
         // private one rather than whatever the source carried.
@@ -1166,7 +1086,7 @@ impl S3Service {
             // Copy is an independent object — never inherit the source's
             // disk-backed BodyRef (which would point at the source's file).
             // The source bytes are read above; the destination's own on-disk
-            // file is written below via `self.store.put_object`.
+            // file is written at commit by `commit_object_version`.
             body: crate::state::memory_body(dest_stored_bytes.clone()),
             // size tracks plaintext bytes (matches what a future GetObject
             // returns to the caller); see the put_object SSE-KMS path.
@@ -1184,7 +1104,8 @@ impl S3Service {
             sse_algorithm: new_sse.clone(),
             sse_kms_key_id: new_kms.clone(),
             bucket_key_enabled: new_bke,
-            version_id: version_id.clone(),
+            // Assigned at commit from the destination's versioning state.
+            version_id: None,
             content_encoding: src_obj.content_encoding,
             cache_control: new_cache_control,
             content_disposition: new_content_disposition,
@@ -1194,85 +1115,25 @@ impl S3Service {
             checksum_algorithm: new_checksum_algo.clone(),
             checksum_value: new_checksum_val.clone(),
             // Lock status is not copied from the source object.
-            lock_mode: dest_lock.mode,
-            lock_retain_until: dest_lock.retain_until,
-            lock_legal_hold: dest_lock.legal_hold,
+            // The request's lock headers; the destination's default retention
+            // is applied at commit when they ask for none.
+            lock_mode: explicit_lock.mode,
+            lock_retain_until: explicit_lock.retain_until,
+            lock_legal_hold: explicit_lock.legal_hold,
             ..Default::default()
         };
 
-        // Store in version history if versioning enabled
-        let dest_versioning_enabled = db.versioning.as_deref() == Some("Enabled");
-        let dest_versioning_suspended = db.versioning.as_deref() == Some("Suspended");
-        let mut dest_obj = dest_obj;
-        if dest_versioning_enabled {
-            // Same rule as PutObject: the destination's pre-versioning object
-            // becomes the "null" version instead of vanishing under the copy.
-            // Persist its sidecar before recording anything in memory.
-            if let Some(preserved) = super::null_version_to_preserve(db, dest_key) {
-                let preserved_meta = crate::persistence::object_meta_snapshot(&preserved);
-                super::run_blocking_io(|| {
-                    self.store
-                        .put_object_meta(dest_bucket, dest_key, Some("null"), &preserved_meta)
-                })
-                .map_err(crate::service::persistence_error)?;
-                let db = state
-                    .buckets
-                    .get_mut(dest_bucket)
-                    .ok_or_else(|| no_such_bucket(dest_bucket))?;
-                super::record_preserved_null(db, dest_key, preserved);
-            }
-        }
-        let db = state
-            .buckets
-            .get_mut(dest_bucket)
-            .ok_or_else(|| no_such_bucket(dest_bucket))?;
-        if dest_versioning_enabled {
-            db.object_versions
-                .entry(dest_key.to_string())
-                .or_default()
-                .push(dest_obj.clone());
-        } else if dest_versioning_suspended {
-            dest_obj.version_id = Some("null".to_string());
-            super::replace_null_version(db, dest_key, &dest_obj);
-        }
-        db.objects.insert(dest_key.to_string(), dest_obj);
-        let dest_meta = {
-            let o = db
-                .objects
-                .get(dest_key)
-                .ok_or_else(|| no_such_key(dest_key))?;
-            object_meta_snapshot(o)
-        };
-        // Release the `db` borrow before the store call so we can re-borrow
-        // for the BodyRef rewrite and subsequent replication/notification
-        // work below.
-        let _ = db;
-        let dest_body_ref = super::run_blocking_io(|| {
-            self.store.put_object(
-                dest_bucket,
-                dest_key,
-                dest_meta.version_id.as_deref(),
-                staged_dest.source(),
-                &dest_meta,
-            )
-        })
+        // Write the copy through the store and record it as the destination's
+        // new version, exactly as PutObject does. The id it reports is the
+        // one assigned at commit.
+        let version_id = super::commit_object_version(
+            db,
+            dest_bucket,
+            Some(&*self.store),
+            dest_obj,
+            staged_dest.source(),
+        )
         .map_err(crate::service::persistence_error)?;
-        if let Some(db2) = state.buckets.get_mut(dest_bucket) {
-            if let Some(o) = db2.objects.get_mut(dest_key) {
-                o.body = dest_body_ref.clone();
-            }
-            // Only the version this copy just appended may be repointed at the
-            // new file. On a bucket that is not versioning-enabled the newest
-            // history entry belongs to some earlier version, and rewriting its
-            // body would serve the copied bytes for that version id instead.
-            if dest_versioning_enabled || dest_versioning_suspended {
-                if let Some(versions) = db2.object_versions.get_mut(dest_key) {
-                    if let Some(last) = versions.last_mut() {
-                        last.body = dest_body_ref;
-                    }
-                }
-            }
-        }
         let db = state
             .buckets
             .get_mut(dest_bucket)

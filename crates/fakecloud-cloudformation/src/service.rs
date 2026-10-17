@@ -2143,6 +2143,7 @@ impl CloudFormationService {
                     notification_arns: notification_arns.clone(),
                     outputs: Vec::new(),
                     enable_termination_protection,
+                    reapply_logical_ids: Default::default(),
                 },
             );
             record_stack_status_event(
@@ -3201,23 +3202,28 @@ impl CloudFormationService {
 
                 let stack_id = stack.stack_id.clone();
                 let stack_name_owned = stack.name.clone();
-                stack.template = input.template_body.clone();
                 stack.status = if update_result.is_err() {
                     "UPDATE_ROLLBACK_COMPLETE".to_string()
                 } else {
                     "UPDATE_COMPLETE".to_string()
                 };
                 stack.status_reason = update_result.as_ref().err().map(ToString::to_string);
-                stack.parameters = input.parameters.clone();
-                if !input.tags.is_empty() {
-                    stack.tags = input.tags;
-                }
                 stack.updated_at = Some(Utc::now());
-                stack.description = parsed.description;
-                if !input.notification_arns.is_empty() {
-                    stack.notification_arns = input.notification_arns.clone();
-                }
                 if update_result.is_ok() {
+                    // The unchanged-resource diff must use the last successful
+                    // template/parameters, never a rejected update. Otherwise
+                    // retrying invalid input skips the provisioner's validation.
+                    // This commits stack metadata; it does not undo any partial
+                    // backing-service mutations from a failed multi-resource run.
+                    stack.template = input.template_body.clone();
+                    stack.parameters = input.parameters.clone();
+                    if !input.tags.is_empty() {
+                        stack.tags = input.tags;
+                    }
+                    stack.description = parsed.description;
+                    if !input.notification_arns.is_empty() {
+                        stack.notification_arns = input.notification_arns.clone();
+                    }
                     stack.outputs.clear();
                 }
                 (
@@ -3727,6 +3733,14 @@ impl ResourceChangeAction {
 /// in-place update resources whose properties changed. Returns the list of
 /// changes applied (for event emission) on success or `Err(msg)` if any
 /// resource operation fails.
+///
+/// A failed run does not roll back, and its callers keep the previous
+/// template, so a resource it already updated no longer matches that
+/// template. Those logical ids are recorded in `stack.reapply_logical_ids`
+/// and re-applied by the next update rather than skipped as unchanged; a
+/// successful run reconciles every resource and clears them. (Resources a
+/// failed run created or removed need no record: the stored template lacks or
+/// still declares them, so the next update's add/remove diff handles them.)
 pub(crate) fn apply_resource_updates(
     stack: &mut crate::state::Stack,
     new_resource_defs: &[template::ResourceDefinition],
@@ -3736,6 +3750,42 @@ pub(crate) fn apply_resource_updates(
     imports: &BTreeMap<String, String>,
 ) -> Result<Vec<ResourceChange>, String> {
     let mut changes: Vec<ResourceChange> = Vec::new();
+    match apply_resource_changes(
+        stack,
+        new_resource_defs,
+        template_body,
+        parameters,
+        provisioner,
+        imports,
+        &mut changes,
+    ) {
+        Ok(()) => {
+            stack.reapply_logical_ids.clear();
+            Ok(changes)
+        }
+        Err(err) => {
+            stack.reapply_logical_ids.extend(
+                changes
+                    .iter()
+                    .filter(|c| c.action == ResourceChangeAction::Update)
+                    .map(|c| c.logical_id.clone()),
+            );
+            Err(err)
+        }
+    }
+}
+
+/// The body of `apply_resource_updates`, recording each applied change in
+/// `changes` as it goes so a failure still reports what was applied before it.
+fn apply_resource_changes(
+    stack: &mut crate::state::Stack,
+    new_resource_defs: &[template::ResourceDefinition],
+    template_body: &str,
+    parameters: &BTreeMap<String, String>,
+    provisioner: &crate::resource_provisioner::ResourceProvisioner,
+    imports: &BTreeMap<String, String>,
+    changes: &mut Vec<ResourceChange>,
+) -> Result<(), String> {
     let old_logical_ids: std::collections::HashSet<String> = stack
         .resources
         .iter()
@@ -3890,9 +3940,12 @@ pub(crate) fn apply_resource_updates(
             // replacement fallback (`reprovision_resource`) from destroying and
             // recreating a stateful backing resource (cache/db/instance) or
             // cascading a Glue-database delete on an unrelated stack update.
-            if old_resolved
-                .get(&resource_def.logical_id)
-                .is_some_and(|old_props| *old_props == resolved_def.properties)
+            // A resource an earlier failed update already changed no longer
+            // matches the stored template, so it is never "unchanged".
+            if !stack.reapply_logical_ids.contains(&resource_def.logical_id)
+                && old_resolved
+                    .get(&resource_def.logical_id)
+                    .is_some_and(|old_props| *old_props == resolved_def.properties)
             {
                 continue;
             }
@@ -3951,7 +4004,7 @@ pub(crate) fn apply_resource_updates(
         }
     }
 
-    Ok(changes)
+    Ok(())
 }
 
 /// Pushes a single `StackEvent` row onto the per-stack event log so
@@ -4727,6 +4780,311 @@ mod tests {
         let state = accounts.regional("123456789012", "us-east-1").unwrap();
         let stack = state.stacks.get("test-stack").unwrap();
         assert_eq!(stack.status, "UPDATE_ROLLBACK_COMPLETE");
+    }
+
+    fn firehose_retry_template(description: &str, codec: serde_json::Value) -> String {
+        serde_json::json!({
+            "Description": description,
+            "Parameters": {
+                "Codec": {"Type": "String", "Default": "UNCOMPRESSED"},
+                "Prefix": {"Type": "String", "Default": "default/"},
+                "Preserved": {"Type": "String", "Default": "default"}
+            },
+            "Resources": {"Stream": {
+                "Type": "AWS::KinesisFirehose::DeliveryStream",
+                "Properties": {
+                    "DeliveryStreamName": "cfn-firehose-retry",
+                    "ExtendedS3DestinationConfiguration": {
+                        "RoleARN": "arn:aws:iam::123456789012:role/fh",
+                        "BucketARN": "arn:aws:s3:::bucket",
+                        "Prefix": {"Ref": "Prefix"},
+                        "CompressionFormat": codec
+                    }
+                }
+            }},
+            "Outputs": {"Kept": {"Value": {"Ref": "Preserved"}}}
+        })
+        .to_string()
+    }
+
+    fn firehose_retry_stack(svc: &CloudFormationService) -> crate::state::Stack {
+        svc.state
+            .read()
+            .regional("123456789012", "us-east-1")
+            .unwrap()
+            .stacks["firehose-retry"]
+            .clone()
+    }
+
+    async fn firehose_retry_apply(
+        svc: &CloudFormationService,
+        mut params: HashMap<String, String>,
+        change_set: bool,
+        name: &str,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        if change_set {
+            params.insert("ChangeSetName".to_string(), name.to_string());
+            params.insert("ChangeSetType".to_string(), "UPDATE".to_string());
+            svc.handle(make_request("CreateChangeSet", params)).await?;
+            svc.handle(make_request(
+                "ExecuteChangeSet",
+                HashMap::from([
+                    ("StackName".to_string(), "firehose-retry".to_string()),
+                    ("ChangeSetName".to_string(), name.to_string()),
+                ]),
+            ))
+            .await
+        } else {
+            svc.handle(make_request("UpdateStack", params)).await
+        }
+    }
+
+    async fn firehose_retry_preserves_applied_metadata(change_set: bool) {
+        let svc = make_service();
+        let original = firehose_retry_template("applied", serde_json::json!({"Ref": "Codec"}));
+        let params: HashMap<String, String> = [
+            ("StackName", "firehose-retry"),
+            ("TemplateBody", original.as_str()),
+            ("Parameters.member.1.ParameterKey", "Codec"),
+            ("Parameters.member.1.ParameterValue", "GZIP"),
+            ("Parameters.member.2.ParameterKey", "Prefix"),
+            ("Parameters.member.2.ParameterValue", "before/"),
+            ("Parameters.member.3.ParameterKey", "Preserved"),
+            ("Parameters.member.3.ParameterValue", "kept"),
+            ("Tags.member.1.Key", "env"),
+            ("Tags.member.1.Value", "before"),
+            (
+                "NotificationARNs.member.1",
+                "arn:aws:sns:us-east-1:123456789012:before",
+            ),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        svc.handle(make_request("CreateStack", params.clone()))
+            .await
+            .unwrap();
+        let before = firehose_retry_stack(&svc);
+        assert_eq!(before.status, "CREATE_COMPLETE");
+        let firehose_before = serde_json::to_value(&*svc.deps.firehose.read()).unwrap();
+        let mut rejected = params.clone();
+        rejected.insert(
+            "TemplateBody".to_string(),
+            firehose_retry_template("rejected", serde_json::json!("BROTLI")),
+        );
+        rejected.insert(
+            "Parameters.member.1.ParameterValue".to_string(),
+            "ZIP".to_string(),
+        );
+        rejected.insert(
+            "Parameters.member.2.ParameterValue".to_string(),
+            "rejected/".to_string(),
+        );
+        rejected.remove("Parameters.member.3.ParameterValue");
+        rejected.insert(
+            "Parameters.member.3.UsePreviousValue".to_string(),
+            "true".to_string(),
+        );
+        rejected.insert("Tags.member.1.Value".to_string(), "rejected".to_string());
+        rejected.insert(
+            "NotificationARNs.member.1".to_string(),
+            "arn:aws:sns:us-east-1:123456789012:rejected".to_string(),
+        );
+
+        // Execute both attempts before asserting, so red proves the second
+        // identical invalid update is falsely accepted, not just metadata drift.
+        let mut attempts = Vec::new();
+        for name in ["invalid-1", "invalid-2"] {
+            let result = firehose_retry_apply(&svc, rejected.clone(), change_set, name).await;
+            attempts.push((
+                result.err(),
+                firehose_retry_stack(&svc),
+                serde_json::to_value(&*svc.deps.firehose.read()).unwrap(),
+            ));
+        }
+        assert!(
+            attempts.iter().all(|(err, _, _)| err.is_some()),
+            "both invalid attempts must fail; observed {:?}",
+            attempts
+                .iter()
+                .map(|(err, _, _)| err.is_some())
+                .collect::<Vec<_>>()
+        );
+        for (err, stack, firehose) in attempts {
+            assert!(err.unwrap().message().contains("CompressionFormat"));
+            assert_eq!(stack.status, "UPDATE_ROLLBACK_COMPLETE");
+            assert_eq!(stack.template, before.template);
+            assert_eq!(stack.parameters, before.parameters);
+            assert_eq!(stack.tags, before.tags);
+            assert_eq!(stack.description, before.description);
+            assert_eq!(stack.notification_arns, before.notification_arns);
+            assert_eq!(
+                serde_json::to_value(&stack.outputs).unwrap(),
+                serde_json::to_value(&before.outputs).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(&stack.resources).unwrap(),
+                serde_json::to_value(&before.resources).unwrap()
+            );
+            assert_eq!(firehose, firehose_before);
+        }
+
+        // A subsequent valid update must commit its template/parameters and
+        // refill UsePreviousValue from the applied values, never rejected ones.
+        let valid = firehose_retry_template("updated", serde_json::json!({"Ref": "Codec"}));
+        let mut accepted = rejected;
+        accepted.insert("TemplateBody".to_string(), valid.clone());
+        accepted.insert(
+            "Parameters.member.1.ParameterValue".to_string(),
+            "Snappy".to_string(),
+        );
+        accepted.remove("Parameters.member.2.ParameterValue");
+        accepted.insert(
+            "Parameters.member.2.UsePreviousValue".to_string(),
+            "true".to_string(),
+        );
+        firehose_retry_apply(&svc, accepted, change_set, "valid")
+            .await
+            .unwrap();
+        let after = firehose_retry_stack(&svc);
+        assert_eq!(after.status, "UPDATE_COMPLETE");
+        assert!(after.status_reason.is_none());
+        assert_eq!(after.template, valid);
+        assert_eq!(after.parameters["Codec"], "Snappy");
+        assert_eq!(after.parameters["Prefix"], "before/");
+        assert_eq!(after.parameters["Preserved"], "kept");
+        assert_eq!(after.tags["env"], "rejected");
+        assert_eq!(
+            after.notification_arns,
+            ["arn:aws:sns:us-east-1:123456789012:rejected"]
+        );
+        assert_eq!(after.outputs[0].value, "kept");
+        let firehose = svc.deps.firehose.read();
+        let stream = &firehose
+            .get("123456789012")
+            .unwrap()
+            .streams("us-east-1")
+            .unwrap()["cfn-firehose-retry"];
+        assert_eq!(stream.version_id, "2");
+        let dest = stream.destination.as_ref().unwrap();
+        assert_eq!(dest.compression_format.as_deref(), Some("Snappy"));
+        assert_eq!(dest.prefix.as_deref(), Some("before/"));
+    }
+
+    #[tokio::test]
+    async fn firehose_update_stack_rejects_retry_and_preserves_applied_metadata() {
+        firehose_retry_preserves_applied_metadata(false).await;
+    }
+
+    #[tokio::test]
+    async fn firehose_execute_change_set_rejects_retry_and_preserves_applied_metadata() {
+        firehose_retry_preserves_applied_metadata(true).await;
+    }
+
+    /// A gets the prefix, B (DependsOn A) the codec.
+    fn firehose_drift_template(prefix_a: &str, codec_b: &str) -> String {
+        let stream = |name: &str, prefix: &str, codec: &str| {
+            serde_json::json!({
+                "Type": "AWS::KinesisFirehose::DeliveryStream",
+                "Properties": {
+                    "DeliveryStreamName": name,
+                    "ExtendedS3DestinationConfiguration": {
+                        "RoleARN": "arn:aws:iam::123456789012:role/fh",
+                        "BucketARN": "arn:aws:s3:::bucket",
+                        "Prefix": prefix,
+                        "CompressionFormat": codec
+                    }
+                }
+            })
+        };
+        let mut b = stream("drift-b", "b/", codec_b);
+        b["DependsOn"] = serde_json::json!("A");
+        serde_json::json!({"Resources": {"A": stream("drift-a", prefix_a, "GZIP"), "B": b}})
+            .to_string()
+    }
+
+    fn firehose_drift_stream(svc: &CloudFormationService, name: &str) -> (String, String) {
+        let firehose = svc.deps.firehose.read();
+        let dest = firehose
+            .get("123456789012")
+            .unwrap()
+            .streams("us-east-1")
+            .unwrap()[name]
+            .destination
+            .clone()
+            .unwrap();
+        (
+            dest.prefix.unwrap_or_default(),
+            dest.compression_format.unwrap_or_default(),
+        )
+    }
+
+    async fn firehose_failed_update_reapplies_changed_resources(change_set: bool) {
+        let svc = make_service();
+        let params = |body: &str| {
+            HashMap::from([
+                ("StackName".to_string(), "firehose-retry".to_string()),
+                ("TemplateBody".to_string(), body.to_string()),
+            ])
+        };
+        let original = firehose_drift_template("a1/", "GZIP");
+        svc.handle(make_request("CreateStack", params(&original)))
+            .await
+            .unwrap();
+        assert_eq!(firehose_retry_stack(&svc).status, "CREATE_COMPLETE");
+
+        // A's in-place change applies before B fails validation; the failed
+        // update keeps the old template, which no longer describes A.
+        let bad = firehose_drift_template("a2/", "BROTLI");
+        let err = firehose_retry_apply(&svc, params(&bad), change_set, "bad-1")
+            .await
+            .err()
+            .expect("invalid CompressionFormat must fail");
+        assert!(err.message().contains("CompressionFormat"));
+        let stack = firehose_retry_stack(&svc);
+        assert_eq!(stack.status, "UPDATE_ROLLBACK_COMPLETE");
+        assert_eq!(stack.template, original);
+        assert_eq!(firehose_drift_stream(&svc, "drift-a").0, "a2/");
+        assert!(stack.reapply_logical_ids.contains("A"));
+        assert!(!stack.reapply_logical_ids.contains("B"));
+
+        // The identical bad retry still reaches validation.
+        let err = firehose_retry_apply(&svc, params(&bad), change_set, "bad-2")
+            .await
+            .err()
+            .expect("identical invalid retry must fail");
+        assert!(err.message().contains("CompressionFormat"));
+
+        // Redeploying the OLD template re-applies A instead of skipping it as
+        // unchanged against the stored template.
+        firehose_retry_apply(&svc, params(&original), change_set, "old")
+            .await
+            .unwrap();
+        let stack = firehose_retry_stack(&svc);
+        assert_eq!(stack.status, "UPDATE_COMPLETE");
+        assert!(stack.reapply_logical_ids.is_empty());
+        assert_eq!(firehose_drift_stream(&svc, "drift-a").0, "a1/");
+
+        // A subsequent good update applies in full.
+        let good = firehose_drift_template("a3/", "Snappy");
+        firehose_retry_apply(&svc, params(&good), change_set, "good")
+            .await
+            .unwrap();
+        let stack = firehose_retry_stack(&svc);
+        assert_eq!(stack.status, "UPDATE_COMPLETE");
+        assert_eq!(stack.template, good);
+        assert_eq!(firehose_drift_stream(&svc, "drift-a").0, "a3/");
+        assert_eq!(firehose_drift_stream(&svc, "drift-b").1, "Snappy");
+    }
+
+    #[tokio::test]
+    async fn firehose_update_stack_failure_reapplies_changed_resources() {
+        firehose_failed_update_reapplies_changed_resources(false).await;
+    }
+
+    #[tokio::test]
+    async fn firehose_execute_change_set_failure_reapplies_changed_resources() {
+        firehose_failed_update_reapplies_changed_resources(true).await;
     }
 
     #[tokio::test]

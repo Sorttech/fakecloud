@@ -1509,3 +1509,286 @@ async fn create_custom_model_stores_model_tags() {
         serde_json::json!([{"key": "team", "value": "ml"}])
     );
 }
+
+// ── requestMetadata ──
+
+fn recorded_metadata(
+    state: &SharedBedrockState,
+) -> Vec<Option<std::collections::BTreeMap<String, String>>> {
+    let accts = state.read();
+    accts
+        .get("123456789012")
+        .map(|s| {
+            s.invocations
+                .iter()
+                .map(|i| i.request_metadata.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn with_metadata_header(mut req: AwsRequest, value: &str) -> AwsRequest {
+    req.headers.insert(
+        "x-amzn-bedrock-request-metadata",
+        http::HeaderValue::from_str(value).unwrap(),
+    );
+    req
+}
+
+#[tokio::test]
+async fn invoke_model_request_metadata_header_over_8500_is_rejected() {
+    let body = serde_json::json!({"inputText": "Hello"}).to_string();
+    for path in [
+        "/model/amazon.titan-text-express-v1/invoke",
+        "/model/amazon.titan-text-express-v1/invoke-with-response-stream",
+    ] {
+        let state = make_state();
+        let svc = BedrockService::new(state.clone());
+        // Valid JSON padded with insignificant whitespace: the cap is on the
+        // header string, independent of the pairs it encodes.
+        let padded = |len: usize| {
+            let mut v = r#"{"k":"v"}"#.to_string();
+            v.push_str(&" ".repeat(len - v.len()));
+            v
+        };
+        let req = with_metadata_header(make_request(Method::POST, path, &body), &padded(8501));
+        let err = expect_err(svc.handle(req).await);
+        assert_eq!(err.code(), "ValidationException", "{path}");
+        assert!(recorded_metadata(&state).is_empty(), "{path}");
+
+        // Exactly at the cap is accepted.
+        let req = with_metadata_header(make_request(Method::POST, path, &body), &padded(8500));
+        svc.handle(req).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn invoke_model_request_metadata_non_ascii_header_is_still_bounded() {
+    let svc = BedrockService::new(make_state());
+    let body = serde_json::json!({"inputText": "Hello"}).to_string();
+    let mut req = make_request(
+        Method::POST,
+        "/model/amazon.titan-text-express-v1/invoke",
+        &body,
+    );
+    // obs-text bytes (0x80..0xFF) make `HeaderValue::to_str` fail; the length
+    // check must still run on the raw bytes.
+    let mut raw = b"{\"k\":\"v\"}".to_vec();
+    raw.extend(std::iter::repeat_n(0xE9u8, 8600));
+    req.headers.insert(
+        "x-amzn-bedrock-request-metadata",
+        http::HeaderValue::from_bytes(&raw).unwrap(),
+    );
+    let err = expect_err(svc.handle(req).await);
+    assert_eq!(err.code(), "ValidationException");
+    assert!(err.message().contains("8500"), "{}", err.message());
+}
+
+#[tokio::test]
+async fn invoke_model_malformed_request_metadata_header_is_rejected() {
+    let body = serde_json::json!({"inputText": "Hello"}).to_string();
+    let seventeen: serde_json::Map<String, Value> = (0..17)
+        .map(|i| (format!("k{i}"), Value::String("v".into())))
+        .collect();
+    for header in [
+        "not json".to_string(),
+        r#"["a","b"]"#.to_string(),
+        r#""just a string""#.to_string(),
+        r#"{"n":1}"#.to_string(),
+        r#"{"nested":{"a":"b"}}"#.to_string(),
+        "{}".to_string(),
+        Value::Object(seventeen).to_string(),
+        format!(r#"{{"{}":"v"}}"#, "k".repeat(257)),
+        format!(r#"{{"k":"{}"}}"#, "v".repeat(257)),
+        r#"{"bad*key":"v"}"#.to_string(),
+        r#"{"k":"bad<value>"}"#.to_string(),
+        r#"{"":"v"}"#.to_string(),
+    ] {
+        let state = make_state();
+        let svc = BedrockService::new(state.clone());
+        let req = with_metadata_header(
+            make_request(
+                Method::POST,
+                "/model/amazon.titan-text-express-v1/invoke",
+                &body,
+            ),
+            &header,
+        );
+        let err = expect_err(svc.handle(req).await);
+        assert_eq!(err.code(), "ValidationException", "{header}");
+        assert!(recorded_metadata(&state).is_empty(), "{header}");
+    }
+
+    // The model's allowed character set (incl. the `,-.` range, whitespace,
+    // and an empty value) is accepted.
+    let state = make_state();
+    let svc = BedrockService::new(state.clone());
+    let req = with_metadata_header(
+        make_request(
+            Method::POST,
+            "/model/amazon.titan-text-express-v1/invoke",
+            &body,
+        ),
+        r#"{"a b:_@$#=/+,-.":"x y:_@$#=/+,-.","empty":""}"#,
+    );
+    svc.handle(req).await.unwrap();
+    let recorded = recorded_metadata(&state);
+    let m = recorded[0].as_ref().unwrap();
+    assert_eq!(m.get("empty").map(String::as_str), Some(""));
+    assert_eq!(
+        m.get("a b:_@$#=/+,-.").map(String::as_str),
+        Some("x y:_@$#=/+,-.")
+    );
+}
+
+#[tokio::test]
+async fn converse_request_metadata_map_constraints_are_enforced() {
+    let seventeen: serde_json::Map<String, Value> = (0..17)
+        .map(|i| (format!("k{i}"), Value::String("v".into())))
+        .collect();
+    for (path, meta) in [
+        ("/model/anthropic.claude-v2/converse", serde_json::json!({})),
+        (
+            "/model/anthropic.claude-v2/converse",
+            Value::Object(seventeen.clone()),
+        ),
+        (
+            "/model/anthropic.claude-v2/converse",
+            serde_json::json!({"k": 7}),
+        ),
+        (
+            "/model/anthropic.claude-v2/converse-stream",
+            serde_json::json!({"bad*key": "v"}),
+        ),
+        (
+            "/model/anthropic.claude-v2/converse-stream",
+            serde_json::json!({"k": "v".repeat(257)}),
+        ),
+        (
+            "/model/anthropic.claude-v2/converse-stream",
+            serde_json::json!(["k", "v"]),
+        ),
+    ] {
+        let state = make_state();
+        let svc = BedrockService::new(state.clone());
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": [{"text": "Hello"}]}],
+            "requestMetadata": meta
+        })
+        .to_string();
+        let err = expect_err(svc.handle(make_request(Method::POST, path, &body)).await);
+        assert_eq!(err.code(), "ValidationException", "{path} {meta}");
+        assert!(recorded_metadata(&state).is_empty(), "{path} {meta}");
+    }
+
+    // ConverseStream records a valid map.
+    let state = make_state();
+    let svc = BedrockService::new(state.clone());
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": [{"text": "Hello"}]}],
+        "requestMetadata": {"tenant": "acme"}
+    })
+    .to_string();
+    svc.handle(make_request(
+        Method::POST,
+        "/model/anthropic.claude-v2/converse-stream",
+        &body,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        recorded_metadata(&state)[0]
+            .as_ref()
+            .and_then(|m| m.get("tenant"))
+            .map(String::as_str),
+        Some("acme")
+    );
+}
+
+#[tokio::test]
+async fn invoke_model_records_request_metadata_header_pairs() {
+    let state = make_state();
+    let svc = BedrockService::new(state.clone());
+    let body = serde_json::json!({
+        "inputText": "Hello",
+        // The InvokeModel body is the opaque model payload: a
+        // `requestMetadata` key in it is not request metadata.
+        "requestMetadata": {"from": "body"}
+    })
+    .to_string();
+    let req = with_metadata_header(
+        make_request(
+            Method::POST,
+            "/model/amazon.titan-text-express-v1/invoke",
+            &body,
+        ),
+        r#"{"team":"search","env":"dev"}"#,
+    );
+    svc.handle(req).await.unwrap();
+    let req = make_request(
+        Method::POST,
+        "/model/amazon.titan-text-express-v1/invoke",
+        &body,
+    );
+    svc.handle(req).await.unwrap();
+
+    let recorded = recorded_metadata(&state);
+    assert_eq!(recorded.len(), 2);
+    let first = recorded[0].as_ref().unwrap();
+    assert_eq!(first.get("team").map(String::as_str), Some("search"));
+    assert_eq!(first.get("env").map(String::as_str), Some("dev"));
+    assert_eq!(first.len(), 2);
+    assert!(recorded[1].is_none());
+}
+
+#[tokio::test]
+async fn converse_records_request_metadata_map() {
+    let state = make_state();
+    let svc = BedrockService::new(state.clone());
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": [{"text": "Hello"}]}],
+        "requestMetadata": {"tenant": "acme"}
+    })
+    .to_string();
+    let req = make_request(Method::POST, "/model/anthropic.claude-v2/converse", &body);
+    svc.handle(req).await.unwrap();
+
+    let recorded = recorded_metadata(&state);
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        recorded[0]
+            .as_ref()
+            .and_then(|m| m.get("tenant"))
+            .map(String::as_str),
+        Some("acme")
+    );
+}
+
+// ── InvokeGuardrailChecks ──
+
+#[tokio::test]
+async fn invoke_guardrail_checks_routes_and_evaluates() {
+    let svc = BedrockService::new(make_state());
+    assert!(svc.supported_actions().contains(&"InvokeGuardrailChecks"));
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": [{"text": "call 555-123-4567"}]}],
+        "checks": {"sensitiveInformation": {"entities": [{"type": "PHONE"}]}}
+    });
+    let req = make_request(Method::POST, "/guardrail-checks/invoke", &body.to_string());
+    let resp = svc.handle(req).await.unwrap();
+    let b = body_json(&resp);
+    let hit = &b["results"]["sensitiveInformation"]["results"][0];
+    assert_eq!(hit["type"], "PHONE");
+    assert_eq!(hit["beginOffset"], 5);
+    assert_eq!(hit["endOffset"], 17);
+
+    let req = make_request(
+        Method::POST,
+        "/guardrail-checks/invoke",
+        r#"{"messages":[],"checks":{}}"#,
+    );
+    assert_eq!(
+        expect_err(svc.handle(req).await).code(),
+        "ValidationException"
+    );
+}
