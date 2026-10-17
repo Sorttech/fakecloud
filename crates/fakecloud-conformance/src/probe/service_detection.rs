@@ -204,6 +204,8 @@ pub(super) fn service_protocol(service_name: &str) -> Protocol {
         "glacier" => Protocol::Rest,
         // AWS Backup: restJson1 control plane (@http traits + JSON bodies).
         "backup" => Protocol::Rest,
+        // AWS Batch: restJson1 control plane (@http POST URIs + JSON bodies).
+        "batch" => Protocol::Rest,
         // AWS Resource Access Manager: restJson1 control plane.
         "ram" => Protocol::Rest,
         // Amazon S3 Tables: restJson1 control plane (path-labelled URIs).

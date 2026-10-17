@@ -1,6 +1,6 @@
 {
-  "variants_passed": 257288,
-  "total_variants": 257288,
+  "variants_passed": 258545,
+  "total_variants": 258545,
   "per_service": {
     "ce": {
       "passed": 1781,
@@ -429,6 +429,10 @@
     "firehose": {
       "passed": 416,
       "total": 416
+    },
+    "batch": {
+      "passed": 1257,
+      "total": 1257
     }
   }
 }

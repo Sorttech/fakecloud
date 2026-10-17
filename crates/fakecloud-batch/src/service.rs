@@ -351,6 +351,30 @@ pub(crate) fn client_error(code: &str, msg: impl Into<String>) -> AwsServiceErro
     AwsServiceError::aws_error(StatusCode::BAD_REQUEST, code, msg.into())
 }
 
+/// The `{resourceArn}` label of the tag operations, which AWS rejects unless it
+/// is a Batch ARN (`arn:<partition>:batch:<region>:<account>:<resource>`).
+fn tag_resource_arn(arn: &str) -> Result<String, AwsServiceError> {
+    if arn.is_empty() {
+        return Err(client_error("ClientException", "resourceArn is required"));
+    }
+    let parts: Vec<&str> = arn.splitn(6, ':').collect();
+    let valid = parts.len() == 6
+        && parts[0] == "arn"
+        && !parts[1].is_empty()
+        && parts[2] == "batch"
+        && !parts[3].is_empty()
+        && parts[4].len() == 12
+        && parts[4].bytes().all(|b| b.is_ascii_digit())
+        && !parts[5].is_empty();
+    if !valid {
+        return Err(client_error(
+            "ClientException",
+            format!("Invalid resourceArn: {arn}"),
+        ));
+    }
+    Ok(arn.to_string())
+}
+
 pub(crate) type TagStore =
     std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>;
 
@@ -578,7 +602,20 @@ impl BatchService {
                 st.job_queues
                     .values()
                     .filter(|q| match_named(q, &wanted, "jobQueueName", "jobQueueArn"))
-                    .map(|q| merge_tag_overlay(q, "jobQueueArn", &st.tags))
+                    .map(|q| {
+                        let mut q = merge_tag_overlay(q, "jobQueueArn", &st.tags);
+                        // `computeEnvironmentOrder` is required on JobQueueDetail: a
+                        // queue fed by service environments reports it empty.
+                        if let Some(o) = q.as_object_mut() {
+                            let order = o
+                                .entry("computeEnvironmentOrder")
+                                .or_insert_with(|| json!([]));
+                            if order.is_null() {
+                                *order = json!([]);
+                            }
+                        }
+                        q
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -605,6 +642,18 @@ impl BatchService {
             .and_then(Value::as_str)
             .ok_or_else(|| client_error("ClientException", "jobDefinitionName is required"))?
             .to_string();
+        match body.get("type").and_then(Value::as_str) {
+            Some("container" | "multinode") => {}
+            Some(other) => {
+                return Err(client_error(
+                    "ClientException",
+                    format!(
+                        "Invalid job definition type: {other}. Valid values: container, multinode"
+                    ),
+                ))
+            }
+            None => return Err(client_error("ClientException", "type is required")),
+        }
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
         let revision = st.job_def_revisions.entry(name.clone()).or_insert(0);
@@ -1372,7 +1421,7 @@ impl BatchService {
         let reason = body
             .get("reason")
             .and_then(Value::as_str)
-            .unwrap_or(op)
+            .ok_or_else(|| client_error("ClientException", format!("reason is required for {op}")))?
             .to_string();
         let mut accounts = self.state.write();
         if let Some(job) = accounts
@@ -1397,8 +1446,9 @@ impl BatchService {
         let arn = req
             .path_segments
             .get(2)
-            .cloned()
-            .ok_or_else(|| client_error("ClientException", "resourceArn is required"))?;
+            .map(String::as_str)
+            .map(tag_resource_arn)
+            .unwrap_or_else(|| Err(client_error("ClientException", "resourceArn is required")))?;
         let body = req.json_body();
         let tags = body
             .get("tags")
@@ -1423,8 +1473,9 @@ impl BatchService {
         let arn = req
             .path_segments
             .get(2)
-            .cloned()
-            .ok_or_else(|| client_error("ClientException", "resourceArn is required"))?;
+            .map(String::as_str)
+            .map(tag_resource_arn)
+            .unwrap_or_else(|| Err(client_error("ClientException", "resourceArn is required")))?;
         // `tagKeys` is an `@httpQuery` list sent as repeated `tagKeys=a&tagKeys=b`
         // pairs; `query_params` collapses repeats to the last value, so parse the
         // raw query string for every occurrence, percent-decoding each.
@@ -1447,8 +1498,9 @@ impl BatchService {
         let arn = req
             .path_segments
             .get(2)
-            .cloned()
-            .ok_or_else(|| client_error("ClientException", "resourceArn is required"))?;
+            .map(String::as_str)
+            .map(tag_resource_arn)
+            .unwrap_or_else(|| Err(client_error("ClientException", "resourceArn is required")))?;
         let accounts = self.state.read();
         let tags = accounts
             .get(&req.account_id)
@@ -2541,6 +2593,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn required_inputs_are_rejected_when_missing() {
+        let s = svc();
+        for (path, body) in [
+            (
+                "/v1/registerjobdefinition",
+                json!({"jobDefinitionName": "jd"}),
+            ),
+            (
+                "/v1/registerjobdefinition",
+                json!({"jobDefinitionName": "jd", "type": "lambda"}),
+            ),
+            ("/v1/canceljob", json!({"jobId": "j"})),
+            ("/v1/terminatejob", json!({"jobId": "j"})),
+        ] {
+            match s.handle(req(path, body.clone())).await {
+                Err(e) => assert!(format!("{e:?}").contains("ClientException"), "{path}"),
+                Ok(_) => panic!("{path} {body} must be rejected"),
+            }
+        }
+        for path in [
+            "/v1/tags/",
+            "/v1/tags/%7BresourceArn%7D",
+            "/v1/tags/not-an-arn",
+        ] {
+            for method in [Method::GET, Method::POST, Method::DELETE] {
+                let mut r = req(path, json!({"tags": {"k": "v"}}));
+                r.method = method.clone();
+                assert!(
+                    s.handle(r).await.is_err(),
+                    "{method} {path} has no Batch ARN"
+                );
+            }
+        }
+        // Nothing was registered by the rejected calls.
+        let d = body_of(
+            s.handle(req(
+                "/v1/describejobdefinitions",
+                json!({"jobDefinitionName": "jd"}),
+            ))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(d["jobDefinitions"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn every_described_queue_carries_compute_environment_order() {
+        let s = svc();
+        mk_queue(&s, "plain").await;
+        let d = body_of(
+            s.handle(req("/v1/describejobqueues", json!({})))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(d["jobQueues"][0]["computeEnvironmentOrder"], json!([]));
+    }
+
+    #[tokio::test]
     async fn tags_agree_across_describe_and_list_tags() {
         let s = svc();
         // Create WITH inline tags.
@@ -3143,12 +3253,14 @@ mod tests {
     async fn list_tags_with_multibyte_arn_does_not_panic() {
         let s = svc();
         // Raw multi-byte byte in the ARN path segment (what dispatch would pass
-        // through unescaped) must yield a normal response, not a dropped conn.
+        // through unescaped) must yield a normal ClientException (it is not a
+        // Batch ARN), not a dropped conn.
         let mut r = req("/v1/tags/%€", json!({}));
         r.method = Method::GET;
-        let resp = s.handle(r).await.unwrap();
-        let v = body_of(resp);
-        assert!(v.get("tags").is_some());
+        match s.handle(r).await {
+            Err(e) => assert!(format!("{e:?}").contains("ClientException")),
+            Ok(_) => panic!("a non-ARN resourceArn must be rejected"),
+        }
     }
 
     #[tokio::test]

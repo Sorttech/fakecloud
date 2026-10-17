@@ -191,6 +191,7 @@ fn service_source_files(project_root: &Path) -> Vec<AuditMapping> {
         // together they cover the whole union, so either tag counts for both
         // mappings (same pattern as the bedrock control/data-plane crate).
         ("backup", "backup", &["service.rs"], &["backup"]),
+        ("batch", "batch", &["service.rs"], &["batch"]),
         ("ram", "ram", &["service.rs"], &["ram"]),
         ("s3tables", "s3tables", &["service.rs"], &["s3tables"]),
         (
