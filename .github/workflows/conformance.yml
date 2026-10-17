@@ -168,7 +168,7 @@ jobs:
       - name: Build conformance tool
         run: cargo build -p fakecloud-conformance
 
-      - name: Check conformance (fails if coverage drops)
+      - name: Check conformance (fails on any failing variant)
         id: check
         run: |
           set -o pipefail

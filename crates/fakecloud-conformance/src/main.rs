@@ -84,7 +84,7 @@ enum CliCommand {
     Audit,
     /// Check that each crate's vendored `model.json` still matches `aws-models/`
     VendoredModels,
-    /// Check conformance results against baseline (fails if coverage drops)
+    /// Check conformance results (fails on any failing variant or a service below its baseline)
     Check {
         /// Path to conformance-baseline.json
         #[arg(long, default_value = "conformance-baseline.json")]
@@ -1036,20 +1036,6 @@ fn cmd_check(
         }
     }
 
-    // Overall ratchet: per-service margins can pile up, so allow the union.
-    let overall_margin = flake_margin.saturating_mul(baseline.per_service.len().max(1));
-    let current_total_passed = report_data.summary.variants_passed;
-    let allowed_total = baseline.variants_passed.saturating_sub(overall_margin);
-    if current_total_passed < allowed_total {
-        regressions.push(format!(
-            "overall: {} → {} variants passing (lost {}; margin {})",
-            baseline.variants_passed,
-            current_total_passed,
-            baseline.variants_passed - current_total_passed,
-            overall_margin,
-        ));
-    }
-
     if let Some(path) = markdown_summary_out {
         let baseline_passed: HashMap<String, usize> = baseline
             .per_service
@@ -1102,7 +1088,8 @@ fn failing_operations(report_data: &report::ConformanceReport) -> Vec<String> {
         .flat_map(|svc| {
             svc.operations
                 .iter()
-                .filter(|op| op.passed < op.total_variants)
+                // An op with no variants at all is as unchecked as a failing one.
+                .filter(|op| op.passed < op.total_variants || op.total_variants == 0)
                 .map(|op| {
                     format!(
                         "{} {}: {}/{} variants passing",
@@ -1151,18 +1138,6 @@ fn cmd_update_baseline(
 #[cfg(test)]
 mod tests {
 
-    fn op(name: &str, passed: usize, total: usize) -> report::OperationReport {
-        report::OperationReport {
-            name: name.to_string(),
-            total_variants: total,
-            passed,
-            failed: total - passed,
-            not_implemented: false,
-            crashes: 0,
-            failures: Vec::new(),
-        }
-    }
-
     #[test]
     fn every_failing_operation_is_a_check_failure() {
         let report_data = report::ConformanceReport {
@@ -1174,8 +1149,8 @@ mod tests {
                 },
                 report::ServiceReport {
                     service_name: "kms".to_string(),
-                    total_operations: 1,
-                    operations: vec![op("Encrypt", 40, 40)],
+                    total_operations: 2,
+                    operations: vec![op("Encrypt", 40, 40), op("Decrypt", 0, 0)],
                 },
             ],
             summary: report::Summary {
@@ -1191,10 +1166,25 @@ mod tests {
         };
         assert_eq!(
             failing_operations(&report_data),
-            vec!["sqs DeleteMessageBatch: 21/22 variants passing".to_string()]
+            vec![
+                "sqs DeleteMessageBatch: 21/22 variants passing".to_string(),
+                "kms Decrypt: 0/0 variants passing".to_string(),
+            ]
         );
     }
     use super::*;
+
+    fn op(name: &str, passed: usize, total: usize) -> report::OperationReport {
+        report::OperationReport {
+            name: name.to_string(),
+            total_variants: total,
+            passed,
+            failed: total - passed,
+            not_implemented: false,
+            crashes: 0,
+            failures: Vec::new(),
+        }
+    }
 
     /// A one-request-per-connection HTTP stub that answers `GET` with
     /// `get_body` and everything else with an empty 200, recording each
