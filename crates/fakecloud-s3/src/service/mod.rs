@@ -30,7 +30,7 @@ use lock::{has_object_lock_headers, has_payload_integrity_header};
 mod multipart;
 pub(crate) mod notifications;
 mod objects;
-pub(crate) use objects::run_blocking_io;
+pub(crate) use objects::{commit_object_version, run_blocking_io};
 mod tags;
 
 // Re-export notification helpers for use in sub-modules
