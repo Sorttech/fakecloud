@@ -2368,11 +2368,20 @@ final class BedrockInvocation
         public readonly ?string $output,
         public readonly string $timestamp,
         public readonly ?string $error,
+        /** @var array<string, string>|null requestMetadata key-value pairs, or null when none were supplied */
+        public readonly ?array $requestMetadata = null,
     ) {}
 
     public static function fromArray(array $data): self
     {
-        return new self($data['modelId'], $data['input'], $data['output'] ?? null, $data['timestamp'], $data['error'] ?? null);
+        return new self(
+            $data['modelId'],
+            $data['input'],
+            $data['output'] ?? null,
+            $data['timestamp'],
+            $data['error'] ?? null,
+            $data['requestMetadata'] ?? null,
+        );
     }
 }
 

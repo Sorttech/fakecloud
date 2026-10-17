@@ -81,6 +81,7 @@ fn is_read_only_action(action: &str) -> bool {
             | "ConverseStream"
             | "CountTokens"
             | "ApplyGuardrail"
+            | "InvokeGuardrailChecks"
     )
 }
 
@@ -1071,9 +1072,7 @@ impl AwsService for BedrockService {
                 &extra_id.unwrap_or_default(),
                 &req.body,
             ),
-            "InvokeGuardrailChecks" => {
-                crate::guardrail_checks::invoke_guardrail_checks(&req, &body)
-            }
+            "InvokeGuardrailChecks" => crate::guardrail_checks::invoke_guardrail_checks(&body),
             // Custom models
             "CreateCustomModel" => {
                 crate::custom_models::create_custom_model(&self.state, &req, &body)
@@ -1627,6 +1626,7 @@ impl AwsService for BedrockService {
                 let model_id = resource_id.unwrap_or_default();
                 crate::runtime_validation::validate_invoke_model_id(&model_id)?;
                 crate::runtime_validation::validate_runtime_headers(&req)?;
+                let metadata = crate::runtime_validation::request_metadata_header(&req)?;
                 crate::runtime_validation::validate_invoke_body_size(&req.body)?;
                 match crate::upstream::UpstreamConfig::from_env() {
                     Some(cfg) => {
@@ -1636,10 +1636,17 @@ impl AwsService for BedrockService {
                             &model_id,
                             &req.body,
                             &cfg,
+                            metadata.as_ref(),
                         )
                         .await
                     }
-                    None => crate::invoke::invoke_model(&self.state, &req, &model_id, &req.body),
+                    None => crate::invoke::invoke_model(
+                        &self.state,
+                        &req,
+                        &model_id,
+                        &req.body,
+                        metadata.as_ref(),
+                    ),
                 }
             }
             "CountTokens" => {
@@ -1650,6 +1657,7 @@ impl AwsService for BedrockService {
             "Converse" => {
                 let model_id = resource_id.unwrap_or_default();
                 crate::runtime_validation::validate_invoke_model_id(&model_id)?;
+                let metadata = crate::runtime_validation::request_metadata_body(&body)?;
                 match crate::upstream::UpstreamConfig::from_env() {
                     Some(cfg) => {
                         crate::upstream::converse_upstream(
@@ -1658,17 +1666,26 @@ impl AwsService for BedrockService {
                             &model_id,
                             &req.body,
                             &cfg,
+                            metadata.as_ref(),
                         )
                         .await
                     }
-                    None => crate::converse::converse(&self.state, &req, &model_id, &req.body),
+                    None => crate::converse::converse(
+                        &self.state,
+                        &req,
+                        &model_id,
+                        &req.body,
+                        metadata.as_ref(),
+                    ),
                 }
             }
             "InvokeModelWithResponseStream" | "InvokeModelWithBidirectionalStream" => {
                 let model_id = resource_id.unwrap_or_default();
                 crate::runtime_validation::validate_invoke_model_id(&model_id)?;
+                let mut metadata = None;
                 if action == "InvokeModelWithResponseStream" {
                     crate::runtime_validation::validate_runtime_headers(&req)?;
+                    metadata = crate::runtime_validation::request_metadata_header(&req)?;
                     crate::runtime_validation::validate_invoke_body_size(&req.body)?;
                 }
                 if action == "InvokeModelWithBidirectionalStream" {
@@ -1694,6 +1711,7 @@ impl AwsService for BedrockService {
                         &model_id,
                         &req.body,
                         &fault,
+                        metadata.as_ref(),
                     );
                     return Err(crate::faults::fault_to_error(&fault));
                 }
@@ -1707,6 +1725,7 @@ impl AwsService for BedrockService {
                             &model_id,
                             &req.body,
                             &cfg,
+                            metadata.as_ref(),
                         )
                         .await;
                     }
@@ -1717,17 +1736,15 @@ impl AwsService for BedrockService {
                     crate::streaming::build_invoke_stream_response(&model_id, &response_text);
 
                 // Record invocation
-                {
-                    let mut accts = self.state.write();
-                    let s = accts.get_or_create(&req.account_id);
-                    s.invocations.push(crate::state::ModelInvocation {
-                        model_id: model_id.clone(),
-                        input: String::from_utf8_lossy(&req.body).to_string(),
-                        output: response_text,
-                        timestamp: chrono::Utc::now(),
-                        error: None,
-                    });
-                }
+                crate::invoke::record_invocation(
+                    &self.state,
+                    &req,
+                    &model_id,
+                    &req.body,
+                    &response_text,
+                    None,
+                    metadata.as_ref(),
+                );
 
                 Ok(AwsResponse {
                     status: http::StatusCode::OK,
@@ -1739,6 +1756,7 @@ impl AwsService for BedrockService {
             "ConverseStream" => {
                 let model_id = resource_id.unwrap_or_default();
                 crate::runtime_validation::validate_invoke_model_id(&model_id)?;
+                let metadata = crate::runtime_validation::request_metadata_body(&body)?;
                 if let Some(fault) = crate::faults::take_matching_fault(
                     &self.state,
                     &req,
@@ -1751,6 +1769,7 @@ impl AwsService for BedrockService {
                         &model_id,
                         &req.body,
                         &fault,
+                        metadata.as_ref(),
                     );
                     return Err(crate::faults::fault_to_error(&fault));
                 }
@@ -1762,6 +1781,7 @@ impl AwsService for BedrockService {
                         &model_id,
                         &req.body,
                         &cfg,
+                        metadata.as_ref(),
                     )
                     .await;
                 }
@@ -1810,17 +1830,15 @@ impl AwsService for BedrockService {
                 );
 
                 // Record invocation
-                {
-                    let mut accts = self.state.write();
-                    let s = accts.get_or_create(&req.account_id);
-                    s.invocations.push(crate::state::ModelInvocation {
-                        model_id: model_id.clone(),
-                        input: String::from_utf8_lossy(&req.body).to_string(),
-                        output: response_text,
-                        timestamp: chrono::Utc::now(),
-                        error: None,
-                    });
-                }
+                crate::invoke::record_invocation(
+                    &self.state,
+                    &req,
+                    &model_id,
+                    &req.body,
+                    &response_text,
+                    None,
+                    metadata.as_ref(),
+                );
 
                 Ok(AwsResponse {
                     status: http::StatusCode::OK,
@@ -1863,6 +1881,7 @@ impl AwsService for BedrockService {
             "DeleteGuardrail",
             "CreateGuardrailVersion",
             "ApplyGuardrail",
+            "InvokeGuardrailChecks",
             "CreateCustomModel",
             "GetCustomModel",
             "ListCustomModels",

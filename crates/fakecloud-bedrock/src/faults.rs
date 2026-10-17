@@ -1,9 +1,8 @@
-use chrono::Utc;
 use http::StatusCode;
 
 use fakecloud_core::service::{AwsRequest, AwsServiceError};
 
-use crate::state::{FaultRule, ModelInvocation, SharedBedrockState};
+use crate::state::{FaultRule, SharedBedrockState};
 
 /// Pop the first queued fault rule that matches the given `(model_id, operation)`
 /// pair. Decrements the rule's remaining count; removes the rule when it hits
@@ -48,16 +47,17 @@ pub(crate) fn record_faulted_invocation(
     model_id: &str,
     body: &[u8],
     fault: &FaultRule,
+    request_metadata: Option<&crate::runtime_validation::RequestMetadata>,
 ) {
-    let mut accts = state.write();
-    let s = accts.get_or_create(&req.account_id);
-    s.invocations.push(ModelInvocation {
-        model_id: model_id.to_string(),
-        input: String::from_utf8_lossy(body).to_string(),
-        output: String::new(),
-        timestamp: Utc::now(),
-        error: Some(format!("{}: {}", fault.error_type, fault.message)),
-    });
+    crate::invoke::record_invocation(
+        state,
+        req,
+        model_id,
+        body,
+        "",
+        Some(format!("{}: {}", fault.error_type, fault.message)),
+        request_metadata,
+    );
 }
 
 #[cfg(test)]
@@ -195,7 +195,7 @@ mod tests {
     fn record_faulted_invocation_appends_error_entry() {
         let s = shared();
         let r = rule("Throttled", "slow", 429, 1, None, None);
-        record_faulted_invocation(&s, &req(), "m-1", b"input-body", &r);
+        record_faulted_invocation(&s, &req(), "m-1", b"input-body", &r, None);
         let guard = s.read();
         let inv = &guard.default_ref().invocations[0];
         assert_eq!(inv.model_id, "m-1");
