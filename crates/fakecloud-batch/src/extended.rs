@@ -250,10 +250,7 @@ pub(crate) fn admit_job(st: &mut BatchState, job_id: &str) -> Admission {
     let Some(job) = st.jobs.get(job_id) else {
         return Admission::Admitted;
     };
-    if matches!(
-        job.get("status").and_then(Value::as_str),
-        Some("SUCCEEDED" | "FAILED")
-    ) {
+    if crate::service::is_terminal(job) {
         return Admission::Stopped;
     }
     let reqs = job_consumable_requirements(job);
