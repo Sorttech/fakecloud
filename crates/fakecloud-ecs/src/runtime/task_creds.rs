@@ -26,15 +26,14 @@
 //!   task container runs.
 //!
 //! Fail-safe: when the holder / initContainer can't do its job (no helper
-//! image, `NET_ADMIN` refused, no NAT support), the task still runs with
+//! image -- including a helper build or pull that outran its budget --
+//! `NET_ADMIN` refused, no NAT support), the task still runs with
 //! `AWS_CONTAINER_CREDENTIALS_FULL_URI` pointing at fakecloud, which
 //! `curl`-style clients can still use.
 
 use std::time::Duration;
 
-use tokio::process::Command;
-
-use super::{ContainerPlan, EcsRuntime};
+use super::{ContainerPlan, EcsRuntime, CLI_CALL_TIMEOUT, CONTAINER_RUN_TIMEOUT};
 
 /// Overrides the helper image (Docker, Podman and Kubernetes). It must have
 /// `sh`, `getent`, `awk` and either `nft` or `iptables`.
@@ -107,6 +106,37 @@ pub(crate) enum HelperImage {
 
 /// How long a holder may take to install its rule.
 const HOLDER_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Budget for one `build` of the local helper. The build is
+/// `apk add nftables` on a base image that is already pulled, which takes a
+/// few seconds (tens on a slow Podman host); the CLI has no deadline of its
+/// own, so a package mirror that stalls mid-download would otherwise hold
+/// every task-role launch in `PENDING` forever. Ninety seconds is many times
+/// a healthy build and short enough that a retry -- a fresh connection, often
+/// to a different CDN edge -- still fits in [`HELPER_BUILD_BUDGET`].
+const HELPER_BUILD_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Budget for every attempt of the helper build together, backoff included.
+/// Tasks that need the helper wait on the first one's build, so this bounds
+/// how long a stalled mirror can hold any task-role launch before it falls
+/// back to the full credentials URI.
+const HELPER_BUILD_BUDGET: Duration = Duration::from_secs(240);
+
+/// The helper build's limits; tests shrink them.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BuildLimits {
+    pub(crate) attempts: u32,
+    pub(crate) attempt_timeout: Duration,
+    pub(crate) budget: Duration,
+    pub(crate) retry_delay: Duration,
+}
+
+const BUILD_LIMITS: BuildLimits = BuildLimits {
+    attempts: 3,
+    attempt_timeout: HELPER_BUILD_ATTEMPT_TIMEOUT,
+    budget: HELPER_BUILD_BUDGET,
+    retry_delay: Duration::from_secs(2),
+};
 
 /// The agent's relative credentials URI for a task.
 pub(crate) fn relative_uri(task_id: &str) -> String {
@@ -340,6 +370,32 @@ impl EcsRuntime {
     /// The helper image for namespace holders: the operator's override, or a
     /// locally built Alpine + nftables image (built once per host and reused).
     pub(crate) async fn ensure_creds_helper_image(&self) -> Result<String, String> {
+        self.ensure_creds_helper_image_with(BUILD_LIMITS).await
+    }
+
+    /// [`Self::ensure_creds_helper_image`] with explicit build limits. The
+    /// lock is held across the whole resolution, so concurrent first tasks
+    /// make one build (or pull) and share its outcome instead of racing
+    /// builds of the same tag.
+    pub(crate) async fn ensure_creds_helper_image_with(
+        &self,
+        limits: BuildLimits,
+    ) -> Result<String, String> {
+        // Fast path, the common case of every launch after the first: check a
+        // resolved image without holding the lock, so launches don't queue
+        // behind each other's `image inspect`.
+        let ready = match self.creds_helper_image.lock().await.as_ref() {
+            Some(HelperImage::Ready(image)) => Some(image.clone()),
+            _ => None,
+        };
+        if let Some(image) = ready {
+            if self.image_present(&image).await {
+                return Ok(image);
+            }
+        }
+        // Slow path, under the lock for the whole resolution so concurrent
+        // launches share one build. Everything is re-checked: another launch
+        // may have resolved (or failed) while this one waited.
         let mut cached = self.creds_helper_image.lock().await;
         match cached.as_ref() {
             // Re-check: the image can be pruned while fakecloud runs, and a
@@ -355,10 +411,11 @@ impl EcsRuntime {
             _ => {}
         }
         let resolved = match helper_image_override() {
-            Some(image) => fakecloud_core::container_image::ensure_image(
+            Some(image) => fakecloud_core::container_image::ensure_image_within(
                 &self.cli,
                 self.docker_config_path().as_deref(),
                 &image,
+                limits.budget,
             )
             .await
             .map(|_| image),
@@ -367,7 +424,7 @@ impl EcsRuntime {
                 if self.image_present(&tag).await {
                     Ok(tag)
                 } else {
-                    self.build_local_helper(&tag).await.map(|()| tag)
+                    self.build_local_helper(&tag, limits).await.map(|()| tag)
                 }
             }
         };
@@ -382,38 +439,58 @@ impl EcsRuntime {
     }
 
     async fn image_present(&self, tag: &str) -> bool {
-        Command::new(&self.cli)
-            .args(["image", "inspect", tag])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
+        self.cli_output(["image", "inspect", tag], CLI_CALL_TIMEOUT)
             .await
-            .is_ok_and(|s| s.success())
+            .is_ok_and(|o| o.status.success())
     }
 
-    async fn build_local_helper(&self, tag: &str) -> Result<(), String> {
+    async fn build_local_helper(&self, tag: &str, limits: BuildLimits) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + limits.budget;
         // Pull the base with the shared retry so a registry 429 doesn't fail
         // the build's implicit pull.
-        fakecloud_core::container_image::ensure_image(&self.cli, None, HELPER_BASE_IMAGE).await?;
+        // Bounded by the build's own budget: the base is small, so a pull that
+        // outlives it has stalled.
+        fakecloud_core::container_image::ensure_image_within(
+            &self.cli,
+            None,
+            HELPER_BASE_IMAGE,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await?;
         let dir = tempfile::tempdir().map_err(|e| format!("helper build dir: {e}"))?;
         std::fs::write(dir.path().join("Dockerfile"), helper_dockerfile())
             .map_err(|e| format!("helper Dockerfile: {e}"))?;
         let mut last_err = String::new();
-        for attempt in 0..3u64 {
+        for attempt in 0..limits.attempts {
             if attempt > 0 {
-                tokio::time::sleep(Duration::from_secs(2 * attempt)).await;
+                tokio::time::sleep(limits.retry_delay * attempt).await;
             }
-            let out = Command::new(&self.cli)
-                .args(["build", "-q", "-t", tag])
-                .arg(dir.path())
-                .output()
-                .await
-                .map_err(|e| format!("{} build: {e}", self.cli))?;
-            if out.status.success() {
-                tracing::info!(image = %tag, "built ECS task-credentials helper image");
-                return Ok(());
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
             }
-            last_err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let timeout = limits.attempt_timeout.min(remaining);
+            let mut args: Vec<std::ffi::OsString> = ["build", "-q", "-t", tag]
+                .into_iter()
+                .map(Into::into)
+                .collect();
+            args.push(dir.path().into());
+            match self.cli_output(&args, timeout).await {
+                Ok(out) if out.status.success() => {
+                    tracing::info!(image = %tag, "built ECS task-credentials helper image");
+                    return Ok(());
+                }
+                Ok(out) => last_err = String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                // Timed out (killed) or could not run: either way the next
+                // attempt starts from scratch.
+                Err(e) => last_err = e,
+            }
+            tracing::warn!(
+                image = %tag,
+                attempt = attempt + 1,
+                error = %last_err,
+                "ECS task-credentials helper build failed"
+            );
         }
         Err(format!("building {tag}: {last_err}"))
     }
@@ -430,10 +507,7 @@ impl EcsRuntime {
     ) -> Result<String, String> {
         let name = holder_name(task_id, &plan.container_name);
         // A holder left by an earlier attempt of this task would block the name.
-        let _ = Command::new(&self.cli)
-            .args(["rm", "-f", &name])
-            .output()
-            .await;
+        let _ = self.cli_output(["rm", "-f", &name], CLI_CALL_TIMEOUT).await;
         let argv = build_holder_argv(
             plan,
             task_id,
@@ -443,24 +517,20 @@ impl EcsRuntime {
             &self.net.host_alias,
             self.server_port,
         );
-        let out = Command::new(&self.cli)
-            .args(&argv)
-            .output()
-            .await
-            .map_err(|e| e.to_string())?;
-        if !out.status.success() {
-            let _ = Command::new(&self.cli)
-                .args(["rm", "-f", &name])
-                .output()
-                .await;
-            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-        }
+        let out = match self.cli_output(&argv, CONTAINER_RUN_TIMEOUT).await {
+            Ok(out) if out.status.success() => out,
+            failed => {
+                // A timed-out `run` may still have created the holder.
+                let _ = self.cli_output(["rm", "-f", &name], CLI_CALL_TIMEOUT).await;
+                return Err(match failed {
+                    Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                    Err(e) => e,
+                });
+            }
+        };
         let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if let Err(e) = self.wait_for_holder_ready(&id).await {
-            let _ = Command::new(&self.cli)
-                .args(["rm", "-f", &id])
-                .output()
-                .await;
+            let _ = self.cli_output(["rm", "-f", &id], CLI_CALL_TIMEOUT).await;
             return Err(e);
         }
         self.netns_holders
@@ -474,20 +544,24 @@ impl EcsRuntime {
     async fn wait_for_holder_ready(&self, id: &str) -> Result<(), String> {
         let deadline = std::time::Instant::now() + HOLDER_READY_TIMEOUT;
         let mut poll = Duration::from_millis(100);
+        // Each call gets what is left of the readiness budget (plus a
+        // moment, so the last poll can still run), never the CLI default:
+        // a wedged daemon must not stretch the wait past its deadline.
+        let call_budget = || {
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(CLI_CALL_TIMEOUT)
+                + Duration::from_secs(1)
+        };
         loop {
-            let logs = Command::new(&self.cli)
-                .args(["logs", id])
-                .output()
-                .await
-                .map_err(|e| e.to_string())?;
+            let logs = self.cli_output(["logs", id], call_budget()).await?;
             let stdout = String::from_utf8_lossy(&logs.stdout);
             let stderr = String::from_utf8_lossy(&logs.stderr);
             if stdout.contains(READY_MARKER) {
                 return Ok(());
             }
-            let running = Command::new(&self.cli)
-                .args(["inspect", "-f", "{{.State.Running}}", id])
-                .output()
+            let running = self
+                .cli_output(["inspect", "-f", "{{.State.Running}}", id], call_budget())
                 .await
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
                 .unwrap_or(false);
@@ -517,10 +591,7 @@ impl EcsRuntime {
     pub(crate) async fn remove_netns_holders(&self, task_id: &str) {
         let ids = self.netns_holders.write().remove(task_id);
         for id in ids.into_iter().flatten() {
-            let _ = Command::new(&self.cli)
-                .args(["rm", "-f", &id])
-                .output()
-                .await;
+            let _ = self.cli_output(["rm", "-f", &id], CLI_CALL_TIMEOUT).await;
         }
     }
 }
@@ -773,6 +844,165 @@ mod tests {
             *rt.creds_helper_image.lock().await,
             Some(HelperImage::Failed { .. })
         ));
+    }
+
+    /// A stand-in container CLI for the helper build. The base image is always
+    /// present; the helper tag is present once a build succeeded. `build`
+    /// either never finishes (`hang`, recording the pid of the process it is
+    /// stuck in) or succeeds after a moment (`ok`). Every call but the warmup
+    /// is appended to `calls.log`.
+    struct FakeBuildCli {
+        dir: tempfile::TempDir,
+    }
+
+    impl FakeBuildCli {
+        fn new(build: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let body = match build {
+                "hang" => r#"sleep 1000 & echo $! >> "$d/pids"; wait"#,
+                "ok" => r#"sleep 0.3; touch "$d/built""#,
+                other => panic!("unknown build mode {other}"),
+            };
+            let script = format!(
+                r#"#!/bin/sh
+d="{dir}"
+[ "$1" = warmup ] && exit 0
+echo "$*" >> "$d/calls.log"
+case "$1" in
+  image)
+    case "$3" in
+      {repo}:*) [ -f "$d/built" ] ;;
+      *) exit 0 ;;
+    esac ;;
+  build) {body} ;;
+  *) exit 2 ;;
+esac
+"#,
+                dir = dir.path().display(),
+                repo = HELPER_LOCAL_REPO,
+            );
+            fakecloud_core::test_support::write_executable(&dir.path().join("cli"), &script);
+            Self { dir }
+        }
+
+        fn runtime(&self) -> EcsRuntime {
+            let mut rt = EcsRuntime::bare_for_tests();
+            rt.cli = self.dir.path().join("cli").display().to_string();
+            rt
+        }
+
+        fn builds(&self) -> usize {
+            std::fs::read_to_string(self.dir.path().join("calls.log"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.starts_with("build "))
+                .count()
+        }
+
+        fn build_pids(&self) -> Vec<u32> {
+            std::fs::read_to_string(self.dir.path().join("pids"))
+                .unwrap_or_default()
+                .lines()
+                .map(|l| l.trim().parse().unwrap())
+                .collect()
+        }
+    }
+
+    fn limits(attempts: u32, attempt_timeout: Duration, budget: Duration) -> BuildLimits {
+        BuildLimits {
+            attempts,
+            attempt_timeout,
+            budget,
+            retry_delay: Duration::from_millis(10),
+        }
+    }
+
+    /// A build stuck on a stalled package mirror used to hold every
+    /// task-role launch in PENDING forever. Each attempt is now killed at its
+    /// timeout -- with the process it was stuck in -- and the failure is
+    /// returned and remembered, so the next task falls back at once instead
+    /// of waiting out the build again.
+    #[tokio::test]
+    async fn a_build_that_never_finishes_is_killed_and_its_failure_returned() {
+        let cli = FakeBuildCli::new("hang");
+        let rt = cli.runtime();
+        let start = std::time::Instant::now();
+        let err = rt
+            .ensure_creds_helper_image_with(limits(
+                2,
+                Duration::from_millis(300),
+                Duration::from_secs(20),
+            ))
+            .await
+            .expect_err("a hung build must fail");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "took {:?}",
+            start.elapsed()
+        );
+        assert!(
+            err.starts_with(&format!("building {}", local_helper_tag())),
+            "{err}"
+        );
+        assert!(err.contains("build did not finish within 0.3s"), "{err}");
+        assert_eq!(cli.builds(), 2, "every attempt runs, each one bounded");
+        let pids = cli.build_pids();
+        assert_eq!(pids.len(), 2);
+        for pid in pids {
+            assert!(
+                fakecloud_core::test_support::pid_gone(pid),
+                "build process {pid} survived its timeout"
+            );
+        }
+        assert!(matches!(
+            *rt.creds_helper_image.lock().await,
+            Some(HelperImage::Failed { .. })
+        ));
+        assert_eq!(rt.ensure_creds_helper_image().await, Err(err));
+        assert_eq!(cli.builds(), 2, "the remembered failure builds nothing");
+    }
+
+    /// The overall budget caps the attempts too: a retry never starts after
+    /// it, and the last attempt only gets what is left of it.
+    #[tokio::test]
+    async fn the_build_budget_caps_every_attempt_together() {
+        let cli = FakeBuildCli::new("hang");
+        let rt = cli.runtime();
+        let start = std::time::Instant::now();
+        let err = rt
+            .ensure_creds_helper_image_with(limits(
+                5,
+                Duration::from_secs(60),
+                Duration::from_millis(400),
+            ))
+            .await
+            .expect_err("a hung build must fail");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "took {:?}",
+            start.elapsed()
+        );
+        assert!(err.contains("did not finish within"), "{err}");
+        assert_eq!(cli.builds(), 1);
+    }
+
+    /// Tasks starting together share the first one's build instead of racing
+    /// builds of the same tag.
+    #[tokio::test]
+    async fn concurrent_tasks_share_a_single_helper_build() {
+        let cli = FakeBuildCli::new("ok");
+        let rt = std::sync::Arc::new(cli.runtime());
+        let lim = limits(3, Duration::from_secs(30), Duration::from_secs(60));
+        let tasks: Vec<_> = (0..4)
+            .map(|_| {
+                let rt = rt.clone();
+                tokio::spawn(async move { rt.ensure_creds_helper_image_with(lim).await })
+            })
+            .collect();
+        for t in tasks {
+            assert_eq!(t.await.unwrap(), Ok(local_helper_tag()));
+        }
+        assert_eq!(cli.builds(), 1);
     }
 
     #[test]

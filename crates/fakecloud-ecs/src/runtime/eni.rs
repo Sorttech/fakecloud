@@ -352,9 +352,8 @@ impl super::EcsRuntime {
             .filter(|pm| pm.protocol.eq_ignore_ascii_case("tcp"))
         {
             let spec = format!("{}/tcp", pm.container_port);
-            let out = tokio::process::Command::new(&self.cli)
-                .args(["port", owner, &spec])
-                .output()
+            let out = self
+                .cli_output(["port", owner, &spec], super::CLI_CALL_TIMEOUT)
                 .await;
             let host_port = out.ok().filter(|o| o.status.success()).and_then(|o| {
                 fakecloud_core::container_net::parse_published_port(&String::from_utf8_lossy(

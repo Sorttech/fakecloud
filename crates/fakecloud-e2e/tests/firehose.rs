@@ -190,10 +190,7 @@ async fn firehose_kinesis_source_rejects_puts_and_direct_put_still_delivers() {
         payloads.sort();
         assert_eq!(
             payloads,
-            [
-                b"direct-a\ndirect-b\n".to_vec(),
-                b"direct-single\n".to_vec()
-            ]
+            [b"direct-adirect-b".to_vec(), b"direct-single".to_vec()]
         );
     })
     .await
@@ -397,7 +394,7 @@ async fn firehose_put_record_writes_to_s3() {
         .await
         .expect("get");
     let bytes = obj.body.collect().await.expect("collect").into_bytes();
-    assert!(bytes.starts_with(b"hello-firehose"));
+    assert_eq!(bytes.as_ref(), b"hello-firehose");
 }
 
 #[tokio::test]
@@ -417,24 +414,9 @@ async fn firehose_put_record_batch_aggregates_payloads() {
     let resp = firehose
         .put_record_batch()
         .delivery_stream_name("fh-batch-stream")
-        .records(
-            Record::builder()
-                .data(Blob::new(b"line-a"))
-                .build()
-                .unwrap(),
-        )
-        .records(
-            Record::builder()
-                .data(Blob::new(b"line-b"))
-                .build()
-                .unwrap(),
-        )
-        .records(
-            Record::builder()
-                .data(Blob::new(b"line-c"))
-                .build()
-                .unwrap(),
-        )
+        .records(Record::builder().data(Blob::new(b"abc")).build().unwrap())
+        .records(Record::builder().data(Blob::new(b"def\n")).build().unwrap())
+        .records(Record::builder().data(Blob::new([0, 255])).build().unwrap())
         .send()
         .await
         .expect("put batch");
@@ -463,10 +445,151 @@ async fn firehose_put_record_batch_aggregates_payloads() {
         .await
         .expect("get");
     let bytes = obj.body.collect().await.expect("collect").into_bytes();
-    let s = std::str::from_utf8(&bytes).unwrap();
-    assert!(s.contains("line-a"));
-    assert!(s.contains("line-b"));
-    assert!(s.contains("line-c"));
+    assert_eq!(listing.contents().len(), 1);
+    assert_eq!(bytes.as_ref(), b"abcdef\n\x00\xff");
+}
+
+#[tokio::test]
+async fn firehose_s3_static_prefixes_extensions_and_utc_names() {
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let firehose = server.firehose_client().await;
+
+    for (i, (prefix, extension)) in [
+        (None, None),
+        (Some(""), Some("")),
+        (Some("events/"), Some(".custom.log")),
+        (Some("events"), None),
+        (Some("../logical/"), Some(".log")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let bucket = format!("fh-output-{i}");
+        let stream = format!("fh-output-stream-{i}");
+        s3.create_bucket().bucket(&bucket).send().await.unwrap();
+        firehose
+            .create_delivery_stream()
+            .delivery_stream_name(&stream)
+            .extended_s3_destination_configuration(
+                ExtendedS3DestinationConfiguration::builder()
+                    .role_arn("arn:aws:iam::123456789012:role/firehose")
+                    .bucket_arn(format!("arn:aws:s3:::{bucket}"))
+                    .set_prefix(prefix.map(str::to_owned))
+                    .set_file_extension(extension.map(str::to_owned))
+                    .build()
+                    .unwrap(),
+            )
+            .send()
+            .await
+            .unwrap();
+        let before = chrono::Utc::now();
+        firehose
+            .put_record()
+            .delivery_stream_name(&stream)
+            .record(Record::builder().data(Blob::new([0, 255])).build().unwrap())
+            .send()
+            .await
+            .unwrap();
+        let after = chrono::Utc::now();
+
+        let listing = s3.list_objects_v2().bucket(&bucket).send().await.unwrap();
+        assert_eq!(listing.contents().len(), 1);
+        // Single-part S3 objects carry the quoted MD5 of their bytes.
+        let md5_etag = "\"d07d34efac6328007ad67c7e0a985e00\"";
+        assert_eq!(listing.contents()[0].e_tag(), Some(md5_etag));
+        let key = listing.contents()[0].key().unwrap();
+        let name = key.strip_prefix(prefix.unwrap_or_default()).unwrap();
+        let (hierarchy, suffix) = name.split_at(14);
+        let suffix = suffix.strip_prefix(&format!("{stream}-1-")).unwrap();
+        let (timestamp, uuid_and_extension) = suffix.split_at(19);
+        let time = chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%d-%H-%M-%S")
+            .expect("AWS suffix timestamp")
+            .and_utc();
+        assert!((before.timestamp()..=after.timestamp()).contains(&time.timestamp()));
+        assert_eq!(hierarchy, time.format("%Y/%m/%d/%H/").to_string());
+        let uuid = uuid_and_extension
+            .strip_prefix('-')
+            .unwrap()
+            .strip_suffix(extension.unwrap_or_default())
+            .unwrap();
+        assert_eq!(uuid.len(), 36);
+        assert_eq!(uuid::Uuid::parse_str(uuid).unwrap().to_string(), uuid);
+
+        let object = s3
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(object.content_type(), Some("application/octet-stream"));
+        assert_eq!(object.content_encoding(), None);
+        assert_eq!(object.content_length(), Some(2));
+        assert_eq!(object.e_tag(), Some(md5_etag));
+        assert_eq!(
+            object.body.collect().await.unwrap().into_bytes().as_ref(),
+            &[0, 255]
+        );
+    }
+}
+
+#[tokio::test]
+async fn firehose_destination_update_changes_output_version_and_extension() {
+    let server = TestServer::start().await;
+    let firehose = setup(&server, "fh-update-output").await;
+    firehose
+        .create_delivery_stream()
+        .delivery_stream_name("updated-output")
+        .extended_s3_destination_configuration(ext_s3("arn:aws:s3:::fh-update-output"))
+        .send()
+        .await
+        .unwrap();
+    let description = firehose
+        .describe_delivery_stream()
+        .delivery_stream_name("updated-output")
+        .send()
+        .await
+        .unwrap();
+    let stream = description.delivery_stream_description().unwrap();
+    firehose
+        .update_destination()
+        .delivery_stream_name("updated-output")
+        .current_delivery_stream_version_id(stream.version_id())
+        .destination_id(stream.destinations()[0].destination_id())
+        .extended_s3_destination_update(
+            aws_sdk_firehose::types::ExtendedS3DestinationUpdate::builder()
+                .prefix("updated/")
+                .file_extension(".log")
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    firehose
+        .put_record()
+        .delivery_stream_name("updated-output")
+        .record(
+            Record::builder()
+                .data(Blob::new(b"after-update"))
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let s3 = server.s3_client().await;
+    let listing = s3
+        .list_objects_v2()
+        .bucket("fh-update-output")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listing.contents().len(), 1);
+    let key = listing.contents()[0].key().unwrap();
+    assert!(key.starts_with("updated/"));
+    assert!(key.contains("/updated-output-2-"));
+    assert!(key.ends_with(".log"));
 }
 
 #[tokio::test]
@@ -687,4 +810,229 @@ async fn firehose_create_with_encryption_reflected_in_describe() {
     assert_eq!(enc.status().map(|s| s.as_str()), Some("ENABLED"));
     assert_eq!(enc.key_type(), Some(&KeyType::CustomerManagedCmk));
     assert_eq!(enc.key_arn(), Some(key));
+}
+
+#[tokio::test]
+async fn firehose_invalid_file_extension_is_rejected() {
+    use aws_sdk_firehose::types::ExtendedS3DestinationUpdate;
+
+    let server = TestServer::start().await;
+    let firehose = setup(&server, "fh-bad-extension").await;
+    let with_extension = |extension: &str| {
+        ExtendedS3DestinationConfiguration::builder()
+            .role_arn("arn:aws:iam::123456789012:role/firehose")
+            .bucket_arn("arn:aws:s3:::fh-bad-extension")
+            .file_extension(extension)
+            .build()
+            .unwrap()
+    };
+    for invalid in ["json", ".JSON", ".a/b"] {
+        let err = firehose
+            .create_delivery_stream()
+            .delivery_stream_name("bad-extension")
+            .extended_s3_destination_configuration(with_extension(invalid))
+            .send()
+            .await
+            .expect_err("invalid FileExtension must be rejected on create");
+        assert!(
+            err.into_service_error().is_invalid_argument_exception(),
+            "{invalid}"
+        );
+    }
+
+    firehose
+        .create_delivery_stream()
+        .delivery_stream_name("bad-extension")
+        .extended_s3_destination_configuration(with_extension(".json"))
+        .send()
+        .await
+        .unwrap();
+    let description = firehose
+        .describe_delivery_stream()
+        .delivery_stream_name("bad-extension")
+        .send()
+        .await
+        .unwrap();
+    let stream = description.delivery_stream_description().unwrap();
+    let err = firehose
+        .update_destination()
+        .delivery_stream_name("bad-extension")
+        .current_delivery_stream_version_id(stream.version_id())
+        .destination_id(stream.destinations()[0].destination_id())
+        .extended_s3_destination_update(
+            ExtendedS3DestinationUpdate::builder()
+                .file_extension(".LOG")
+                .build(),
+        )
+        .send()
+        .await
+        .expect_err("invalid FileExtension must be rejected on update");
+    assert!(err.into_service_error().is_invalid_argument_exception());
+
+    let after = firehose
+        .describe_delivery_stream()
+        .delivery_stream_name("bad-extension")
+        .send()
+        .await
+        .unwrap();
+    let after = after.delivery_stream_description().unwrap();
+    assert_eq!(after.version_id(), "1");
+    assert_eq!(
+        after.destinations()[0]
+            .extended_s3_destination_description()
+            .unwrap()
+            .file_extension(),
+        Some(".json")
+    );
+}
+
+/// `AppendDelimiterToRecord` adds `\n` after every record of an enabled
+/// processing configuration; disabling the configuration stops it, and other
+/// processors in the same configuration are not run.
+#[tokio::test]
+async fn firehose_append_delimiter_to_record_processor() {
+    use aws_sdk_firehose::types::{
+        ExtendedS3DestinationUpdate, ProcessingConfiguration, Processor, ProcessorParameter,
+        ProcessorParameterName, ProcessorType,
+    };
+
+    let server = TestServer::start().await;
+    let firehose = setup(&server, "fh-delimiter").await;
+    let append_delimiter = Processor::builder()
+        .r#type(ProcessorType::AppendDelimiterToRecord)
+        .parameters(
+            ProcessorParameter::builder()
+                .parameter_name(ProcessorParameterName::Delimiter)
+                .parameter_value("\\n")
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .unwrap();
+    firehose
+        .create_delivery_stream()
+        .delivery_stream_name("delimited")
+        .extended_s3_destination_configuration(
+            ExtendedS3DestinationConfiguration::builder()
+                .role_arn("arn:aws:iam::123456789012:role/firehose")
+                .bucket_arn("arn:aws:s3:::fh-delimiter")
+                .processing_configuration(
+                    ProcessingConfiguration::builder()
+                        .enabled(true)
+                        .processors(append_delimiter.clone())
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let put_batch = |records: &[&[u8]]| {
+        let mut request = firehose
+            .put_record_batch()
+            .delivery_stream_name("delimited");
+        for record in records {
+            request = request.records(Record::builder().data(Blob::new(*record)).build().unwrap());
+        }
+        request.send()
+    };
+    let description = firehose
+        .describe_delivery_stream()
+        .delivery_stream_name("delimited")
+        .send()
+        .await
+        .unwrap();
+    let destination_id = description
+        .delivery_stream_description()
+        .unwrap()
+        .destinations()[0]
+        .destination_id()
+        .to_owned();
+    let update = |processing: ProcessingConfiguration, version: &str| {
+        firehose
+            .update_destination()
+            .delivery_stream_name("delimited")
+            .current_delivery_stream_version_id(version)
+            .destination_id(&destination_id)
+            .extended_s3_destination_update(
+                ExtendedS3DestinationUpdate::builder()
+                    .processing_configuration(processing)
+                    .build(),
+            )
+            .send()
+    };
+
+    // Version 1: enabled -> "\n" after every record, producer bytes untouched.
+    put_batch(&[b"a", b"b\n", &[0, 255]]).await.unwrap();
+    // Version 2: disabled -> raw concatenation.
+    update(
+        ProcessingConfiguration::builder()
+            .enabled(false)
+            .processors(append_delimiter.clone())
+            .build(),
+        "1",
+    )
+    .await
+    .unwrap();
+    put_batch(&[b"c", b"d"]).await.unwrap();
+    // Version 3: re-enabled alongside a Lambda processor -> only the delimiter.
+    update(
+        ProcessingConfiguration::builder()
+            .enabled(true)
+            .processors(
+                Processor::builder()
+                    .r#type(ProcessorType::Lambda)
+                    .parameters(
+                        ProcessorParameter::builder()
+                            .parameter_name(ProcessorParameterName::LambdaArn)
+                            .parameter_value("arn:aws:lambda:us-east-1:123456789012:function:f")
+                            .build()
+                            .unwrap(),
+                    )
+                    .build()
+                    .unwrap(),
+            )
+            .processors(append_delimiter)
+            .build(),
+        "2",
+    )
+    .await
+    .unwrap();
+    put_batch(&[b"e"]).await.unwrap();
+
+    let s3 = server.s3_client().await;
+    let listing = s3
+        .list_objects_v2()
+        .bucket("fh-delimiter")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listing.contents().len(), 3);
+    for (version, expected) in [
+        ("1", &b"a\nb\n\n\x00\xff\n"[..]),
+        ("2", &b"cd"[..]),
+        ("3", &b"e\n"[..]),
+    ] {
+        let key = listing
+            .contents()
+            .iter()
+            .filter_map(|object| object.key())
+            .find(|key| key.contains(&format!("/delimited-{version}-")))
+            .unwrap_or_else(|| panic!("object for stream version {version}"));
+        let body = s3
+            .get_object()
+            .bucket("fh-delimiter")
+            .key(key)
+            .send()
+            .await
+            .unwrap()
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(body.as_ref(), expected, "version {version}");
+    }
 }
