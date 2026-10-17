@@ -385,6 +385,71 @@ fn session_statement_increments() {
 }
 
 #[test]
+fn system_logs_urls_require_existing_run_and_session() {
+    let svc = GlueService::default();
+    let err = svc
+        .get_system_logs_for_job_run(&req(
+            "GetSystemLogsForJobRun",
+            json!({"JobName": "j", "RunId": "jr_missing"}),
+        ))
+        .err()
+        .unwrap();
+    assert!(format!("{err:?}").contains("EntityNotFound"));
+
+    svc.create_job(&req(
+        "CreateJob",
+        json!({"Name": "j", "Role": "r", "Command": {"Name": "glueetl"}}),
+    ))
+    .unwrap();
+    let run = body_of(
+        svc.start_job_run(&req("StartJobRun", json!({"JobName": "j"})))
+            .unwrap(),
+    );
+    let run_id = run["JobRunId"].as_str().unwrap();
+    let logs = body_of(
+        svc.get_system_logs_for_job_run(&req(
+            "GetSystemLogsForJobRun",
+            json!({"JobName": "j", "RunId": run_id}),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(
+        logs["SystemLogsUrl"],
+        format!(
+            "https://aws-glue-system-logs-123456789012-us-east-1.s3.us-east-1.amazonaws.com/jobs/j/{run_id}/system-logs.zip"
+        )
+    );
+    // The run belongs to job `j`; naming another job does not find it.
+    let err = svc
+        .get_system_logs_for_job_run(&req(
+            "GetSystemLogsForJobRun",
+            json!({"JobName": "other", "RunId": run_id}),
+        ))
+        .err()
+        .unwrap();
+    assert!(format!("{err:?}").contains("EntityNotFound"));
+
+    let err = svc
+        .get_system_logs_for_session(&req("GetSystemLogsForSession", json!({"Id": "s"})))
+        .err()
+        .unwrap();
+    assert!(format!("{err:?}").contains("EntityNotFound"));
+    svc.create_session(&req(
+        "CreateSession",
+        json!({"Id": "s", "Role": "r", "Command": {"Name": "glueetl"}}),
+    ))
+    .unwrap();
+    let logs = body_of(
+        svc.get_system_logs_for_session(&req("GetSystemLogsForSession", json!({"Id": "s"})))
+            .unwrap(),
+    );
+    assert!(logs["SystemLogsUrl"]
+        .as_str()
+        .unwrap()
+        .ends_with("/sessions/s/system-logs.zip"));
+}
+
+#[test]
 fn get_session_endpoint_requires_existing_session() {
     let svc = GlueService::default();
     // Missing session -> EntityNotFoundException.

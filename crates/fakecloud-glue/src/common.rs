@@ -151,6 +151,18 @@ pub fn resource_arn(region: &str, account: &str, kind: &str, name: &str) -> Stri
 /// absent the full remaining list (from any incoming offset) is returned in a
 /// single page with no continuation token — matching how AWS returns an
 /// unbounded page when the caller omits a page size.
+/// S3 location of a job run's or session's system log archive, in the
+/// caller's region and partition. `key` is the resource path under the
+/// account's system-logs bucket.
+pub(crate) fn system_logs_url(req: &fakecloud_core::service::AwsRequest, key: &str) -> String {
+    let region = &req.region;
+    format!(
+        "https://aws-glue-system-logs-{}-{region}.s3.{region}.{}/{key}/system-logs.zip",
+        req.account_id,
+        fakecloud_aws::endpoint::dns_suffix_for_region(region),
+    )
+}
+
 pub(crate) fn paginate_body(
     action: &str,
     body: &Value,

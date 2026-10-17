@@ -1421,6 +1421,102 @@ async fn session_endpoint_and_dashboard_url() {
     assert!(v["Url"].as_str().unwrap().contains("ep-sess"));
 }
 
+// GetSystemLogsForJobRun / GetSystemLogsForSession are newer than the typed
+// aws-sdk-glue client, so drive them over raw awsJson1.1.
+#[test_action("glue", "GetSystemLogsForJobRun", checksum = "ce6da4b6")]
+#[test_action("glue", "GetSystemLogsForSession", checksum = "ee289019")]
+#[tokio::test]
+async fn system_logs_urls() {
+    let server = TestServer::start().await;
+    let glue = server.glue_client().await;
+    use aws_sdk_glue::types::{JobCommand, SessionCommand};
+
+    glue.create_job()
+        .name("logs-job")
+        .role("arn:aws:iam::123456789012:role/glue")
+        .command(JobCommand::builder().name("glueetl").build())
+        .send()
+        .await
+        .unwrap();
+    let run_id = glue
+        .start_job_run()
+        .job_name("logs-job")
+        .send()
+        .await
+        .unwrap()
+        .job_run_id()
+        .unwrap()
+        .to_string();
+    glue.create_session()
+        .id("logs-sess")
+        .role("arn:aws:iam::123456789012:role/glue")
+        .command(SessionCommand::builder().name("glueetl").build())
+        .send()
+        .await
+        .unwrap();
+
+    let auth = "AWS4-HMAC-SHA256 Credential=test/20240101/us-east-1/glue/aws4_request, SignedHeaders=host, Signature=0";
+    let call = |op: &str, body: String| {
+        let url = server.endpoint();
+        let target = format!("AWSGlue.{op}");
+        async move {
+            reqwest::Client::new()
+                .post(url)
+                .header("Authorization", auth)
+                .header("Content-Type", "application/x-amz-json-1.1")
+                .header("X-Amz-Target", target)
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    let resp = call(
+        "GetSystemLogsForJobRun",
+        format!(r#"{{"JobName":"logs-job","RunId":"{run_id}"}}"#),
+    )
+    .await;
+    assert!(
+        resp.status().is_success(),
+        "GetSystemLogsForJobRun: {}",
+        resp.status()
+    );
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert!(v["SystemLogsUrl"]
+        .as_str()
+        .unwrap()
+        .ends_with(&format!("/jobs/logs-job/{run_id}/system-logs.zip")));
+
+    let resp = call(
+        "GetSystemLogsForJobRun",
+        r#"{"JobName":"logs-job","RunId":"jr_missing"}"#.to_string(),
+    )
+    .await;
+    assert_eq!(resp.status(), 400);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert!(v["__type"]
+        .as_str()
+        .unwrap()
+        .contains("EntityNotFoundException"));
+
+    let resp = call(
+        "GetSystemLogsForSession",
+        r#"{"Id":"logs-sess"}"#.to_string(),
+    )
+    .await;
+    assert!(
+        resp.status().is_success(),
+        "GetSystemLogsForSession: {}",
+        resp.status()
+    );
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert!(v["SystemLogsUrl"]
+        .as_str()
+        .unwrap()
+        .ends_with("/sessions/logs-sess/system-logs.zip"));
+}
+
 // BatchGetDataQualityRulesetEvaluationRun is newer than the typed
 // aws-sdk-glue client, so drive it over raw awsJson1.1. It resolves runs
 // started by StartDataQualityRulesetEvaluationRun and reports unknown ids in
