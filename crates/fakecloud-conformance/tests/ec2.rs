@@ -5694,12 +5694,16 @@ async fn ec2_describe_capacity_reservation_topology() {
 async fn ec2_create_interruptible_capacity_reservation_allocation() {
     let s = TestServer::start().await;
     let c = s.ec2_client().await;
-    c.create_interruptible_capacity_reservation_allocation()
-        .capacity_reservation_id("cr-1")
+    let src = make_cr(&c).await;
+    let r = c
+        .create_interruptible_capacity_reservation_allocation()
+        .capacity_reservation_id(&src)
         .instance_count(1)
         .send()
         .await
         .unwrap();
+    assert_eq!(r.source_capacity_reservation_id(), Some(src.as_str()));
+    assert_eq!(r.target_instance_count(), Some(1));
 }
 
 #[test_action(
@@ -5711,12 +5715,23 @@ async fn ec2_create_interruptible_capacity_reservation_allocation() {
 async fn ec2_update_interruptible_capacity_reservation_allocation() {
     let s = TestServer::start().await;
     let c = s.ec2_client().await;
-    c.update_interruptible_capacity_reservation_allocation()
-        .capacity_reservation_id("cr-1")
-        .target_instance_count(2)
+    let src = make_cr(&c).await;
+    c.create_interruptible_capacity_reservation_allocation()
+        .capacity_reservation_id(&src)
+        .instance_count(1)
         .send()
         .await
         .unwrap();
+    // Reclaim the allocated instance back to the source reservation.
+    let r = c
+        .update_interruptible_capacity_reservation_allocation()
+        .capacity_reservation_id(&src)
+        .target_instance_count(0)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.source_capacity_reservation_id(), Some(src.as_str()));
+    assert_eq!(r.target_instance_count(), Some(0));
 }
 
 // ---- reserved instances ----

@@ -140,7 +140,11 @@ impl PinpointService {
                         filter_type.map(|ft| ft == t.template_type).unwrap_or(true)
                             && prefix.map(|p| name.starts_with(p)).unwrap_or(true)
                     })
-                    .filter_map(|(_, t)| t.versions.last().map(|r| d.render(r)))
+                    .filter_map(|(_, t)| {
+                        t.versions
+                            .last()
+                            .map(|r| template_list_projection(&d.render(r)))
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -242,6 +246,26 @@ fn build_template(name: &str, ttype: &str, version: &str, arn: &str, body: &Valu
     out.insert("Version".into(), json!(version));
     out.insert("CreationDate".into(), json!(now));
     out.insert("LastModifiedDate".into(), json!(now));
+    Value::Object(out)
+}
+
+/// A `ListTemplates` item is a `TemplateResponse`: template metadata only,
+/// never the channel content (`HtmlPart`, `Subject`, `Layout`,
+/// `RecommenderId`, ...) that `Get*Template` returns.
+fn template_list_projection(rec: &Value) -> Value {
+    const MEMBERS: &[&str] = &[
+        "Arn",
+        "CreationDate",
+        "DefaultSubstitutions",
+        "LastModifiedDate",
+        "tags",
+        "TemplateDescription",
+        "TemplateName",
+        "TemplateType",
+        "Version",
+    ];
+    let mut out = Map::new();
+    copy_many(&mut out, rec, MEMBERS);
     Value::Object(out)
 }
 

@@ -943,6 +943,32 @@ pub struct CapacityReservation {
     pub adjustment_status: Option<String>,
     #[serde(default)]
     pub adjustment_details: Option<CapacityReservationAdjustment>,
+    /// True for an interruptible reservation carved out of a source
+    /// reservation by `CreateInterruptibleCapacityReservationAllocation`.
+    #[serde(default)]
+    pub interruptible: bool,
+    /// `InterruptionInfo.SourceCapacityReservationId` of an interruptible
+    /// reservation.
+    #[serde(default)]
+    pub interruption_source_id: Option<String>,
+    /// `ZeroSizePreference` of an interruptible reservation (`retain` |
+    /// `default`).
+    #[serde(default)]
+    pub zero_size_preference: Option<String>,
+    /// On a source reservation: the interruptible allocation made from it.
+    #[serde(default)]
+    pub interruptible_allocation: Option<InterruptibleAllocation>,
+}
+
+/// `InterruptibleCapacityAllocation` of a source capacity reservation.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct InterruptibleAllocation {
+    pub interruptible_reservation_id: String,
+    pub instance_count: i64,
+    pub target_instance_count: i64,
+    /// `pending` | `active` | `updating` | `canceling` | `canceled` | `failed`.
+    pub status: String,
+    pub zero_size_preference: String,
 }
 
 /// `CapacityReservationCommitmentInfo` of a future-dated reservation.

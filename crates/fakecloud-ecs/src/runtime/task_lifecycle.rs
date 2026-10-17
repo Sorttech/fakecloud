@@ -18,6 +18,7 @@ impl EcsRuntime {
                 // A failure past the launch loop leaves the namespace
                 // holders of the task's containers behind.
                 rt.remove_netns_holders(&task_id).await;
+                rt.abort_execs(Some(&task_id));
                 finalize_failure(&state, &account_id, &task_id, &err.to_string());
                 rt.emit_state_change(
                     &state,
@@ -128,11 +129,11 @@ impl EcsRuntime {
                 if fakecloud_core::ecr_uri::is_digest_ref(&rp.plan.image) {
                     local_uri.clone()
                 } else {
-                    let _ = self
-                        .cli_command()
-                        .args(["tag", local_uri, &rp.plan.image])
-                        .output()
-                        .await;
+                    let _ = fakecloud_core::container_net::output_within(
+                        self.cli_command().args(["tag", local_uri, &rp.plan.image]),
+                        CLI_CALL_TIMEOUT,
+                    )
+                    .await;
                     rp.plan.image.clone()
                 }
             } else {
@@ -180,22 +181,24 @@ impl EcsRuntime {
             .any(|rp| rp.plan.network_mode.as_deref() == Some("awsvpc"));
         let network_name = format!("fakecloud-ecs-{}", task_id);
         let network_created = if awsvpc_network {
-            let create = Command::new(&self.cli)
-                .args([
-                    "network",
-                    "create",
-                    "--driver",
-                    "bridge",
-                    "--label",
-                    &format!("fakecloud-ecs-task={}", task_id),
-                    // Ownership label so the startup reaper can prune the
-                    // per-task awsvpc network after an ungraceful restart,
-                    // matching the container label.
-                    "--label",
-                    &super::fakecloud_instance_label(),
-                    &network_name,
-                ])
-                .output()
+            let create = self
+                .cli_output(
+                    [
+                        "network",
+                        "create",
+                        "--driver",
+                        "bridge",
+                        "--label",
+                        &format!("fakecloud-ecs-task={}", task_id),
+                        // Ownership label so the startup reaper can prune the
+                        // per-task awsvpc network after an ungraceful restart,
+                        // matching the container label.
+                        "--label",
+                        &super::fakecloud_instance_label(),
+                        &network_name,
+                    ],
+                    CLI_CALL_TIMEOUT,
+                )
                 .await;
             match create {
                 Ok(out) if out.status.success() => {
@@ -328,13 +331,22 @@ impl EcsRuntime {
                 network,
                 run_image,
             );
-            let mut cmd = Command::new(&self.cli);
-            cmd.args(&argv);
-            let run_out = cmd.output().await.map_err(|e| {
-                // Cleanup already-started containers on launch failure.
-                self.cleanup_partial_start(&started, task_id);
-                RuntimeError::ContainerStart(e.to_string())
-            })?;
+            let run_out = match self.cli_output(&argv, CONTAINER_RUN_TIMEOUT).await {
+                Ok(out) => out,
+                Err(e) => {
+                    // A timed-out `run` may still have created the container,
+                    // which isn't in `started` yet: remove it by name.
+                    let _ = self
+                        .cli_output(
+                            ["rm", "-f", &format!("{task_id}-{}", rp.plan.container_name)],
+                            CLI_CALL_TIMEOUT,
+                        )
+                        .await;
+                    // Cleanup already-started containers on launch failure.
+                    self.cleanup_partial_start(&started, task_id);
+                    return Err(RuntimeError::ContainerStart(e));
+                }
+            };
             if !run_out.status.success() {
                 let err = String::from_utf8_lossy(&run_out.stderr).to_string();
                 self.cleanup_partial_start(&started, task_id);
@@ -376,20 +388,17 @@ impl EcsRuntime {
         // StopTask-deleted Pod and finalizes the same way.
         if task_desired_stopped(state, account_id, task_id) {
             for rc in &started {
-                let _ = Command::new(&self.cli)
-                    .args(["stop", "--time", "10", &rc.container_id])
-                    .output()
+                let _ = self
+                    .cli_output(["stop", "--time", "10", &rc.container_id], CLI_CALL_TIMEOUT)
                     .await;
-                let _ = Command::new(&self.cli)
-                    .args(["rm", "-f", &rc.container_id])
-                    .output()
+                let _ = self
+                    .cli_output(["rm", "-f", &rc.container_id], CLI_CALL_TIMEOUT)
                     .await;
             }
             self.remove_netns_holders(task_id).await;
             if network_created {
-                let _ = Command::new(&self.cli)
-                    .args(["network", "rm", &network_name])
-                    .output()
+                let _ = self
+                    .cli_output(["network", "rm", &network_name], CLI_CALL_TIMEOUT)
                     .await;
             }
             self.containers.write().remove(task_id);
@@ -451,18 +460,22 @@ impl EcsRuntime {
             // Try to grab the exit code if the container already exited
             // on its own (non-essential exits don't stop the task), then
             // fall back to `docker stop` for stragglers.
-            let inspect = Command::new(&self.cli)
-                .args(["inspect", "-f", "{{.State.ExitCode}}", &rc.container_id])
-                .output()
+            let inspect = self
+                .cli_output(
+                    ["inspect", "-f", "{{.State.ExitCode}}", &rc.container_id],
+                    CLI_CALL_TIMEOUT,
+                )
                 .await;
             let still_running = match inspect {
                 Ok(out) if out.status.success() => {
                     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     // `docker inspect` returns 0 for not-yet-exited
                     // containers, so we additionally check `State.Running`.
-                    let running = Command::new(&self.cli)
-                        .args(["inspect", "-f", "{{.State.Running}}", &rc.container_id])
-                        .output()
+                    let running = self
+                        .cli_output(
+                            ["inspect", "-f", "{{.State.Running}}", &rc.container_id],
+                            CLI_CALL_TIMEOUT,
+                        )
                         .await
                         .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
                         .unwrap_or(false);
@@ -476,13 +489,11 @@ impl EcsRuntime {
                 _ => false,
             };
             if still_running {
-                let _ = Command::new(&self.cli)
-                    .args(["stop", "--time", "10", &rc.container_id])
-                    .output()
+                let _ = self
+                    .cli_output(["stop", "--time", "10", &rc.container_id], CLI_CALL_TIMEOUT)
                     .await;
-                let wait_out = Command::new(&self.cli)
-                    .args(["wait", &rc.container_id])
-                    .output()
+                let wait_out = self
+                    .cli_output(["wait", &rc.container_id], CLI_CALL_TIMEOUT)
                     .await;
                 if let Ok(out) = wait_out {
                     let code: i64 = String::from_utf8_lossy(&out.stdout)
@@ -498,11 +509,10 @@ impl EcsRuntime {
         // introspection endpoint shows logs from sidecars too.
         let mut captured = String::new();
         for rc in &started {
-            let logs_out = Command::new(&self.cli)
-                .args(["logs", &rc.container_id])
-                .output()
+            let logs_out = self
+                .cli_output(["logs", &rc.container_id], CLI_CALL_TIMEOUT)
                 .await
-                .map_err(|e| RuntimeError::Wait(e.to_string()))?;
+                .map_err(RuntimeError::Wait)?;
             captured.push_str(&format!("[{}] ", rc.name));
             captured.push_str(&String::from_utf8_lossy(&logs_out.stdout));
             captured.push_str(&String::from_utf8_lossy(&logs_out.stderr));
@@ -510,9 +520,8 @@ impl EcsRuntime {
 
         // Reap every container we own.
         for rc in &started {
-            let _ = Command::new(&self.cli)
-                .args(["rm", "-f", &rc.container_id])
-                .output()
+            let _ = self
+                .cli_output(["rm", "-f", &rc.container_id], CLI_CALL_TIMEOUT)
                 .await;
         }
         // Reap task-scoped docker volumes (anonymous "Docker volumes" and
@@ -530,19 +539,19 @@ impl EcsRuntime {
             }
         }
         for vol in &task_volumes {
-            let _ = Command::new(&self.cli)
-                .args(["volume", "rm", "-f", vol])
-                .output()
+            let _ = self
+                .cli_output(["volume", "rm", "-f", vol], CLI_CALL_TIMEOUT)
                 .await;
         }
         // The namespace holders outlive their containers; remove them before
         // the per-task network they are attached to.
         self.remove_netns_holders(task_id).await;
+        // Any ExecuteCommand command ended with its container.
+        self.abort_execs(Some(task_id));
         // Clean up the per-task docker network for awsvpc.
         if network_created {
-            let _ = Command::new(&self.cli)
-                .args(["network", "rm", &network_name])
-                .output()
+            let _ = self
+                .cli_output(["network", "rm", &network_name], CLI_CALL_TIMEOUT)
                 .await;
         }
         self.containers.write().remove(task_id);
@@ -606,9 +615,11 @@ impl EcsRuntime {
                 if working[i].exit_code.is_some() {
                     continue;
                 }
-                let inspect = Command::new(&self.cli)
-                    .args(["inspect", "-f", "{{.State.Running}}", &rc.container_id])
-                    .output()
+                let inspect = self
+                    .cli_output(
+                        ["inspect", "-f", "{{.State.Running}}", &rc.container_id],
+                        CLI_CALL_TIMEOUT,
+                    )
                     .await;
                 let running = match inspect {
                     Ok(out) if out.status.success() => {
@@ -619,11 +630,12 @@ impl EcsRuntime {
                 if running {
                     continue;
                 }
-                let wait_out = Command::new(&self.cli)
-                    .args(["wait", &rc.container_id])
-                    .output()
+                // Only reached once the container is no longer running, so
+                // `wait` returns at once on a healthy daemon.
+                let wait_out = self
+                    .cli_output(["wait", &rc.container_id], CLI_CALL_TIMEOUT)
                     .await
-                    .map_err(|e| RuntimeError::Wait(e.to_string()))?;
+                    .map_err(RuntimeError::Wait)?;
                 if !wait_out.status.success() {
                     let err = String::from_utf8_lossy(&wait_out.stderr).to_string();
                     return Err(RuntimeError::Wait(err));
@@ -728,7 +740,7 @@ impl EcsRuntime {
     /// deriving it from a container_id prefix was wrong (container ids
     /// are docker-assigned, not task-shaped).
     pub(super) fn cleanup_partial_start(&self, started: &[RunningContainer], task_id: &str) {
-        let cli = self.cli.clone();
+        let cli = self.container_cli();
         let ids: Vec<String> = started.iter().map(|c| c.container_id.clone()).collect();
         // Namespace holders go after the containers sharing them and before
         // the network they are attached to.
@@ -744,11 +756,10 @@ impl EcsRuntime {
         self.containers.write().remove(task_id);
         tokio::spawn(async move {
             for id in ids.into_iter().chain(holders) {
-                let _ = Command::new(&cli).args(["rm", "-f", &id]).output().await;
+                let _ = cli.output(["rm", "-f", &id], CLI_CALL_TIMEOUT).await;
             }
-            let _ = Command::new(&cli)
-                .args(["network", "rm", &network])
-                .output()
+            let _ = cli
+                .output(["network", "rm", &network], CLI_CALL_TIMEOUT)
                 .await;
         });
     }
@@ -762,6 +773,9 @@ impl EcsRuntime {
             tracing::info!(task = %task_id, reason = %reason, "ecs task stop requested (k8s)");
             return k.stop_task(task_id).await;
         }
+        // Its ExecuteCommand commands end with it, as Session Manager
+        // sessions do when ECS stops the task.
+        self.abort_execs(Some(task_id));
         let containers = self.containers.read().get(task_id).cloned();
         let Some(list) = containers else {
             return false;
@@ -771,9 +785,8 @@ impl EcsRuntime {
         }
         // `docker stop` sends SIGTERM then SIGKILL after a timeout.
         for (_name, id) in &list {
-            let _ = Command::new(&self.cli)
-                .args(["stop", "--time", "10", id])
-                .output()
+            let _ = self
+                .cli_output(["stop", "--time", "10", id], CLI_CALL_TIMEOUT)
                 .await;
         }
         tracing::info!(task = %task_id, reason = %reason, "ecs task stop requested");
@@ -784,6 +797,7 @@ impl EcsRuntime {
     /// shutdown so docker state matches fakecloud state after a fresh
     /// boot.
     pub async fn stop_all(&self) {
+        self.abort_execs(None);
         if let Some(k) = &self.k8s {
             k.stop_all().await;
             return;
@@ -795,8 +809,8 @@ impl EcsRuntime {
             .flat_map(|list| list.iter().map(|(_, id)| id.clone()))
             .collect();
         for id in ids {
-            let _ = Command::new(&self.cli).args(["kill", &id]).output().await;
-            let _ = Command::new(&self.cli).args(["rm", &id]).output().await;
+            let _ = self.cli_output(["kill", &id], CLI_CALL_TIMEOUT).await;
+            let _ = self.cli_output(["rm", &id], CLI_CALL_TIMEOUT).await;
         }
         self.containers.write().clear();
         let holders: Vec<String> = self
@@ -806,10 +820,7 @@ impl EcsRuntime {
             .flat_map(|(_, ids)| ids)
             .collect();
         for id in holders {
-            let _ = Command::new(&self.cli)
-                .args(["rm", "-f", &id])
-                .output()
-                .await;
+            let _ = self.cli_output(["rm", "-f", &id], CLI_CALL_TIMEOUT).await;
         }
     }
 }

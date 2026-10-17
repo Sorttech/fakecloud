@@ -236,6 +236,14 @@ pub(super) fn service_common_errors(service_name: &str) -> &'static [&'static st
             // IPAM internet-registry associations: the probe addresses an
             // association by a synthetic id, which AWS answers with this code.
             "InvalidIpamInternetRegistryAssociationId.NotFound",
+            // IPAMs and IPAM resource discoveries: CreateIpamInternetRegistry-
+            // Association / GetIpamRouteProtectionFindings look the IPAM up in
+            // stored state and GetIpamDiscoveredRoutes looks the resource
+            // discovery up; the probe's synthetic ids answer with these codes
+            // from the EC2 "Error codes" reference
+            // (https://docs.aws.amazon.com/AWSEC2/latest/APIReference/errors-overview.html).
+            "InvalidIpamId.NotFound",
+            "InvalidIpamResourceDiscoveryId.NotFound",
             // Client VPN endpoints: Modify and the authorization-policy ops
             // address an endpoint by the probe's synthetic id, which AWS
             // answers with this code.
@@ -335,6 +343,14 @@ pub(super) fn service_common_errors(service_name: &str) -> &'static [&'static st
         // (https://docs.aws.amazon.com/elasticloadbalancing/latest/APIReference/CommonErrors.html).
         "elasticloadbalancing" => &["ValidationError"],
         "kms" => &["ValidationException"],
+        // EventBridge PutRule parses ScheduleExpression with the real
+        // `cron(...)` / `rate(...)` grammar that drives rule firing and
+        // rejects a malformed one the way AWS does:
+        // `ValidationException: Parameter ScheduleExpression is not valid.`
+        // (EventBridge User Guide, "Creating a rule that runs on a schedule"
+        // / PutRule). The PutRule model only declares the pattern/limit
+        // errors, not this one.
+        "events" => &["ValidationException"],
         "ssm" => &["InvalidNextToken", "ValidationException"],
         "eks" => &["ResourceNotFoundException", "ResourceInUseException"],
         // STS returns AccessDenied (HTTP 403) whenever a role can't be assumed
@@ -444,6 +460,20 @@ pub(super) fn service_common_errors(service_name: &str) -> &'static [&'static st
             "ConflictException",
             "ValidationException",
         ],
+        // AWS Support (awsJson1_1) declares no validation error shape, yet the
+        // model documents request constraints that have no declared error to
+        // carry them: `UploadRange` is half-open (`endIndex` must exceed
+        // `startIndex`) and "the range size (endIndex - startIndex) must not
+        // exceed 10" (GetAttachmentUploadLinks). The service's "Common Error
+        // Types" list a 400 input-validation error for every action; on this
+        // JSON protocol it is the framework's `ValidationException` (the same
+        // code, with the "1 validation error detected: ..." message shape, that
+        // the service returns for its modelled @length / @range / @required
+        // violations). Unknown or unfinished `uploadIds` use the declared
+        // `AttachmentSetIdNotFound` / `AttachmentSetExpired`, not this. Source:
+        // https://docs.aws.amazon.com/awssupport/latest/APIReference/API_UploadRange.html
+        // https://docs.aws.amazon.com/awssupport/latest/APIReference/CommonErrors.html
+        "support" => &["ValidationException"],
         _ => &[],
     }
 }

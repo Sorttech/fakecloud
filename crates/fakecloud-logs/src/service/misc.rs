@@ -407,30 +407,8 @@ impl LogsService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
         let name = require_str(&body, "name")?;
-        validate_string_length("name", name, 1, 255)?;
-        validate_optional_string_length("description", body["description"].as_str(), 0, 1024)?;
-        let query_string = require_str(&body, "queryString")?;
-        validate_string_length("queryString", query_string, 0, 10000)?;
-        let query_language = require_str(&body, "queryLanguage")?;
-        validate_enum("queryLanguage", query_language, &["CWLI", "SQL", "PPL"])?;
-        let schedule_expression = require_str(&body, "scheduleExpression")?;
-        validate_string_length("scheduleExpression", schedule_expression, 0, 256)?;
-        let execution_role_arn = require_str(&body, "executionRoleArn")?;
-        validate_string_length("executionRoleArn", execution_role_arn, 1, 2048)?;
-        validate_optional_string_length("timezone", body["timezone"].as_str(), 1, 2048)?;
-        validate_optional_range_i64(
-            "scheduleStartTime",
-            body["scheduleStartTime"].as_i64(),
-            0,
-            i64::MAX,
-        )?;
-        validate_optional_range_i64(
-            "scheduleEndTime",
-            body["scheduleEndTime"].as_i64(),
-            0,
-            i64::MAX,
-        )?;
-        validate_optional_enum_value("state", &body["state"], &["ENABLED", "DISABLED"])?;
+        validate_string_length("name", name, 1, 300)?;
+        let fields = parse_scheduled_query_fields(&body)?;
 
         let account_id = req.account_id.clone();
         let region = req.region.clone();
@@ -446,27 +424,37 @@ impl LogsService {
 
         // `state` is the caller's desired ENABLED/DISABLED setting; live AWS
         // defaults it to ENABLED when omitted.
-        let desired_state = body["state"].as_str().unwrap_or("ENABLED").to_string();
-
-        let sq = ScheduledQuery {
-            name: name.to_string(),
-            arn: arn.clone(),
-            query_string: query_string.to_string(),
-            query_language: query_language.to_string(),
-            schedule_expression: schedule_expression.to_string(),
-            execution_role_arn: execution_role_arn.to_string(),
-            status: "ACTIVE".to_string(),
-            creation_time: now,
-            last_modified_time: now,
-            description: body["description"].as_str().map(str::to_string),
-            timezone: body["timezone"].as_str().map(str::to_string),
-            schedule_start_time: body["scheduleStartTime"].as_i64(),
-            schedule_end_time: body["scheduleEndTime"].as_i64(),
-            state: Some(desired_state.clone()),
-        };
+        let desired_state = fields.state.clone().unwrap_or_else(|| "ENABLED".into());
 
         let mut accounts = self.state.write();
         let state = accounts.regional_mut(&req.account_id, &req.region);
+        if state.scheduled_queries.contains_key(&arn) {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::CONFLICT,
+                "ConflictException",
+                format!("Scheduled query with name {name} already exists"),
+            ));
+        }
+        let sq = ScheduledQuery {
+            name: name.to_string(),
+            arn: arn.clone(),
+            query_string: fields.query_string,
+            query_language: fields.query_language,
+            schedule_expression: fields.schedule_expression,
+            execution_role_arn: fields.execution_role_arn,
+            status: "ACTIVE".to_string(),
+            creation_time: now,
+            last_modified_time: now,
+            description: fields.description,
+            timezone: fields.timezone,
+            schedule_start_time: fields.schedule_start_time,
+            schedule_end_time: fields.schedule_end_time,
+            state: Some(desired_state.clone()),
+            log_group_identifiers: fields.log_group_identifiers,
+            start_time_offset: fields.start_time_offset,
+            end_time_offset: fields.end_time_offset,
+            destination_configuration: fields.destination_configuration,
+        };
         state.scheduled_queries.insert(arn.clone(), sq);
 
         Ok(AwsResponse::json(
@@ -481,51 +469,18 @@ impl LogsService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
-        let identifier = require_str(&body, "identifier")?;
+        let identifier = scheduled_query_identifier(&body)?;
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
         let state = accounts
             .regional(&req.account_id, &req.region)
             .unwrap_or(&empty);
-        match state.scheduled_queries.get(identifier) {
-            Some(sq) => {
-                let mut out = json!({
-                    "scheduledQueryArn": sq.arn,
-                    "name": sq.name,
-                    "queryString": sq.query_string,
-                    "queryLanguage": sq.query_language,
-                    "scheduleExpression": sq.schedule_expression,
-                    "executionRoleArn": sq.execution_role_arn,
-                    "creationTime": sq.creation_time,
-                    "lastUpdatedTime": sq.last_modified_time,
-                });
-                if let Some(ref d) = sq.description {
-                    out["description"] = json!(d);
-                }
-                if let Some(ref tz) = sq.timezone {
-                    out["timezone"] = json!(tz);
-                }
-                if let Some(t) = sq.schedule_start_time {
-                    out["scheduleStartTime"] = json!(t);
-                }
-                if let Some(t) = sq.schedule_end_time {
-                    out["scheduleEndTime"] = json!(t);
-                }
-                if let Some(ref s) = sq.state {
-                    out["state"] = json!(s);
-                }
-                Ok(AwsResponse::json(
-                    StatusCode::OK,
-                    serde_json::to_string(&out).unwrap(),
-                ))
-            }
-            None => Err(AwsServiceError::aws_error(
-                StatusCode::NOT_FOUND,
-                "ResourceNotFoundException",
-                format!("Scheduled query not found: {identifier}"),
-            )),
-        }
+        let sq = find_scheduled_query(state, identifier)?;
+        Ok(AwsResponse::json(
+            StatusCode::OK,
+            serde_json::to_string(&scheduled_query_detail(sq)).unwrap(),
+        ))
     }
 
     pub(crate) fn get_scheduled_query_history(
@@ -533,17 +488,36 @@ impl LogsService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
-        let _identifier = require_str(&body, "identifier")?;
+        let identifier = scheduled_query_identifier(&body)?;
         validate_required("startTime", &body["startTime"])?;
         validate_required("endTime", &body["endTime"])?;
         validate_optional_range_i64("startTime", body["startTime"].as_i64(), 0, i64::MAX)?;
         validate_optional_range_i64("endTime", body["endTime"].as_i64(), 0, i64::MAX)?;
         validate_optional_range_i64("maxResults", body["maxResults"].as_i64(), 1, 1000)?;
         validate_optional_string_length("nextToken", body["nextToken"].as_str(), 1, 4096)?;
-        // Stub: return empty history
+        if let Some(statuses) = body["executionStatuses"].as_array() {
+            for s in statuses {
+                validate_optional_enum_value("executionStatuses", s, EXECUTION_STATUSES)?;
+            }
+        }
+
+        let accounts = self.state.read();
+        let empty = crate::state::LogsState::new(&req.account_id, &req.region);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
+        let sq = find_scheduled_query(state, identifier)?;
+        // fakecloud records scheduled queries but never triggers them, so a
+        // query has no trigger executions to report: the history is empty for
+        // every time window and status filter.
         Ok(AwsResponse::json(
             StatusCode::OK,
-            serde_json::to_string(&json!({ "triggerHistory": [] })).unwrap(),
+            serde_json::to_string(&json!({
+                "name": sq.name,
+                "scheduledQueryArn": sq.arn,
+                "triggerHistory": [],
+            }))
+            .unwrap(),
         ))
     }
 
@@ -554,7 +528,10 @@ impl LogsService {
         let body = req.json_body();
         validate_optional_range_i64("maxResults", body["maxResults"].as_i64(), 1, 1000)?;
         validate_optional_string_length("nextToken", body["nextToken"].as_str(), 1, 4096)?;
-        validate_optional_enum_value("state", &body["state"], &["ENABLED", "DISABLED"])?;
+        validate_optional_enum_value("state", &body["state"], SCHEDULED_QUERY_STATES)?;
+        validate_optional_enum_value("scheduleType", &body["scheduleType"], SCHEDULE_TYPES)?;
+        let state_filter = body["state"].as_str();
+        let type_filter = body["scheduleType"].as_str();
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
@@ -564,16 +541,24 @@ impl LogsService {
         let queries: Vec<Value> = state
             .scheduled_queries
             .values()
-            .map(|sq| {
-                json!({
-                    "name": sq.name,
-                    "scheduledQueryArn": sq.arn,
-                })
-            })
+            .filter(|sq| state_filter.is_none_or(|f| sq.state.as_deref().unwrap_or("ENABLED") == f))
+            // Every query created through the API is customer-managed.
+            .filter(|_| type_filter.is_none_or(|f| f == CUSTOMER_MANAGED))
+            .map(scheduled_query_summary)
             .collect();
+        let (page, next) = super::paginate_offset(
+            &queries,
+            body["maxResults"].as_i64(),
+            1000,
+            body["nextToken"].as_str(),
+        );
+        let mut out = json!({ "scheduledQueries": page });
+        if let Some(t) = next {
+            out["nextToken"] = json!(t);
+        }
         Ok(AwsResponse::json(
             StatusCode::OK,
-            serde_json::to_string(&json!({ "scheduledQueries": queries })).unwrap(),
+            serde_json::to_string(&out).unwrap(),
         ))
     }
 
@@ -582,11 +567,12 @@ impl LogsService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
-        let identifier = require_str(&body, "identifier")?;
+        let identifier = scheduled_query_identifier(&body)?;
 
         let mut accounts = self.state.write();
         let state = accounts.regional_mut(&req.account_id, &req.region);
-        state.scheduled_queries.remove(identifier);
+        let arn = find_scheduled_query(state, identifier)?.arn.clone();
+        state.scheduled_queries.remove(&arn);
         Ok(AwsResponse::json(StatusCode::OK, "{}"))
     }
 
@@ -595,44 +581,36 @@ impl LogsService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
-        let identifier = require_str(&body, "identifier")?;
-        let query_string = require_str(&body, "queryString")?;
-        let query_language = require_str(&body, "queryLanguage")?;
-        let schedule_expression = require_str(&body, "scheduleExpression")?;
-        let execution_role_arn = require_str(&body, "executionRoleArn")?;
+        let identifier = scheduled_query_identifier(&body)?;
+        let fields = parse_scheduled_query_fields(&body)?;
 
         let mut accounts = self.state.write();
         let state = accounts.regional_mut(&req.account_id, &req.region);
-        match state.scheduled_queries.get_mut(identifier) {
-            Some(sq) => {
-                sq.query_string = query_string.to_string();
-                sq.query_language = query_language.to_string();
-                sq.schedule_expression = schedule_expression.to_string();
-                sq.execution_role_arn = execution_role_arn.to_string();
-                if let Some(d) = body["description"].as_str() {
-                    sq.description = Some(d.to_string());
-                }
-                if let Some(tz) = body["timezone"].as_str() {
-                    sq.timezone = Some(tz.to_string());
-                }
-                if let Some(t) = body["scheduleStartTime"].as_i64() {
-                    sq.schedule_start_time = Some(t);
-                }
-                if let Some(t) = body["scheduleEndTime"].as_i64() {
-                    sq.schedule_end_time = Some(t);
-                }
-                if let Some(st) = body["state"].as_str() {
-                    sq.state = Some(st.to_string());
-                }
-                sq.last_modified_time = Utc::now().timestamp_millis();
-                Ok(AwsResponse::json(StatusCode::OK, "{}"))
-            }
-            None => Err(AwsServiceError::aws_error(
-                StatusCode::NOT_FOUND,
-                "ResourceNotFoundException",
-                format!("Scheduled query not found: {identifier}"),
-            )),
-        }
+        let arn = find_scheduled_query(state, identifier)?.arn.clone();
+        let Some(sq) = state.scheduled_queries.get_mut(&arn) else {
+            unreachable!("scheduled query resolved above under the same write lock");
+        };
+        // UpdateScheduledQuery has PUT semantics: the request is the complete
+        // new definition, so an omitted optional member clears the stored one
+        // (and an omitted `state` reverts to the ENABLED default).
+        sq.query_string = fields.query_string;
+        sq.query_language = fields.query_language;
+        sq.schedule_expression = fields.schedule_expression;
+        sq.execution_role_arn = fields.execution_role_arn;
+        sq.description = fields.description;
+        sq.timezone = fields.timezone;
+        sq.schedule_start_time = fields.schedule_start_time;
+        sq.schedule_end_time = fields.schedule_end_time;
+        sq.state = Some(fields.state.unwrap_or_else(|| "ENABLED".to_string()));
+        sq.log_group_identifiers = fields.log_group_identifiers;
+        sq.start_time_offset = fields.start_time_offset;
+        sq.end_time_offset = fields.end_time_offset;
+        sq.destination_configuration = fields.destination_configuration;
+        sq.last_modified_time = Utc::now().timestamp_millis();
+        Ok(AwsResponse::json(
+            StatusCode::OK,
+            serde_json::to_string(&scheduled_query_detail(sq)).unwrap(),
+        ))
     }
 
     // -- Live tail / log object / log fields --
@@ -986,6 +964,214 @@ fn json_value_kind(v: &Value) -> &'static str {
     }
 }
 
+const SCHEDULED_QUERY_STATES: &[&str] = &["ENABLED", "DISABLED"];
+const SCHEDULE_TYPES: &[&str] = &["CUSTOMER_MANAGED", "AWS_MANAGED"];
+const CUSTOMER_MANAGED: &str = "CUSTOMER_MANAGED";
+const EXECUTION_STATUSES: &[&str] = &["Running", "InvalidQuery", "Complete", "Failed", "Timeout"];
+
+/// The scheduled-query operations declare `ValidationException` (not the
+/// `InvalidParameterException` the classic CloudWatch Logs ops use), so the
+/// shared validators' parameter errors are re-coded at the dispatch boundary.
+pub(crate) fn scheduled_query_error(err: AwsServiceError) -> AwsServiceError {
+    if err.code() == "InvalidParameterException" {
+        AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "ValidationException",
+            err.message(),
+        )
+    } else {
+        err
+    }
+}
+
+fn sq_invalid(message: impl Into<String>) -> AwsServiceError {
+    AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "ValidationException", message)
+}
+
+/// Read + length-check the `identifier` member (the scheduled query's name
+/// or ARN, 1..=300 characters).
+fn scheduled_query_identifier(body: &Value) -> Result<&str, AwsServiceError> {
+    let identifier = require_str(body, "identifier")?;
+    validate_string_length("identifier", identifier, 1, 300)?;
+    Ok(identifier)
+}
+
+/// Resolve a scheduled query by ARN or by name.
+fn find_scheduled_query<'a>(
+    state: &'a crate::state::LogsState,
+    identifier: &str,
+) -> Result<&'a ScheduledQuery, AwsServiceError> {
+    state
+        .scheduled_queries
+        .get(identifier)
+        .or_else(|| {
+            state
+                .scheduled_queries
+                .values()
+                .find(|sq| sq.name == identifier)
+        })
+        .ok_or_else(|| {
+            AwsServiceError::aws_error(
+                StatusCode::NOT_FOUND,
+                "ResourceNotFoundException",
+                format!("Scheduled query not found: {identifier}"),
+            )
+        })
+}
+
+/// The `ScheduledQuerySummary` view used by ListScheduledQueries.
+fn scheduled_query_summary(sq: &ScheduledQuery) -> Value {
+    let mut out = json!({
+        "scheduledQueryArn": sq.arn,
+        "name": sq.name,
+        "state": sq.state.as_deref().unwrap_or("ENABLED"),
+        "scheduleType": CUSTOMER_MANAGED,
+        "scheduleExpression": sq.schedule_expression,
+        "creationTime": sq.creation_time,
+        "lastUpdatedTime": sq.last_modified_time,
+    });
+    if let Some(ref tz) = sq.timezone {
+        out["timezone"] = json!(tz);
+    }
+    if let Some(ref d) = sq.destination_configuration {
+        out["destinationConfiguration"] = d.clone();
+    }
+    out
+}
+
+/// The full Get/UpdateScheduledQuery output view.
+fn scheduled_query_detail(sq: &ScheduledQuery) -> Value {
+    let mut out = scheduled_query_summary(sq);
+    out["queryString"] = json!(sq.query_string);
+    out["queryLanguage"] = json!(sq.query_language);
+    out["executionRoleArn"] = json!(sq.execution_role_arn);
+    if let Some(ref d) = sq.description {
+        out["description"] = json!(d);
+    }
+    if let Some(ref groups) = sq.log_group_identifiers {
+        out["logGroupIdentifiers"] = json!(groups);
+    }
+    if let Some(t) = sq.start_time_offset {
+        out["startTimeOffset"] = json!(t);
+    }
+    if let Some(t) = sq.end_time_offset {
+        out["endTimeOffset"] = json!(t);
+    }
+    if let Some(t) = sq.schedule_start_time {
+        out["scheduleStartTime"] = json!(t);
+    }
+    if let Some(t) = sq.schedule_end_time {
+        out["scheduleEndTime"] = json!(t);
+    }
+    out
+}
+
+/// The definition members shared by Create/UpdateScheduledQuery.
+struct ScheduledQueryFields {
+    query_string: String,
+    query_language: String,
+    schedule_expression: String,
+    execution_role_arn: String,
+    description: Option<String>,
+    timezone: Option<String>,
+    schedule_start_time: Option<i64>,
+    schedule_end_time: Option<i64>,
+    state: Option<String>,
+    log_group_identifiers: Option<Vec<String>>,
+    start_time_offset: Option<i64>,
+    end_time_offset: Option<i64>,
+    destination_configuration: Option<Value>,
+}
+
+fn parse_scheduled_query_fields(body: &Value) -> Result<ScheduledQueryFields, AwsServiceError> {
+    validate_optional_string_length("description", body["description"].as_str(), 0, 1024)?;
+    let query_string = require_str(body, "queryString")?;
+    validate_string_length("queryString", query_string, 0, 10000)?;
+    let query_language = require_str(body, "queryLanguage")?;
+    validate_enum("queryLanguage", query_language, &["CWLI", "SQL", "PPL"])?;
+    let schedule_expression = require_str(body, "scheduleExpression")?;
+    validate_string_length("scheduleExpression", schedule_expression, 0, 256)?;
+    let execution_role_arn = require_str(body, "executionRoleArn")?;
+    validate_string_length("executionRoleArn", execution_role_arn, 1, 2048)?;
+    validate_optional_string_length("timezone", body["timezone"].as_str(), 1, 2048)?;
+    validate_optional_range_i64(
+        "scheduleStartTime",
+        body["scheduleStartTime"].as_i64(),
+        0,
+        i64::MAX,
+    )?;
+    validate_optional_range_i64(
+        "scheduleEndTime",
+        body["scheduleEndTime"].as_i64(),
+        0,
+        i64::MAX,
+    )?;
+    validate_optional_enum_value("state", &body["state"], SCHEDULED_QUERY_STATES)?;
+    let log_group_identifiers = match body.get("logGroupIdentifiers").filter(|v| !v.is_null()) {
+        None => None,
+        Some(Value::Array(groups)) => {
+            if !(1..=50).contains(&groups.len()) {
+                return Err(sq_invalid(
+                    "Value at 'logGroupIdentifiers' failed to satisfy constraint: \
+                     Member must have length between 1 and 50",
+                ));
+            }
+            let mut out = Vec::with_capacity(groups.len());
+            for g in groups {
+                let Some(g) = g.as_str() else {
+                    return Err(sq_invalid("logGroupIdentifiers entries must be strings"));
+                };
+                let pattern_ok = g
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || "#+=/:,.@-".contains(c));
+                if !(1..=2048).contains(&g.len()) || !pattern_ok {
+                    return Err(sq_invalid(format!(
+                        "Value '{g}' at 'logGroupIdentifiers' failed to satisfy constraint: \
+                         Member must have length between 1 and 2048 and match [\\w#+=/:,.@-]*"
+                    )));
+                }
+                out.push(g.to_string());
+            }
+            Some(out)
+        }
+        Some(_) => return Err(sq_invalid("logGroupIdentifiers must be a list")),
+    };
+    let optional_long = |field: &str| -> Result<Option<i64>, AwsServiceError> {
+        match body.get(field).filter(|v| !v.is_null()) {
+            None => Ok(None),
+            Some(v) => v
+                .as_i64()
+                .map(Some)
+                .ok_or_else(|| sq_invalid(format!("{field} must be an integer"))),
+        }
+    };
+    let start_time_offset = optional_long("startTimeOffset")?;
+    let end_time_offset = optional_long("endTimeOffset")?;
+    let destination_configuration = match body
+        .get("destinationConfiguration")
+        .filter(|v| !v.is_null())
+    {
+        None => None,
+        Some(v @ Value::Object(_)) => Some(v.clone()),
+        Some(_) => return Err(sq_invalid("destinationConfiguration must be a structure")),
+    };
+    Ok(ScheduledQueryFields {
+        query_string: query_string.to_string(),
+        query_language: query_language.to_string(),
+        schedule_expression: schedule_expression.to_string(),
+        execution_role_arn: execution_role_arn.to_string(),
+        description: body["description"].as_str().map(str::to_string),
+        timezone: body["timezone"].as_str().map(str::to_string),
+        schedule_start_time: body["scheduleStartTime"].as_i64(),
+        schedule_end_time: body["scheduleEndTime"].as_i64(),
+        state: body["state"].as_str().map(str::to_string),
+        log_group_identifiers,
+        start_time_offset,
+        end_time_offset,
+        destination_configuration,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use crate::service::test_helpers::*;
@@ -1330,6 +1516,199 @@ mod tests {
         let resp = svc.list_scheduled_queries(&req).unwrap();
         let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
         assert!(body["scheduledQueries"].as_array().unwrap().is_empty());
+    }
+
+    fn sq_body(name: &str) -> Value {
+        json!({
+            "name": name,
+            "queryString": "fields @timestamp",
+            "queryLanguage": "CWLI",
+            "scheduleExpression": "rate(1 hour)",
+            "executionRoleArn": "arn:aws:iam::123456789012:role/exec"
+        })
+    }
+
+    #[test]
+    fn scheduled_query_names_identifiers_and_conflicts() {
+        let svc = make_service();
+        let long = "q".repeat(300);
+        let req = make_request("CreateScheduledQuery", sq_body(&long));
+        svc.create_scheduled_query(&req).unwrap();
+        let req = make_request("CreateScheduledQuery", sq_body(&"q".repeat(301)));
+        assert!(svc.create_scheduled_query(&req).is_err());
+
+        // A duplicate name conflicts instead of overwriting.
+        let req = make_request("CreateScheduledQuery", sq_body(&long));
+        let err = svc.create_scheduled_query(&req).err().unwrap();
+        assert_eq!(err.code(), "ConflictException");
+
+        // The identifier may be the name; GetScheduledQueryHistory reports it.
+        let req = make_request(
+            "GetScheduledQueryHistory",
+            json!({ "identifier": long, "startTime": 0_i64, "endTime": 1_i64 }),
+        );
+        let resp = svc.get_scheduled_query_history(&req).unwrap();
+        let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(body["name"].as_str().unwrap(), long);
+        assert!(body["scheduledQueryArn"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("scheduled-query:{long}")));
+
+        for identifier in [String::new(), "x".repeat(301)] {
+            for op in ["DeleteScheduledQuery", "GetScheduledQuery"] {
+                let req = make_request(op, json!({ "identifier": identifier }));
+                let err = if op == "DeleteScheduledQuery" {
+                    svc.delete_scheduled_query(&req).err().unwrap()
+                } else {
+                    svc.get_scheduled_query(&req).err().unwrap()
+                };
+                assert_eq!(
+                    super::scheduled_query_error(err).code(),
+                    "ValidationException"
+                );
+            }
+        }
+
+        // Unknown queries are not found, for history and delete alike.
+        let req = make_request(
+            "GetScheduledQueryHistory",
+            json!({ "identifier": "nope", "startTime": 0_i64, "endTime": 1_i64 }),
+        );
+        let err = svc.get_scheduled_query_history(&req).err().unwrap();
+        assert_eq!(err.code(), "ResourceNotFoundException");
+        let req = make_request("DeleteScheduledQuery", json!({ "identifier": long }));
+        svc.delete_scheduled_query(&req).unwrap();
+        let req = make_request("DeleteScheduledQuery", json!({ "identifier": long }));
+        let err = svc.delete_scheduled_query(&req).err().unwrap();
+        assert_eq!(err.code(), "ResourceNotFoundException");
+    }
+
+    #[test]
+    fn list_scheduled_queries_filters_and_paginates() {
+        let svc = make_service();
+        for (name, state) in [("a", "ENABLED"), ("b", "DISABLED"), ("c", "ENABLED")] {
+            let mut body = sq_body(name);
+            body["state"] = json!(state);
+            body["timezone"] = json!("UTC");
+            let req = make_request("CreateScheduledQuery", body);
+            svc.create_scheduled_query(&req).unwrap();
+        }
+        let list = |body: Value| -> Result<Value, String> {
+            let req = make_request("ListScheduledQueries", body);
+            svc.list_scheduled_queries(&req)
+                .map(|r| serde_json::from_slice(r.body.expect_bytes()).unwrap())
+                .map_err(|e| e.code().to_string())
+        };
+
+        let enabled = list(json!({ "state": "ENABLED" })).unwrap();
+        assert_eq!(enabled["scheduledQueries"].as_array().unwrap().len(), 2);
+        let first = &enabled["scheduledQueries"][0];
+        assert_eq!(first["scheduleType"], "CUSTOMER_MANAGED");
+        assert_eq!(first["state"], "ENABLED");
+        assert_eq!(first["scheduleExpression"], "rate(1 hour)");
+        assert_eq!(first["timezone"], "UTC");
+
+        let customer = list(json!({ "scheduleType": "CUSTOMER_MANAGED" })).unwrap();
+        assert_eq!(customer["scheduledQueries"].as_array().unwrap().len(), 3);
+        let aws = list(json!({ "scheduleType": "AWS_MANAGED" })).unwrap();
+        assert!(aws["scheduledQueries"].as_array().unwrap().is_empty());
+
+        let page1 = list(json!({ "maxResults": 2 })).unwrap();
+        assert_eq!(page1["scheduledQueries"].as_array().unwrap().len(), 2);
+        let token = page1["nextToken"].as_str().unwrap().to_string();
+        let page2 = list(json!({ "maxResults": 2, "nextToken": token })).unwrap();
+        assert_eq!(page2["scheduledQueries"].as_array().unwrap().len(), 1);
+        assert!(page2.get("nextToken").is_none());
+    }
+
+    /// Drive a request through the service's dispatch so the wire error code
+    /// (after the scheduled-query re-coding) is what's asserted.
+    fn dispatch(
+        svc: &crate::service::LogsService,
+        action: &str,
+        body: Value,
+    ) -> Result<Value, String> {
+        use fakecloud_core::service::AwsService;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(svc.handle(make_request(action, body)))
+            .map(|r| serde_json::from_slice(r.body.expect_bytes()).unwrap())
+            .map_err(|e| e.code().to_string())
+    }
+
+    #[test]
+    fn scheduled_query_wire_validation_errors() {
+        let svc = make_service();
+        assert_eq!(
+            dispatch(
+                &svc,
+                "ListScheduledQueries",
+                json!({ "scheduleType": "BOGUS" })
+            )
+            .unwrap_err(),
+            "ValidationException"
+        );
+        let with = |k: &str, v: Value| {
+            let mut b = sq_body("bad");
+            b[k] = v;
+            b
+        };
+        for body in [
+            with("logGroupIdentifiers", json!([1])),
+            with("logGroupIdentifiers", json!("g")),
+            with("logGroupIdentifiers", json!([])),
+            with("logGroupIdentifiers", json!(["bad group!"])),
+            with("destinationConfiguration", json!("s3")),
+            with("startTimeOffset", json!("soon")),
+            with("endTimeOffset", json!(1.5)),
+        ] {
+            assert_eq!(
+                dispatch(&svc, "CreateScheduledQuery", body.clone()).unwrap_err(),
+                "ValidationException",
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_scheduled_query_replaces_the_definition() {
+        let svc = make_service();
+        let mut body = sq_body("full");
+        body["description"] = json!("nightly");
+        body["timezone"] = json!("UTC");
+        body["state"] = json!("DISABLED");
+        body["logGroupIdentifiers"] = json!(["/app"]);
+        body["startTimeOffset"] = json!(3600);
+        body["endTimeOffset"] = json!(0);
+        body["scheduleStartTime"] = json!(10);
+        body["destinationConfiguration"] = json!({ "s3Configuration": { "destinationIdentifier": "s3://b", "roleArn": "arn:aws:iam::123456789012:role/r" } });
+        dispatch(&svc, "CreateScheduledQuery", body).unwrap();
+
+        let mut update = sq_body("full");
+        update["identifier"] = json!("full");
+        update.as_object_mut().unwrap().remove("name");
+        update["queryString"] = json!("fields @message");
+        let out = dispatch(&svc, "UpdateScheduledQuery", update).unwrap();
+        assert_eq!(out["queryString"], "fields @message");
+        assert_eq!(out["state"], "ENABLED");
+        for cleared in [
+            "description",
+            "timezone",
+            "logGroupIdentifiers",
+            "startTimeOffset",
+            "endTimeOffset",
+            "scheduleStartTime",
+            "destinationConfiguration",
+        ] {
+            assert!(
+                out.get(cleared).is_none(),
+                "{cleared} should be cleared: {out}"
+            );
+        }
+        let got = dispatch(&svc, "GetScheduledQuery", json!({ "identifier": "full" })).unwrap();
+        assert!(got.get("description").is_none(), "{got}");
     }
 
     // CreateLookupTable persists description + kmsKeyId; GetLookupTable echoes

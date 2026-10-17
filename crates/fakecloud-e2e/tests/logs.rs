@@ -3381,3 +3381,94 @@ async fn logs_get_log_events_polling_resumes_at_next_unseen_event() {
         Some("InvalidParameterException")
     );
 }
+
+#[tokio::test]
+async fn logs_scheduled_query_identifiers_conflicts_and_filters() {
+    use aws_sdk_cloudwatchlogs::types::{QueryLanguage, ScheduledQueryState};
+    let server = TestServer::start().await;
+    let client = server.logs_client().await;
+
+    let create = |name: String, state: ScheduledQueryState| {
+        client
+            .create_scheduled_query()
+            .name(name)
+            .query_language(QueryLanguage::Cwli)
+            .query_string("fields @timestamp")
+            .schedule_expression("rate(1 hour)")
+            .execution_role_arn("arn:aws:iam::123456789012:role/exec")
+            .state(state)
+            .send()
+    };
+    // Names may be up to 300 characters.
+    let long = "q".repeat(300);
+    create(long.clone(), ScheduledQueryState::Enabled)
+        .await
+        .unwrap();
+    create("off".to_string(), ScheduledQueryState::Disabled)
+        .await
+        .unwrap();
+
+    // A duplicate name conflicts rather than overwriting.
+    let err = create(long.clone(), ScheduledQueryState::Enabled)
+        .await
+        .expect_err("duplicate scheduled query name must conflict");
+    assert!(
+        err.as_service_error()
+            .is_some_and(|e| e.is_conflict_exception()),
+        "{err:?}"
+    );
+
+    // The identifier may be the name.
+    let got = client
+        .get_scheduled_query()
+        .identifier(&long)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.name(), Some(long.as_str()));
+    let history = client
+        .get_scheduled_query_history()
+        .identifier(&long)
+        .start_time(0)
+        .end_time(1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(history.name(), Some(long.as_str()));
+    assert!(history.trigger_history().is_empty());
+
+    let enabled = client
+        .list_scheduled_queries()
+        .state(ScheduledQueryState::Enabled)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(enabled.scheduled_queries().len(), 1);
+    assert_eq!(
+        enabled.scheduled_queries()[0].state(),
+        Some(&ScheduledQueryState::Enabled)
+    );
+    // Unknown queries are not found; validation failures are ValidationException.
+    let err = client
+        .delete_scheduled_query()
+        .identifier("does-not-exist")
+        .send()
+        .await
+        .expect_err("deleting an unknown scheduled query must fail");
+    assert!(
+        err.as_service_error()
+            .is_some_and(|e| e.is_resource_not_found_exception()),
+        "{err:?}"
+    );
+    let err = client
+        .delete_scheduled_query()
+        .identifier("x".repeat(301))
+        .send()
+        .await
+        .expect_err("an over-long identifier must be rejected");
+    assert!(
+        err.as_service_error()
+            .is_some_and(|e| e.is_validation_exception()),
+        "{err:?}"
+    );
+}

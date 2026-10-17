@@ -601,10 +601,12 @@ pub(super) fn rest_request_config(
                 None,
             ),
             "CopyObject" => (reqwest::Method::PUT, format!("/{}/{}", BUCKET, KEY), None),
-            // Object annotations. `AnnotationName` is an `@httpQuery` member,
-            // so `append_http_query_from_model` supplies it from the variant —
-            // which is also what separates GetObjectAnnotation (name present)
-            // from ListObjectAnnotations (name absent) on the shared URI.
+            // Object annotations. `AnnotationName` is bound to the
+            // `annotationName` query key (`@httpQuery`), so
+            // `append_http_query_from_model` supplies it from the variant under
+            // that wire key — which is also what separates GetObjectAnnotation
+            // (`annotationName` present) from ListObjectAnnotations (absent) on
+            // the shared URI.
             "PutObjectAnnotation" => (
                 reqwest::Method::PUT,
                 format!("/{}/{}", BUCKET, KEY),

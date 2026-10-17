@@ -32,7 +32,7 @@ For every operation, [`generators/`](./src/generators/) produces test variants u
 | **Round-trip echo** (`round_trip.rs`) | Walks the Smithy graph to pair every `Create*`/`Put*`/`Update*` with its matching `Get*`/`Describe*`. Sends the writer with one optional input field set, then chases the reader and asserts that field echoed | Silent input drops on Create/Put/Update — the field is accepted at the wire layer but lost before storage (e.g. Lambda `Layers` dropped on `CreateFunction`, [#853](https://github.com/faiscadev/fakecloud/issues/853)) |
 | **Identifier-form fanout** (`id_forms.rs`) | For URL-bound `@httpLabel` members whose `@pattern` admits an ARN, sends the operation with each accepted identifier form: bare name, `name:qualifier`, partial ARN, full ARN, URL-encoded full ARN | REST endpoints that 404 on alternate identifier forms (e.g. Lambda `GetFunction` rejecting full ARNs, [#817](https://github.com/faiscadev/fakecloud/issues/817)) |
 
-A single operation typically produces anywhere from a dozen to several hundred variants. Across all 106 services the baseline is **249,449 / 249,449 variants passing (100%)** — see [`conformance-baseline.json`](../../conformance-baseline.json) for the per-service breakdown.
+A single operation typically produces anywhere from a dozen to several hundred variants. Across all 106 services the baseline is **249,849 / 249,849 variants passing (100%)** — see [`conformance-baseline.json`](../../conformance-baseline.json) for the per-service breakdown.
 
 ### 3. Send and capture
 
@@ -121,6 +121,10 @@ cargo run -p fakecloud-conformance -- audit
 # Print all operations discovered in the Smithy models
 cargo run -p fakecloud-conformance -- operations
 ```
+
+### Container runtime
+
+The spawned sweep server runs with containers disabled, so thousands of variants never start real databases, functions or instances. A few operations refuse outright without a runtime (RDS `CreateDBInstance` will not report an instance it cannot back with a real database). Any variant that fails with that runtime-required error is re-probed on its own fresh server with Docker or Podman enabled, which is shut down gracefully afterwards so it removes the containers it started. Without Docker or Podman those variants are reported as failures, so run `check` and `update-baseline` where a runtime is available (CI does). Setting `FAKECLOUD_CONTAINER_CLI` pins the sweep server's runtime and turns the re-probe off.
 
 ## Adding a new service
 

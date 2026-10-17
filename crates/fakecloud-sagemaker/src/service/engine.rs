@@ -258,9 +258,80 @@ pub(crate) fn build_output(ctx: &Ctx, meta: &OpMeta, key: &str, record: &Value) 
     let derived = super::derive::record(ctx, meta, record);
     let record = derived.as_ref().unwrap_or(record);
     let mut out = Map::new();
-    project(record.as_object(), meta.omembers, &mut out);
+    if let Some((wrapper, inner)) = wrapped_output(meta) {
+        // The whole resource view sits under one structure member (e.g.
+        // `DescribeWorkforce` -> `{"Workforce": {...}}`): project the record
+        // onto that structure's members instead of the (single) top level.
+        let mut view = Map::new();
+        project(record.as_object(), inner, &mut view);
+        out.insert(wrapper.to_string(), Value::Object(view));
+    } else {
+        project(record.as_object(), meta.omembers, &mut out);
+    }
+    redact_write_only(meta.family, &mut out);
     fill_required(ctx, meta, key, &mut out, meta.req_out);
     Value::Object(out)
+}
+
+/// Operations whose output is a single structure member wrapping the resource
+/// view, paired with the list operation whose element members describe that
+/// structure. For the Workforce / Workteam / SubscribedWorkteam ops the list
+/// element is the very same shape; for `DescribeClusterNode` /
+/// `DescribeClusterEvent` the list element (`ClusterNodeSummary` /
+/// `ClusterEventSummary`) is a member-subset of the wrapped detail shape, so
+/// the projection yields the detail's summary fields. Checked against the
+/// Smithy model by `wrapped_outputs_match_the_model`.
+pub(crate) const WRAPPED_OUTPUTS: &[(&str, &str)] = &[
+    ("DescribeClusterEvent", "ListClusterEvents"),
+    ("DescribeClusterNode", "ListClusterNodes"),
+    ("DescribeSubscribedWorkteam", "ListSubscribedWorkteams"),
+    ("DescribeWorkforce", "ListWorkforces"),
+    ("DescribeWorkteam", "ListWorkteams"),
+    ("UpdateWorkforce", "ListWorkforces"),
+    ("UpdateWorkteam", "ListWorkteams"),
+];
+
+/// For a wrapped-output op, its wrapper member and the inner structure's
+/// `(wire, kind)` members.
+fn wrapped_output(meta: &OpMeta) -> Option<(&'static str, &'static [(&'static str, K)])> {
+    let (_, list_op) = WRAPPED_OUTPUTS.iter().find(|(op, _)| *op == meta.op)?;
+    let [(wrapper, K::Struct)] = meta.omembers else {
+        return None;
+    };
+    let list_meta = crate::generated::OPS.iter().find(|m| m.op == *list_op)?;
+    Some((wrapper, list_meta.list_elems))
+}
+
+/// Input-only secrets AWS accepts but never returns: `(family, structure
+/// member, nested member)`. The response shapes omit them (e.g. a workforce's
+/// `OidcConfigForResponse` has no `ClientSecret`).
+const WRITE_ONLY: &[(&str, &str, &str)] = &[("Workforce", "OidcConfig", "ClientSecret")];
+
+/// Strip [`WRITE_ONLY`] members wherever the owning structure member occurs in
+/// a projected view (top level, under a wrapper, or inside list elements).
+fn redact_write_only(family: &str, out: &mut Map<String, Value>) {
+    fn walk(map: &mut Map<String, Value>, rules: &[&(&str, &str, &str)]) {
+        for (_, member, secret) in rules {
+            if let Some(obj) = map.get_mut(*member).and_then(Value::as_object_mut) {
+                obj.remove(*secret);
+            }
+        }
+        for child in map.values_mut() {
+            match child {
+                Value::Object(m) => walk(m, rules),
+                Value::Array(items) => {
+                    for m in items.iter_mut().filter_map(Value::as_object_mut) {
+                        walk(m, rules);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let rules: Vec<_> = WRITE_ONLY.iter().filter(|(f, _, _)| *f == family).collect();
+    if !rules.is_empty() {
+        walk(out, &rules);
+    }
 }
 
 /// Project a record onto a list operation's element members, then fill any
@@ -271,6 +342,7 @@ fn build_element(ctx: &Ctx, meta: &OpMeta, key: &str, record: &Value) -> Value {
     let record = derived.as_ref().unwrap_or(record);
     let mut out = Map::new();
     project(record.as_object(), meta.list_elems, &mut out);
+    redact_write_only(meta.family, &mut out);
     fill_required(ctx, meta, key, &mut out, meta.req_elem);
     Value::Object(out)
 }
@@ -332,12 +404,32 @@ fn build_record(ctx: &Ctx, meta: &OpMeta, key: &str, body: &Map<String, Value>) 
     Value::Object(record)
 }
 
+/// Creates that operate on an existing resource of another family: the
+/// `(input member, family)` naming the resource that must already exist.
+/// AWS rejects such a create with `ResourceNotFound` when it does not.
+fn required_parent(op: &str) -> Option<(&'static str, &'static str)> {
+    match op {
+        // An export job renders an existing model card (by name or ARN).
+        "CreateModelCardExportJob" => Some(("ModelCardName", "ModelCard")),
+        _ => None,
+    }
+}
+
 pub(super) fn create(
     data: &mut SageMakerData,
     ctx: &Ctx,
     meta: &OpMeta,
     body: &Map<String, Value>,
 ) -> Result<AwsResponse, AwsServiceError> {
+    if let Some((member, family)) = required_parent(meta.op) {
+        let parent = body.get(member).and_then(Value::as_str).unwrap_or_default();
+        if data.resolve_key(family, parent).is_none() {
+            return Err(super::missing(
+                meta,
+                format!("{family} '{parent}' does not exist."),
+            ));
+        }
+    }
     let key = match key_value(meta, body) {
         Some(k) => k,
         // No caller-supplied identifier (e.g. an optional name): mint one.
