@@ -517,6 +517,13 @@ impl EcsService {
         let state = accounts
             .get_mut(&request.account_id)
             .ok_or_else(|| capacity_provider_not_found(&name))?;
+        let owner = state
+            .capacity_providers
+            .get(&name)
+            .ok_or_else(|| capacity_provider_not_found(&name))?
+            .cluster
+            .clone();
+        check_provider_cluster(state, &name, owner.as_deref(), opt_str(&body, "cluster"))?;
         let mut cp = state
             .capacity_providers
             .remove(&name)
@@ -546,12 +553,17 @@ impl EcsService {
             .map(|c| EcsState::resolve_cluster_name(Some(c)));
         // Unpaged calls return up to 10 providers (the documented default
         // and maximum page size).
-        let max_results = body
-            .get("maxResults")
-            .and_then(|v| v.as_i64())
-            .filter(|n| (1..=10).contains(n))
-            .map(|n| n as usize)
-            .unwrap_or(10);
+        let max_results = match body.get("maxResults").filter(|v| !v.is_null()) {
+            None => 10,
+            Some(v) => match v.as_i64() {
+                Some(n) if (1..=10).contains(&n) => n as usize,
+                _ => {
+                    return Err(invalid_parameter(
+                        "maxResults must be an integer between 1 and 10.",
+                    ))
+                }
+            },
+        };
         let next_token = opt_str(&body, "nextToken").unwrap_or("");
         let region = request.region.as_str();
         let account_id = request.account_id.as_str();
@@ -585,7 +597,14 @@ impl EcsService {
                 let cluster = state
                     .and_then(|s| s.clusters.get(c))
                     .ok_or_else(|| cluster_not_found(c))?;
-                Some(cluster.capacity_providers.clone())
+                // PutClusterCapacityProviders accepts names or ARNs.
+                Some(
+                    cluster
+                        .capacity_providers
+                        .iter()
+                        .map(|r| capacity_provider_name_from_ref(r))
+                        .collect(),
+                )
             }
             None => None,
         };
@@ -649,6 +668,13 @@ impl EcsService {
         let state = accounts
             .get_mut(&request.account_id)
             .ok_or_else(|| capacity_provider_not_found(&name))?;
+        let owner = state
+            .capacity_providers
+            .get(&name)
+            .ok_or_else(|| capacity_provider_not_found(&name))?
+            .cluster
+            .clone();
+        check_provider_cluster(state, &name, owner.as_deref(), opt_str(&body, "cluster"))?;
         let cp = state
             .capacity_providers
             .get_mut(&name)
@@ -1364,4 +1390,33 @@ impl EcsService {
             "failures": failures,
         })))
     }
+}
+
+/// Managed Instances capacity providers are cluster-scoped: Update and Delete
+/// must name the provider's own cluster. Account-level (Auto Scaling group)
+/// providers are not tied to a cluster, so `cluster` is not consulted.
+fn check_provider_cluster(
+    state: &EcsState,
+    name: &str,
+    owner: Option<&str>,
+    requested: Option<&str>,
+) -> Result<(), AwsServiceError> {
+    let Some(owner) = owner else {
+        return Ok(());
+    };
+    let requested = requested.filter(|c| !c.is_empty()).ok_or_else(|| {
+        invalid_parameter(format!(
+            "cluster is required for the Managed Instances capacity provider {name}."
+        ))
+    })?;
+    let requested = EcsState::resolve_cluster_name(Some(requested));
+    if !state.clusters.contains_key(&requested) {
+        return Err(cluster_not_found(&requested));
+    }
+    if requested != owner {
+        return Err(client_exception(format!(
+            "The capacity provider {name} is not associated with the cluster {requested}."
+        )));
+    }
+    Ok(())
 }

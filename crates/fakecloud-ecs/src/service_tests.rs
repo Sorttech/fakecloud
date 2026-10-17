@@ -1081,6 +1081,65 @@ mod scheduler_reconcile {
             mip_out["infrastructureRoleArn"],
             "arn:aws:iam::1:role/infra"
         );
+
+        // A Managed Instances provider is updated/deleted within its cluster.
+        svc.create_cluster(&ecs_request("CreateCluster", json!({"clusterName": "c2"})))
+            .unwrap();
+        let update = |cluster: Option<&str>| {
+            let mut body = json!({"name": "mi",
+                "managedInstancesProvider": {"propagateTags": "NONE"}});
+            if let Some(c) = cluster {
+                body["cluster"] = json!(c);
+            }
+            svc.update_capacity_provider(&ecs_request("UpdateCapacityProvider", body))
+                .err()
+                .map(|e| e.code().to_string())
+        };
+        assert_eq!(update(None).as_deref(), Some("InvalidParameterException"));
+        assert_eq!(update(Some("c2")).as_deref(), Some("ClientException"));
+        assert_eq!(
+            update(Some("ghost")).as_deref(),
+            Some("ClusterNotFoundException")
+        );
+        let c1_arn = format!("arn:aws:ecs:us-east-1:{ACCOUNT}:cluster/c1");
+        assert_eq!(update(Some(&c1_arn)), None);
+        let err = svc
+            .delete_capacity_provider(&ecs_request(
+                "DeleteCapacityProvider",
+                json!({"capacityProvider": "mi", "cluster": "c2"}),
+            ))
+            .err()
+            .unwrap();
+        assert_eq!(err.code(), "ClientException");
+
+        // maxResults is bounded to 1..=10.
+        for bad in [0, 11] {
+            let err = svc
+                .describe_capacity_providers(&ecs_request(
+                    "DescribeCapacityProviders",
+                    json!({"maxResults": bad}),
+                ))
+                .err()
+                .unwrap();
+            assert_eq!(err.code(), "InvalidParameterException", "{bad}");
+        }
+
+        // A provider attached to a cluster by ARN is listed for that cluster.
+        let asg_arn = format!("arn:aws:ecs:us-east-1:{ACCOUNT}:capacity-provider/asg-cp");
+        svc.put_cluster_capacity_providers(&ecs_request(
+            "PutClusterCapacityProviders",
+            json!({"cluster": "c2", "capacityProviders": [asg_arn],
+                "defaultCapacityProviderStrategy": []}),
+        ))
+        .unwrap();
+        let scoped = json_of(
+            svc.describe_capacity_providers(&ecs_request(
+                "DescribeCapacityProviders",
+                json!({"cluster": "c2"}),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(scoped["capacityProviders"][0]["name"], "asg-cp", "{scoped}");
     }
 }
 

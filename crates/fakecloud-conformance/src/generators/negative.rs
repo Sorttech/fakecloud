@@ -77,24 +77,41 @@ fn empty_label_collapses_to_other_op(
     let (Some(method), Some(uri)) = (http_method, http_uri) else {
         return false;
     };
-    let path = uri.split('?').next().unwrap_or(uri);
+    let (path, query) = split_uri_template(uri);
     let Some(parent) = path
         .strip_suffix(&format!("/{{{label}}}"))
         .or_else(|| path.strip_suffix(&format!("/{{{label}+}}")))
     else {
         return false;
     };
+    // The collapsed request must be byte-identical to the other operation's:
+    // same method, same path, and the same constant query literals (S3's
+    // `POST /{Bucket}/{Key+}?uploads` with an empty key is NOT
+    // `POST /{Bucket}?delete`).
     model.operations.iter().any(|op| {
         let same_method = op
             .http_method
             .as_deref()
             .is_some_and(|m| m.eq_ignore_ascii_case(method));
-        let op_path = op
-            .http_uri
-            .as_deref()
-            .map(|u| u.split('?').next().unwrap_or(u).trim_end_matches('/'));
-        same_method && op_path == Some(parent.trim_end_matches('/'))
+        same_method
+            && op.http_uri.as_deref().is_some_and(|u| {
+                let (op_path, op_query) = split_uri_template(u);
+                op_path.trim_end_matches('/') == parent.trim_end_matches('/') && op_query == query
+            })
     })
+}
+
+/// Split a Smithy `@http` URI template into its path and its sorted constant
+/// query literals (`?uploads&x-id=GetObject` -> `["uploads", "x-id=GetObject"]`).
+fn split_uri_template(uri: &str) -> (&str, Vec<&str>) {
+    match uri.split_once('?') {
+        Some((path, query)) => {
+            let mut literals: Vec<&str> = query.split('&').filter(|q| !q.is_empty()).collect();
+            literals.sort_unstable();
+            (path, literals)
+        }
+        None => (uri, Vec::new()),
+    }
 }
 
 pub fn generate(
@@ -427,6 +444,51 @@ mod tests {
             got.contains(&"negative_too_short_Id".to_string()),
             "{got:?}"
         );
+    }
+
+    #[test]
+    fn collapse_requires_equal_query_literals() {
+        let uri = "/things/{Sub}/items/{Id}?mode=a&flag";
+        // Same path and the same literals in another order -> identical
+        // request -> skipped.
+        let m = model(
+            1,
+            vec![
+                op("GetItem", "GET", uri, "t#Input"),
+                op(
+                    "ListItems",
+                    "GET",
+                    "/things/{Sub}/items?flag&mode=a",
+                    "t#Input",
+                ),
+            ],
+        );
+        let got = names(&m, "GET", uri);
+        assert!(
+            !got.contains(&"negative_too_short_Id".to_string()),
+            "{got:?}"
+        );
+
+        // Different literals (`?uploads` vs `?delete`), a differing value, or
+        // a literal on only one side -> a distinct request -> kept.
+        for other in [
+            "/things/{Sub}/items?delete",
+            "/things/{Sub}/items?mode=b&flag",
+            "/things/{Sub}/items",
+        ] {
+            let m = model(
+                1,
+                vec![
+                    op("GetItem", "GET", uri, "t#Input"),
+                    op("Other", "GET", other, "t#Input"),
+                ],
+            );
+            let got = names(&m, "GET", uri);
+            assert!(
+                got.contains(&"negative_too_short_Id".to_string()),
+                "{other}: {got:?}"
+            );
+        }
     }
 
     #[test]

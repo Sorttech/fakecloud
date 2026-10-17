@@ -1962,10 +1962,12 @@ impl ApiGatewayV2Service {
         let parent = parent_opt.ok_or_else(|| missing("Parent"))?.to_string();
         // `id_opt` is set only by Update, which must address an existing page
         // (NotFoundException otherwise) and is a partial update: members the
-        // request omits keep their stored value.
+        // request omits keep their stored value. The existence check and the
+        // write happen under one lock so a concurrent Delete can't be undone
+        // by an Update that already passed the check.
+        let mut accounts = self.state.write();
         let existing = match &id_opt {
             Some(id) => {
-                let accounts = self.state.read();
                 let found = accounts.get(account_id).and_then(|s| {
                     let map = match store {
                         "product_pages" => &s.product_pages,
@@ -2078,7 +2080,6 @@ impl ApiGatewayV2Service {
             }
             _ => return Err(missing("Store")),
         };
-        let mut accounts = self.state.write();
         let state = accounts.get_or_create(account_id);
         let map = match store {
             "product_pages" => &mut state.product_pages,
