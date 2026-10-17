@@ -13,6 +13,26 @@ use std::net::Ipv4Addr;
 use crate::state::{Ec2State, NetworkInterface, Subnet};
 use crate::SharedEc2State;
 
+/// Run `f` against `account_id`'s EC2 state. An account EC2 has not seen yet
+/// already owns its default VPC, subnets and security group on AWS, so it is
+/// created (with those defaults) the way EC2's own calls create it. Takes the
+/// shared read lock when the account exists and the write lock only to create
+/// it, so cross-service readers do not serialize against EC2 traffic.
+pub fn with_account<R>(
+    ec2: &SharedEc2State,
+    account_id: &str,
+    f: impl FnOnce(&Ec2State) -> R,
+) -> R {
+    {
+        let accounts = ec2.read();
+        if let Some(state) = accounts.get(account_id) {
+            return f(state);
+        }
+    }
+    let mut accounts = ec2.write();
+    f(accounts.get_or_create(account_id))
+}
+
 /// The facts about a subnet other services report back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubnetInfo {
@@ -42,9 +62,9 @@ pub fn resolve_subnets(
     account_id: &str,
     subnet_ids: &[String],
 ) -> Result<Vec<SubnetInfo>, String> {
-    let mut accounts = ec2.write();
-    let state = accounts.get_or_create(account_id);
-    resolve_subnets_in(state, subnet_ids)
+    with_account(ec2, account_id, |state| {
+        resolve_subnets_in(state, subnet_ids)
+    })
 }
 
 /// [`resolve_subnets`] against an already-borrowed account state.
@@ -122,28 +142,28 @@ pub fn resolve_subnet_group(
     account_id: &str,
     subnet_ids: &[String],
 ) -> Result<SubnetGroupPlacement, SubnetGroupError> {
-    let mut accounts = ec2.write();
-    let state = accounts.get_or_create(account_id);
-    let missing: Vec<String> = subnet_ids
-        .iter()
-        .filter(|id| !state.subnets.contains_key(*id))
-        .cloned()
-        .collect();
-    if !missing.is_empty() {
-        return Err(SubnetGroupError::NotFound(missing));
-    }
-    let subnets: Vec<SubnetInfo> = subnet_ids
-        .iter()
-        .map(|id| SubnetInfo::from(&state.subnets[id]))
-        .collect();
-    let vpc_id = subnets
-        .first()
-        .map(|s| s.vpc_id.clone())
-        .unwrap_or_default();
-    if subnets.iter().any(|s| s.vpc_id != vpc_id) {
-        return Err(SubnetGroupError::DifferentVpcs(subnet_ids.to_vec()));
-    }
-    Ok(SubnetGroupPlacement { vpc_id, subnets })
+    with_account(ec2, account_id, |state| {
+        let missing: Vec<String> = subnet_ids
+            .iter()
+            .filter(|id| !state.subnets.contains_key(*id))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            return Err(SubnetGroupError::NotFound(missing));
+        }
+        let subnets: Vec<SubnetInfo> = subnet_ids
+            .iter()
+            .map(|id| SubnetInfo::from(&state.subnets[id]))
+            .collect();
+        let vpc_id = subnets
+            .first()
+            .map(|s| s.vpc_id.clone())
+            .unwrap_or_default();
+        if subnets.iter().any(|s| s.vpc_id != vpc_id) {
+            return Err(SubnetGroupError::DifferentVpcs(subnet_ids.to_vec()));
+        }
+        Ok(SubnetGroupPlacement { vpc_id, subnets })
+    })
 }
 
 /// The `InvalidSubnet` message the database services return when a subnet
@@ -164,15 +184,13 @@ pub fn subnet_group_vpc_change_allowed(
     if existing_vpc.is_empty() || existing_vpc == new_vpc {
         return true;
     }
-    let mut accounts = ec2.write();
-    let state = accounts.get_or_create(account_id);
-    !state.vpcs.contains_key(existing_vpc)
+    with_account(ec2, account_id, |state| {
+        !state.vpcs.contains_key(existing_vpc)
+    })
 }
 
-/// The default VPC of the account, when it still exists.
-pub fn default_vpc_id(ec2: &SharedEc2State, account_id: &str) -> Option<String> {
-    let mut accounts = ec2.write();
-    let state = accounts.get_or_create(account_id);
+/// [`default_vpc_id`] against an already-borrowed account state.
+pub fn default_vpc_id_in(state: &Ec2State) -> Option<String> {
     state
         .vpcs
         .values()
@@ -180,27 +198,27 @@ pub fn default_vpc_id(ec2: &SharedEc2State, account_id: &str) -> Option<String> 
         .map(|v| v.vpc_id.clone())
 }
 
+/// The default VPC of the account, when it still exists.
+pub fn default_vpc_id(ec2: &SharedEc2State, account_id: &str) -> Option<String> {
+    with_account(ec2, account_id, default_vpc_id_in)
+}
+
 /// The default VPC's default subnets (one per Availability Zone), ordered by
 /// zone. This is where AWS places resources that take no subnets.
 pub fn default_vpc_subnets(ec2: &SharedEc2State, account_id: &str) -> Vec<SubnetInfo> {
-    let mut accounts = ec2.write();
-    let state = accounts.get_or_create(account_id);
-    let Some(vpc_id) = state
-        .vpcs
-        .values()
-        .find(|v| v.is_default)
-        .map(|v| v.vpc_id.clone())
-    else {
-        return Vec::new();
-    };
-    let mut subnets: Vec<SubnetInfo> = state
-        .subnets
-        .values()
-        .filter(|s| s.vpc_id == vpc_id && s.default_for_az)
-        .map(SubnetInfo::from)
-        .collect();
-    subnets.sort_by(|a, b| a.availability_zone.cmp(&b.availability_zone));
-    subnets
+    with_account(ec2, account_id, |state| {
+        let Some(vpc_id) = default_vpc_id_in(state) else {
+            return Vec::new();
+        };
+        let mut subnets: Vec<SubnetInfo> = state
+            .subnets
+            .values()
+            .filter(|s| s.vpc_id == vpc_id && s.default_for_az)
+            .map(SubnetInfo::from)
+            .collect();
+        subnets.sort_by(|a, b| a.availability_zone.cmp(&b.availability_zone));
+        subnets
+    })
 }
 
 /// The id of `vpc_id`'s `default` security group.
@@ -209,9 +227,9 @@ pub fn default_security_group_id(
     account_id: &str,
     vpc_id: &str,
 ) -> Option<String> {
-    let mut accounts = ec2.write();
-    let state = accounts.get_or_create(account_id);
-    default_security_group_id_in(state, vpc_id)
+    with_account(ec2, account_id, |state| {
+        default_security_group_id_in(state, vpc_id)
+    })
 }
 
 /// [`default_security_group_id`] against an already-borrowed account state.
@@ -230,9 +248,9 @@ pub fn security_group_vpcs(
     account_id: &str,
     group_ids: &[String],
 ) -> Result<Vec<(String, String)>, String> {
-    let mut accounts = ec2.write();
-    let state = accounts.get_or_create(account_id);
-    security_group_vpcs_in(state, group_ids)
+    with_account(ec2, account_id, |state| {
+        security_group_vpcs_in(state, group_ids)
+    })
 }
 
 /// [`security_group_vpcs`] against an already-borrowed account state.
@@ -526,6 +544,18 @@ mod tests {
             "us-east-1",
             "",
         )))
+    }
+
+    #[test]
+    fn with_account_creates_an_unseen_account_with_its_default_vpc() {
+        let ec2 = ec2();
+        assert!(ec2.read().get("444455556666").is_none());
+        let vpc = with_account(&ec2, "444455556666", default_vpc_id_in).expect("default VPC");
+        let sg = with_account(&ec2, "444455556666", |s| {
+            default_security_group_id_in(s, &vpc)
+        });
+        assert!(sg.is_some());
+        assert!(ec2.read().get("444455556666").is_some());
     }
 
     #[test]

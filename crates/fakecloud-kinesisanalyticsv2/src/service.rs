@@ -1155,16 +1155,13 @@ impl Ka2Service {
         let Some(ec2) = self.ec2_state.as_ref() else {
             return BTreeMap::new();
         };
-        let guard = ec2.read();
-        guard
-            .get(account)
-            .map(|st| {
-                st.subnets
-                    .iter()
-                    .map(|(sid, sub)| (sid.clone(), sub.vpc_id.clone()))
-                    .collect()
-            })
-            .unwrap_or_default()
+        // An account EC2 has not seen yet still resolves its default subnets.
+        fakecloud_ec2::vpc_lookup::with_account(ec2, account, |st| {
+            st.subnets
+                .iter()
+                .map(|(sid, sub)| (sid.clone(), sub.vpc_id.clone()))
+                .collect()
+        })
     }
 
     /// Overwrite each VPC configuration description's `VpcId` from a
@@ -3632,6 +3629,21 @@ mod tests {
             "us-east-1",
             "",
         ))))
+    }
+
+    /// Default subnets of an account EC2 has not seen yet still resolve to
+    /// their VPC.
+    #[test]
+    fn subnet_vpc_map_covers_untouched_account_defaults() {
+        let ec2 = Arc::new(RwLock::new(MultiAccountState::new(
+            "000000000000",
+            "us-east-1",
+            "",
+        )));
+        let svc = svc().with_ec2_state(ec2);
+        let map = svc.ec2_subnet_vpc_map("111111111111");
+        assert!(!map.is_empty());
+        assert!(map.values().all(|vpc| vpc.starts_with("vpc-")));
     }
 
     fn req(action: &str, body: Value) -> AwsRequest {

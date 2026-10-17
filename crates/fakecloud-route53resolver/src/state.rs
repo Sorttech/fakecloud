@@ -135,7 +135,13 @@ pub struct ResolverEndpoint {
     pub creation_time: String,
     pub modification_time: String,
     pub resolver_endpoint_type: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// Endpoints stored before omitted `Protocols` became `Do53` load as
+    /// `Do53` too.
+    #[serde(
+        default = "default_endpoint_protocols",
+        deserialize_with = "deserialize_endpoint_protocols",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub protocols: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outpost_arn: Option<String>,
@@ -149,6 +155,27 @@ pub struct ResolverEndpoint {
     pub rni_enhanced_metrics_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_name_server_metrics_enabled: Option<bool>,
+}
+
+/// Endpoint protocols as stored and returned: AWS treats an omitted or empty
+/// `Protocols` list as `Do53` and reports it as such.
+pub fn endpoint_protocols(protocols: Vec<String>) -> Vec<String> {
+    if protocols.is_empty() {
+        vec!["Do53".to_string()]
+    } else {
+        protocols
+    }
+}
+
+fn default_endpoint_protocols() -> Vec<String> {
+    endpoint_protocols(Vec::new())
+}
+
+fn deserialize_endpoint_protocols<'de, D>(de: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<String>::deserialize(de).map(endpoint_protocols)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,7 +206,7 @@ pub struct ResolverRule {
     pub rule_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub target_ips: Vec<TargetAddress>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolver_endpoint_id: Option<String>,
@@ -618,6 +645,98 @@ mod tests {
             .accounts
             .unwrap();
         assert!(again.region("123456789012", "eu-west-1").is_some());
+    }
+
+    fn endpoint(protocols: Vec<String>) -> ResolverEndpoint {
+        ResolverEndpoint {
+            id: "rslvr-in-1".into(),
+            creator_request_id: "c".into(),
+            arn: "arn:aws:route53resolver:us-east-1:123456789012:resolver-endpoint/rslvr-in-1"
+                .into(),
+            name: None,
+            security_group_ids: vec!["sg-1".into()],
+            direction: "INBOUND".into(),
+            ip_address_count: 0,
+            host_vpc_id: "vpc-1".into(),
+            status: "OPERATIONAL".into(),
+            status_message: String::new(),
+            creation_time: String::new(),
+            modification_time: String::new(),
+            resolver_endpoint_type: "IPV4".into(),
+            protocols,
+            outpost_arn: None,
+            preferred_instance_type: None,
+            dns64_enabled: None,
+            ipv6_internet_access_enabled: None,
+            rni_enhanced_metrics_enabled: None,
+            target_name_server_metrics_enabled: None,
+        }
+    }
+
+    /// Empty lists are omitted on write, so they must default on read: a
+    /// snapshot holding an endpoint with no `Protocols` (written before the
+    /// Do53 default; it loads as Do53) or a SYSTEM rule with no `TargetIps`
+    /// has to load.
+    #[test]
+    fn snapshot_with_omitted_empty_lists_loads() {
+        let mut st = AccountState::default();
+        st.endpoints.insert(
+            "rslvr-in-1".into(),
+            EndpointRecord {
+                endpoint: endpoint(Vec::new()),
+                ip_addresses: Vec::new(),
+            },
+        );
+        st.rules.insert(
+            "rslvr-rr-1".into(),
+            ResolverRule {
+                id: "rslvr-rr-1".into(),
+                creator_request_id: "c".into(),
+                arn: "arn:aws:route53resolver:us-east-1:123456789012:resolver-rule/rslvr-rr-1"
+                    .into(),
+                domain_name: Some("example.com.".into()),
+                status: "COMPLETE".into(),
+                status_message: String::new(),
+                rule_type: "SYSTEM".into(),
+                name: None,
+                target_ips: Vec::new(),
+                resolver_endpoint_id: None,
+                owner_id: "123456789012".into(),
+                share_status: "NOT_SHARED".into(),
+                creation_time: String::new(),
+                modification_time: String::new(),
+                delegation_record: None,
+            },
+        );
+        let mut accounts = Route53ResolverAccounts::default();
+        *accounts.region_mut("123456789012", "us-east-1") = st;
+        let bytes = serde_json::to_vec(&Route53ResolverSnapshot {
+            schema_version: R53R_SNAPSHOT_SCHEMA_VERSION,
+            accounts: Some(accounts),
+        })
+        .unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(!text.contains("Protocols") && !text.contains("TargetIps"));
+
+        let loaded = parse_route53resolver_snapshot(&bytes, "us-east-1")
+            .unwrap()
+            .accounts
+            .unwrap();
+        let region = loaded.region("123456789012", "us-east-1").unwrap();
+        assert_eq!(
+            region.endpoints["rslvr-in-1"].endpoint.protocols,
+            vec!["Do53".to_string()]
+        );
+        assert!(region.rules["rslvr-rr-1"].target_ips.is_empty());
+    }
+
+    #[test]
+    fn omitted_protocols_are_do53() {
+        assert_eq!(endpoint_protocols(Vec::new()), vec!["Do53".to_string()]);
+        assert_eq!(
+            endpoint_protocols(vec!["DoH".into()]),
+            vec!["DoH".to_string()]
+        );
     }
 
     #[test]

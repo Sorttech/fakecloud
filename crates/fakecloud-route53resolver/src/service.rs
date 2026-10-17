@@ -14,9 +14,9 @@ use fakecloud_persistence::SnapshotStore;
 
 use crate::persistence::save_route53resolver_snapshot;
 use crate::state::{
-    EndpointRecord, FirewallConfig, FirewallDomainList, FirewallRule, FirewallRuleGroup,
-    FirewallRuleGroupAssociation, IpAddressResponse, OutpostResolver, ResolverConfig,
-    ResolverDnssecConfig, ResolverEndpoint, ResolverQueryLogConfig,
+    endpoint_protocols, EndpointRecord, FirewallConfig, FirewallDomainList, FirewallRule,
+    FirewallRuleGroup, FirewallRuleGroupAssociation, IpAddressResponse, OutpostResolver,
+    ResolverConfig, ResolverDnssecConfig, ResolverEndpoint, ResolverQueryLogConfig,
     ResolverQueryLogConfigAssociation, ResolverRule, ResolverRuleAssociation,
     Route53ResolverAccounts, SharedRoute53ResolverState,
 };
@@ -413,9 +413,10 @@ impl Route53ResolverService {
         let Some(ec2) = self.ec2_state.as_ref() else {
             return Ok(None);
         };
-        let guard = ec2.read();
-        match ec2_in_region(&guard, account, region).and_then(|s| s.subnets.get(subnet_id)) {
-            Some(subnet) => Ok(Some(subnet.vpc_id.clone())),
+        match with_ec2_in_region(ec2, account, region, |s| {
+            s.subnets.get(subnet_id).map(|sub| sub.vpc_id.clone())
+        }) {
+            Some(vpc) => Ok(Some(vpc)),
             None => Err(invalid_parameter(format!(
                 "The subnet ID '{subnet_id}' does not exist"
             ))),
@@ -432,19 +433,17 @@ impl Route53ResolverService {
         let Some(ec2) = self.ec2_state.as_ref() else {
             return Ok(());
         };
-        let guard = ec2.read();
-        let acc = ec2_in_region(&guard, account, region);
-        for sg in sgs {
-            let ok = acc
-                .map(|s| s.security_groups.contains_key(sg))
-                .unwrap_or(false);
-            if !ok {
-                return Err(invalid_parameter(format!(
-                    "The security group '{sg}' does not exist"
-                )));
-            }
+        let missing = with_ec2_in_region(ec2, account, region, |s| {
+            sgs.iter()
+                .find(|sg| !s.security_groups.contains_key(*sg))
+                .cloned()
+        });
+        match missing {
+            Some(sg) => Err(invalid_parameter(format!(
+                "The security group '{sg}' does not exist"
+            ))),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// `true` when EC2 state is wired and the VPC does not exist. Returns
@@ -455,10 +454,7 @@ impl Route53ResolverService {
         let Some(ec2) = self.ec2_state.as_ref() else {
             return false;
         };
-        let guard = ec2.read();
-        !ec2_in_region(&guard, account, region)
-            .map(|s| s.vpcs.contains_key(vpc_id))
-            .unwrap_or(false)
+        !with_ec2_in_region(ec2, account, region, |s| s.vpcs.contains_key(vpc_id))
     }
 }
 
@@ -468,12 +464,15 @@ impl Route53ResolverService {
 /// kept once per account (every region's VPCs together), so for now this is
 /// the account's EC2 state; the region is threaded through every lookup so it
 /// narrows to the request region as soon as EC2 state is region-partitioned.
-fn ec2_in_region<'a>(
-    guard: &'a fakecloud_core::multi_account::MultiAccountState<fakecloud_ec2::Ec2State>,
+/// An account EC2 has not seen yet resolves with its default VPC (see
+/// [`fakecloud_ec2::vpc_lookup::with_account`]).
+fn with_ec2_in_region<R>(
+    ec2: &fakecloud_ec2::SharedEc2State,
     account: &str,
     _region: &str,
-) -> Option<&'a fakecloud_ec2::Ec2State> {
-    guard.get(account)
+    f: impl FnOnce(&fakecloud_ec2::Ec2State) -> R,
+) -> R {
+    fakecloud_ec2::vpc_lookup::with_account(ec2, account, f)
 }
 
 impl Default for Route53ResolverService {
@@ -703,7 +702,7 @@ impl Route53ResolverService {
                 .and_then(Value::as_str)
                 .unwrap_or("IPV4")
                 .to_string(),
-            protocols: string_list(body.get("Protocols")),
+            protocols: endpoint_protocols(string_list(body.get("Protocols"))),
             outpost_arn: body
                 .get("OutpostArn")
                 .and_then(Value::as_str)

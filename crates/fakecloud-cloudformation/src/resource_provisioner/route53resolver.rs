@@ -140,15 +140,9 @@ impl ResourceProvisioner {
     /// Resolve a subnet's VPC id from EC2 state (same lookup the service's
     /// `resolve_subnet_vpc` uses), or `None` when the subnet is not present.
     fn r53r_subnet_vpc(&self, subnet_id: &str) -> Option<String> {
-        let guard = self.ec2_state.read();
-        Some(
-            guard
-                .get(&self.account_id)?
-                .subnets
-                .get(subnet_id)?
-                .vpc_id
-                .clone(),
-        )
+        fakecloud_ec2::vpc_lookup::with_account(&self.ec2_state, &self.account_id, |s| {
+            s.subnets.get(subnet_id).map(|sub| sub.vpc_id.clone())
+        })
     }
 
     fn r53r_tags(&self, props: &serde_json::Value) -> Vec<Tag> {
@@ -261,15 +255,17 @@ impl ResourceProvisioner {
                 .and_then(|v| v.as_str())
                 .unwrap_or("IPV4")
                 .to_string(),
-            protocols: props
-                .get("Protocols")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            protocols: fakecloud_route53resolver::endpoint_protocols(
+                props
+                    .get("Protocols")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            ),
             outpost_arn: props
                 .get("OutpostArn")
                 .and_then(|v| v.as_str())
@@ -344,10 +340,11 @@ impl ResourceProvisioner {
                 rec.endpoint.resolver_endpoint_type = t.to_string();
             }
             if let Some(p) = props.get("Protocols").and_then(|v| v.as_array()) {
-                rec.endpoint.protocols = p
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect();
+                rec.endpoint.protocols = fakecloud_route53resolver::endpoint_protocols(
+                    p.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect(),
+                );
             }
             if let Some(v) = props.get("PreferredInstanceType").and_then(|v| v.as_str()) {
                 rec.endpoint.preferred_instance_type = Some(v.to_string());
