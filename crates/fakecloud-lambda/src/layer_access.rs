@@ -542,7 +542,7 @@ mod tests {
         let other = caller(OTHER, None);
         for principal in [
             json!({"AWS": format!("arn:aws:iam::{OTHER}:root")}),
-            json!({"AWS": [format!("arn:aws:iam::333333333333:root"), format!("arn:aws:iam::{OTHER}:root")]}),
+            json!({"AWS": ["arn:aws:iam::333333333333:root".to_string(), format!("arn:aws:iam::{OTHER}:root")]}),
             json!(OTHER),
             json!({"AWS": OTHER}),
             json!("*"),

@@ -355,17 +355,13 @@ async fn lambda_role(cfg: &aws_config::SdkConfig, account: &str) -> String {
     format!("arn:aws:iam::{account}:role/layer-user-role")
 }
 
-async fn create_with_layers(
+/// A CreateFunction request for a small Python function with `layers` attached.
+fn create_with_layers(
     lambda: &aws_sdk_lambda::Client,
     role: &str,
     name: &str,
     layers: &[String],
-) -> Result<
-    aws_sdk_lambda::operation::create_function::CreateFunctionOutput,
-    aws_sdk_lambda::error::SdkError<
-        aws_sdk_lambda::operation::create_function::CreateFunctionError,
-    >,
-> {
+) -> aws_sdk_lambda::operation::create_function::builders::CreateFunctionFluentBuilder {
     let mut req = lambda
         .create_function()
         .function_name(name)
@@ -383,7 +379,7 @@ async fn create_with_layers(
     for layer in layers {
         req = req.layers(layer);
     }
-    req.send().await
+    req
 }
 
 #[tokio::test]
@@ -427,8 +423,11 @@ async fn a_shared_layer_version_is_readable_and_attachable_cross_account() {
     );
 
     let role = lambda_role(&user_cfg, LAYER_USER).await;
-    let refused =
-        error_of(create_with_layers(&user, &role, "consumer", std::slice::from_ref(&v1)).await);
+    let refused = error_of(
+        create_with_layers(&user, &role, "consumer", std::slice::from_ref(&v1))
+            .send()
+            .await,
+    );
     assert_eq!(refused.0, "AccessDeniedException", "{}", refused.1);
 
     let granted = owner
@@ -472,6 +471,7 @@ async fn a_shared_layer_version_is_readable_and_attachable_cross_account() {
     assert!(msg.contains("lambda:ListLayerVersions"), "{msg}");
 
     let created = create_with_layers(&user, &role, "consumer", std::slice::from_ref(&v1))
+        .send()
         .await
         .expect("a shared layer attaches");
     let attached = created.layers();
