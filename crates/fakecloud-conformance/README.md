@@ -109,7 +109,7 @@ cargo run -p fakecloud-conformance -- run --services s3
 # Run against an already-running fakecloud
 cargo run -p fakecloud-conformance -- run --endpoint http://localhost:4566
 
-# Check current results against the committed baseline (CI mode)
+# CI mode: fail on any failing variant, or on any service passing fewer variants than the committed baseline
 cargo run -p fakecloud-conformance -- check
 
 # Update the baseline after intentional improvements

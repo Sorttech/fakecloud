@@ -852,7 +852,7 @@ fn remove_labelled_leftovers(cli: &str, pid: u32) {
 /// Start the main sweep server (containers disabled, see `try_start_fakecloud`),
 /// exiting the process if it cannot come up: nothing can be probed without it.
 fn start_fakecloud() -> (String, Child) {
-    try_start_fakecloud(None, Duration::from_secs(5)).unwrap_or_else(|e| {
+    try_start_fakecloud(None, Duration::from_secs(60)).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1);
     })
@@ -996,15 +996,17 @@ fn cmd_check(
         }
     }
 
-    // Check per-service ratchet. The probe randomizes per-variant request
-    // inputs and shares one fakecloud process across services, so consecutive
-    // runs on the same code drift ±50 variants for kms / cognito-idp / ses.
-    // Treat that band as flake. Override via FAKECLOUD_CONFORMANCE_FLAKE_MARGIN.
+    // Every implemented service is at 100%, so any failing variant is a
+    // regression: report each failing operation.
+    let mut regressions = failing_operations(&report_data);
+
+    // Per-service ratchet against the baseline, so a service can't keep a
+    // clean 100% by losing variants. No margin by default; a local run can
+    // relax it via FAKECLOUD_CONFORMANCE_FLAKE_MARGIN.
     let flake_margin: usize = std::env::var("FAKECLOUD_CONFORMANCE_FLAKE_MARGIN")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(100);
-    let mut regressions = Vec::new();
+        .unwrap_or(0);
 
     let current_by_service: HashMap<&str, usize> = report_data
         .services
@@ -1067,7 +1069,7 @@ fn cmd_check(
     }
 
     if regressions.is_empty() {
-        println!("\nConformance check PASSED (no regressions)");
+        println!("\nConformance check PASSED (every variant passes, no regressions)");
         println!(
             "  baseline: {}/{} ({:.1}%)",
             baseline.variants_passed,
@@ -1082,7 +1084,7 @@ fn cmd_check(
                 * 100.0,
         );
     } else {
-        eprintln!("\nConformance check FAILED — coverage dropped:");
+        eprintln!("\nConformance check FAILED:");
         for r in &regressions {
             eprintln!("  {}", r);
         }
@@ -1090,6 +1092,25 @@ fn cmd_check(
         eprintln!("  cargo run -p fakecloud-conformance -- update-baseline");
         std::process::exit(1);
     }
+}
+
+/// One line per operation with a failing variant: `service Op: passed/total`.
+fn failing_operations(report_data: &report::ConformanceReport) -> Vec<String> {
+    report_data
+        .services
+        .iter()
+        .flat_map(|svc| {
+            svc.operations
+                .iter()
+                .filter(|op| op.passed < op.total_variants)
+                .map(|op| {
+                    format!(
+                        "{} {}: {}/{} variants passing",
+                        svc.service_name, op.name, op.passed, op.total_variants
+                    )
+                })
+        })
+        .collect()
 }
 
 fn cmd_update_baseline(
@@ -1129,6 +1150,50 @@ fn cmd_update_baseline(
 
 #[cfg(test)]
 mod tests {
+
+    fn op(name: &str, passed: usize, total: usize) -> report::OperationReport {
+        report::OperationReport {
+            name: name.to_string(),
+            total_variants: total,
+            passed,
+            failed: total - passed,
+            not_implemented: false,
+            crashes: 0,
+            failures: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn every_failing_operation_is_a_check_failure() {
+        let report_data = report::ConformanceReport {
+            services: vec![
+                report::ServiceReport {
+                    service_name: "sqs".to_string(),
+                    total_operations: 2,
+                    operations: vec![op("SendMessage", 30, 30), op("DeleteMessageBatch", 21, 22)],
+                },
+                report::ServiceReport {
+                    service_name: "kms".to_string(),
+                    total_operations: 1,
+                    operations: vec![op("Encrypt", 40, 40)],
+                },
+            ],
+            summary: report::Summary {
+                total_operations: 3,
+                implemented: 3,
+                passing: 2,
+                failing: 1,
+                not_implemented: 0,
+                total_variants: 92,
+                variants_passed: 91,
+                variants_failed: 1,
+            },
+        };
+        assert_eq!(
+            failing_operations(&report_data),
+            vec!["sqs DeleteMessageBatch: 21/22 variants passing".to_string()]
+        );
+    }
     use super::*;
 
     /// A one-request-per-connection HTTP stub that answers `GET` with
