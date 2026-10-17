@@ -1749,9 +1749,9 @@ async fn launch_now(
                 }
             };
             if !recorded {
-                // Cancelled or terminated while the task launched: it must not run.
+                // Cancelled or terminated while the task launched: it must not
+                // run. The caller persists ECS after the launch.
                 stop_ecs_task(&ecs, &src, &cluster, &task_arn, STOPPED_JOB_REASON).await;
-                ecs.persist().await;
                 return;
             }
             spawn_status_sync(
@@ -2067,10 +2067,8 @@ fn spawn_status_sync(
             for _ in 0..max_polls {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 if job_is_terminal(&batch_state, &account_id, &job_id) {
-                    // Stopped by CancelJob / TerminateJob. Stop this task too in
-                    // case the handler's StopTask failed or missed it.
-                    stop_ecs_task(&ecs, &src, &cluster, &task, STOPPED_JOB_REASON).await;
-                    ecs.persist().await;
+                    // Stopped by CancelJob / TerminateJob, which stopped the
+                    // task with the caller's reason.
                     return;
                 }
                 let resp = match ecs
@@ -2120,8 +2118,6 @@ fn spawn_status_sync(
 
             // Cancelled or terminated while this attempt ran: keep that outcome.
             if job_is_terminal(&batch_state, &account_id, &job_id) {
-                stop_ecs_task(&ecs, &src, &cluster, &task, STOPPED_JOB_REASON).await;
-                ecs.persist().await;
                 return;
             }
             if succeeded {
@@ -2138,19 +2134,6 @@ fn spawn_status_sync(
             }
 
             // Failure (or timeout when `outcome` is None).
-            if outcome.is_none() {
-                // The attempt overran: its container must not keep running
-                // beside a retry or under a FAILED job.
-                stop_ecs_task(
-                    &ecs,
-                    &src,
-                    &cluster,
-                    &task,
-                    "Job attempt duration exceeded timeout",
-                )
-                .await;
-                ecs.persist().await;
-            }
             let (exit_code, reason) =
                 outcome.unwrap_or((None, Some("Job attempt duration exceeded timeout".into())));
             if attempt < max_attempts {
@@ -2188,6 +2171,7 @@ fn spawn_status_sync(
                             match live_job(accounts.get_or_create(&account_id), &job_id) {
                                 Some(j) => {
                                     j.insert("status".into(), json!("STARTING"));
+                                    j.insert("ecsCluster".into(), json!(cluster));
                                     j.insert("ecsTaskArn".into(), json!(task));
                                     true
                                 }
@@ -2268,9 +2252,8 @@ pub(crate) fn live_job<'a>(
 }
 
 /// Stop an ECS task Batch launched, recording `reason` as its stoppedReason.
-/// Best-effort: a failure is logged, and the status poller retries it for a
-/// task whose job was stopped. Defers ECS's snapshot like a launch does; the
-/// caller persists once.
+/// Best-effort: a failure is logged. Defers ECS's snapshot like a launch
+/// does; the caller persists once.
 async fn stop_ecs_task(
     ecs: &fakecloud_ecs::EcsService,
     src: &AwsRequest,

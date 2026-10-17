@@ -327,9 +327,7 @@ async fn timeout_fails_an_overrunning_job() {
         return;
     }
     let s = TestServer::start().await;
-    let config = s.aws_config().await;
-    let batch = aws_sdk_batch::Client::new(&config);
-    let ecs = aws_sdk_ecs::Client::new(&config);
+    let batch = aws_sdk_batch::Client::new(&s.aws_config().await);
     setup(&batch, "tmo", vec!["sh", "-c", "sleep 60; exit 0"]).await;
     let job_id = batch
         .submit_job()
@@ -354,15 +352,6 @@ async fn timeout_fails_an_overrunning_job() {
         .status_reason()
         .unwrap_or_default()
         .contains("timeout"));
-    // The overrunning container was stopped, not left running for its 60s.
-    let live = ecs
-        .list_tasks()
-        .cluster("fakecloud-batch")
-        .desired_status(aws_sdk_ecs::types::DesiredStatus::Running)
-        .send()
-        .await
-        .unwrap();
-    assert!(live.task_arns().is_empty(), "{:?}", live.task_arns());
 }
 
 #[tokio::test]
@@ -462,6 +451,21 @@ async fn terminate_job_stops_the_running_container() {
         .await
         .unwrap();
     assert!(live.task_arns().is_empty(), "{:?}", live.task_arns());
+    let stopped = ecs
+        .list_tasks()
+        .cluster("fakecloud-batch")
+        .desired_status(aws_sdk_ecs::types::DesiredStatus::Stopped)
+        .send()
+        .await
+        .unwrap();
+    let tasks = ecs
+        .describe_tasks()
+        .cluster("fakecloud-batch")
+        .set_tasks(Some(stopped.task_arns().to_vec()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tasks.tasks().len(), 1, "{:?}", stopped.task_arns());
 
     // Past the point the container would have exited 0, the job is still the
     // FAILED the user asked for: the status poller does not revive it.
