@@ -877,27 +877,6 @@ fn sha256_b64(bytes: &[u8]) -> String {
     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, hash)
 }
 
-/// Look up the `code_size` for an attached layer-version ARN by walking
-/// the in-process lambda state. Falls back to 0 when the ARN is
-/// unparseable or the layer/version is unknown — same fallback as the
-/// lambda service helper.
-fn layer_code_size(
-    accounts: &fakecloud_core::multi_account::MultiRegionState<fakecloud_lambda::LambdaState>,
-    arn: &str,
-) -> i64 {
-    // arn:aws:lambda:<region>:<account>:layer:<name>:<version>, which names
-    // the account and region the layer lives in.
-    let Some((_, name, ver)) = fakecloud_lambda::extras::parse_layer_version_arn(arn) else {
-        return 0;
-    };
-    accounts
-        .by_arn(arn)
-        .and_then(|s| s.layers.get(&name))
-        .and_then(|l| l.versions.iter().find(|v| v.version == ver))
-        .map(|v| v.code_size)
-        .unwrap_or(0)
-}
-
 /// What a resource provisioner returns. The physical id is what `Ref` resolves
 /// to; `attributes` is what `Fn::GetAtt` resolves to (per-resource-type).
 pub struct ProvisionResult {

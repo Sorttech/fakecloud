@@ -101,30 +101,9 @@ impl LambdaService {
             })?;
             // Resolve attached layer ARNs to ZIP bytes under the same read
             // lock. Layers may live in sibling accounts (cross-account
-            // attach is legal in AWS); fall back to no bytes for unknown
-            // ARNs and warn — invoke proceeds without that layer.
-            let mut layer_zips: Vec<Vec<u8>> = Vec::with_capacity(func.layers.len());
-            for attached in &func.layers {
-                // A layer version ARN names the account and region the
-                // layer lives in.
-                let bytes = crate::extras::parse_layer_version_arn(&attached.arn).and_then(
-                    |(_acct, name, ver)| {
-                        accounts
-                            .by_arn(&attached.arn)
-                            .and_then(|s| s.layers.get(&name))
-                            .and_then(|l| l.versions.iter().find(|v| v.version == ver))
-                            .and_then(|v| v.code_zip.clone())
-                    },
-                );
-                match bytes {
-                    Some(b) => layer_zips.push(b),
-                    None => tracing::warn!(
-                        function = %function_name,
-                        layer_arn = %attached.arn,
-                        "attached layer not resolvable; skipping /opt mount for this layer"
-                    ),
-                }
-            }
+            // attach is legal in AWS); an unresolvable layer is skipped with
+            // a warning and invoke proceeds without it.
+            let layer_zips = crate::state::attached_layer_zips(&accounts, &func);
             (func, layer_zips)
         };
 

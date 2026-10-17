@@ -14,8 +14,8 @@ use fakecloud_core::query::{optional_query_param, required_query_param};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::service::{
-    collect_member_values, empty_metadata_response, validate_len, validation_error, xml_escape,
-    CloudWatchService,
+    collect_member_values, empty_metadata_response, missing_param, validate_len, validation_error,
+    xml_escape, CloudWatchService,
 };
 use crate::state::{AlarmState, LogAlarm};
 
@@ -53,7 +53,14 @@ impl CloudWatchService {
         let alarm_name = required_query_param(req, "AlarmName")?;
 
         // ScheduledQueryConfiguration's required members arrive flattened.
-        let query_string = required_query_param(req, "ScheduledQueryConfiguration.QueryString")?;
+        // `QueryString` is `@length(min: 0)`: an empty string is a present
+        // value, unlike the other required members (min 1), so only an
+        // absent key is missing.
+        let query_string = req
+            .query_params
+            .get("ScheduledQueryConfiguration.QueryString")
+            .cloned()
+            .ok_or_else(|| missing_param("ScheduledQueryConfiguration.QueryString"))?;
         let scheduled_query_role_arn =
             required_query_param(req, "ScheduledQueryConfiguration.ScheduledQueryRoleARN")?;
         let aggregation_expression =

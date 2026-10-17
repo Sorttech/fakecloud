@@ -6,6 +6,25 @@
 use super::*;
 
 impl ResourceProvisioner {
+    /// A function's `Layers`, resolved as CreateFunction resolves them: each
+    /// version's `CodeSize`, and a refusal for a version another account has
+    /// not shared with the stack's account (or its organization).
+    fn resolve_lambda_layers(&self, arns: &[String]) -> Result<Vec<AttachedLayer>, String> {
+        let caller = fakecloud_lambda::layer_access::LayerCaller::for_account(
+            &self.account_id,
+            &self.region,
+            None,
+            Some(
+                fakecloud_organizations::resolver::OrganizationsScpResolver::shared(
+                    self.organizations_state.clone(),
+                ),
+            ),
+        );
+        let accounts = self.lambda_state.read();
+        fakecloud_lambda::layer_access::resolve_layer_attachments(&accounts, arns.to_vec(), &caller)
+            .map_err(|e| e.message())
+    }
+
     pub(super) fn get_att_lambda_function(
         &self,
         physical_id: &str,
@@ -86,16 +105,7 @@ impl ResourceProvisioner {
         // Resolve attached layer ARNs to their current code_size so
         // GetFunctionConfiguration echoes the right size without a
         // second state lookup.
-        let layers: Vec<AttachedLayer> = {
-            let accounts = self.lambda_state.read();
-            cfg.layers
-                .iter()
-                .map(|arn| AttachedLayer {
-                    arn: arn.clone(),
-                    code_size: layer_code_size(&accounts, arn),
-                })
-                .collect()
-        };
+        let layers: Vec<AttachedLayer> = self.resolve_lambda_layers(&cfg.layers)?;
 
         let func = fakecloud_lambda::LambdaFunction {
             function_name: function_name.clone(),
@@ -257,16 +267,7 @@ impl ResourceProvisioner {
             None
         };
 
-        let resolved_layers: Vec<AttachedLayer> = {
-            let accounts = self.lambda_state.read();
-            cfg.layers
-                .iter()
-                .map(|arn| AttachedLayer {
-                    arn: arn.clone(),
-                    code_size: layer_code_size(&accounts, arn),
-                })
-                .collect()
-        };
+        let resolved_layers: Vec<AttachedLayer> = self.resolve_lambda_layers(&cfg.layers)?;
 
         let vpc_config = cfg
             .vpc_config
@@ -657,6 +658,7 @@ impl ResourceProvisioner {
             compatible_runtimes,
             license_info,
             policy: None,
+            policy_revision_id: None,
             code_zip: zip_bytes,
             code_sha256,
             code_size,
@@ -668,20 +670,19 @@ impl ResourceProvisioner {
     }
 
     pub(super) fn delete_lambda_layer_version(&self, physical_id: &str) -> Result<(), String> {
-        // physical_id = `{layer_arn}:{version}` — strip trailing version.
-        let Some(idx) = physical_id.rfind(':') else {
+        // physical_id is the layer version ARN, which names the account and
+        // region the version lives in.
+        let Some(arn) = fakecloud_lambda::layer_access::LayerArn::parse(physical_id) else {
             return Ok(());
         };
-        let (layer_arn, version_part) = physical_id.split_at(idx);
-        let version_part = &version_part[1..];
-        let Ok(version) = version_part.parse::<i64>() else {
+        let Some(version) = arn.version else {
             return Ok(());
         };
-        // ARN form: arn:aws:lambda:<region>:<account>:layer:<name>
-        let layer_name = layer_arn.rsplit(':').next().unwrap_or("").to_string();
         let mut accounts = self.lambda_state.write();
-        let state = accounts.regional_mut(&self.account_id, &self.region);
-        if let Some(layer) = state.layers.get_mut(&layer_name) {
+        if let Some(layer) = accounts
+            .regional_get_mut(&arn.account_id, &arn.region)
+            .and_then(|s| s.layers.get_mut(&arn.layer_name))
+        {
             layer.versions.retain(|v| v.version != version);
         }
         Ok(())
@@ -1096,10 +1097,8 @@ impl ResourceProvisioner {
         _resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let arn = existing.physical_id.clone();
-        // ARN form: arn:aws:lambda:<region>:<account>:layer:<name>:<version>
-        let layer_arn_only = arn
-            .rsplit_once(':')
-            .map(|(prefix, _)| prefix.to_string())
+        let layer_arn_only = fakecloud_lambda::layer_access::LayerArn::parse(&arn)
+            .map(|a| a.layer_arn())
             .unwrap_or_else(|| arn.clone());
         Ok(ProvisionResult::new(existing.physical_id.clone())
             .with("LayerVersionArn", arn)

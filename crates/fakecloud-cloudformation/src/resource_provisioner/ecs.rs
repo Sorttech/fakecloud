@@ -511,11 +511,49 @@ impl ResourceProvisioner {
             &self.account_id,
             &format!("capacity-provider/{name}"),
         );
+        // Stored in the camelCase API shape so Describe reads it back the
+        // same as a direct CreateCapacityProvider.
+        let present = |key: &str| {
+            props
+                .get(key)
+                .filter(|v| !v.is_null())
+                .map(|v| cfn_props_to_camel(v, &[]))
+        };
+        let auto_scaling_group_provider = present("AutoScalingGroupProvider");
+        let managed_instances_provider = present("ManagedInstancesProvider");
+        // Same rule as CreateCapacityProvider: exactly one kind of backing
+        // capacity, and only Managed Instances providers are cluster-scoped.
+        let cluster = match (&auto_scaling_group_provider, &managed_instances_provider) {
+            (None, None) => return Err(
+                "Either AutoScalingGroupProvider or ManagedInstancesProvider must be specified."
+                    .to_string(),
+            ),
+            (Some(_), Some(_)) => return Err(
+                "AutoScalingGroupProvider and ManagedInstancesProvider can't both be specified."
+                    .to_string(),
+            ),
+            (Some(_), None) => None,
+            (None, Some(_)) => {
+                let cluster_ref = props
+                    .get("ClusterName")
+                    .and_then(|v| v.as_str())
+                    .filter(|c| !c.is_empty())
+                    .ok_or_else(|| {
+                        "ClusterName is required for a Managed Instances capacity provider."
+                            .to_string()
+                    })?;
+                Some(fakecloud_ecs::EcsState::resolve_cluster_name(Some(
+                    cluster_ref,
+                )))
+            }
+        };
         let cp = EcsCapacityProvider {
             name: name.clone(),
             arn: arn.clone(),
             status: "ACTIVE".to_string(),
-            auto_scaling_group_provider: props.get("AutoScalingGroupProvider").cloned(),
+            auto_scaling_group_provider,
+            managed_instances_provider,
+            cluster,
             update_status: None,
             update_status_reason: None,
             created_at: Utc::now(),
@@ -523,6 +561,11 @@ impl ResourceProvisioner {
         };
         let mut accounts = self.ecs_state.write();
         let state = accounts.get_or_create(&self.account_id);
+        if let Some(c) = &cp.cluster {
+            if !state.clusters.contains_key(c) {
+                return Err(format!("The referenced cluster was inactive: {c}"));
+            }
+        }
         state.capacity_providers.insert(name.clone(), cp);
         Ok(ProvisionResult::new(name).with("Arn", arn))
     }
@@ -750,8 +793,29 @@ impl ResourceProvisioner {
             .capacity_providers
             .get_mut(&name)
             .ok_or_else(|| format!("CapacityProvider {name} no longer exists"))?;
-        if props.get("AutoScalingGroupProvider").is_some() {
-            cp.auto_scaling_group_provider = props.get("AutoScalingGroupProvider").cloned();
+        // An in-place update keeps the provider's kind of backing capacity.
+        let managed = cp.managed_instances_provider.is_some();
+        if let Some(asg) = props
+            .get("AutoScalingGroupProvider")
+            .filter(|v| !v.is_null())
+        {
+            if managed {
+                return Err(format!(
+                    "CapacityProvider {name} is a Managed Instances provider; AutoScalingGroupProvider can't be set"
+                ));
+            }
+            cp.auto_scaling_group_provider = Some(cfn_props_to_camel(asg, &[]));
+        }
+        if let Some(mip) = props
+            .get("ManagedInstancesProvider")
+            .filter(|v| !v.is_null())
+        {
+            if !managed {
+                return Err(format!(
+                    "CapacityProvider {name} is an Auto Scaling group provider; ManagedInstancesProvider can't be set"
+                ));
+            }
+            cp.managed_instances_provider = Some(cfn_props_to_camel(mip, &[]));
         }
         if props.get("Tags").is_some() {
             cp.tags = parse_ecs_tags(props.get("Tags"));
