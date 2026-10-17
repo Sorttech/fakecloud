@@ -253,6 +253,13 @@ impl LambdaService {
             let third = segs.get(3).map(|s| s.as_str());
             let version = segs.get(4).map(|s| s.to_string());
             return match (&req.method, segs.len(), third, version.is_some()) {
+                // `GET /2018-10-31/layers?find=LayerVersion&Arn=...` is how
+                // the SDKs send `GetLayerVersionByArn`.
+                (&Method::GET, 2, _, _)
+                    if req.query_params.get("find").map(String::as_str) == Some("LayerVersion") =>
+                {
+                    Some(("GetLayerVersionByArn", None))
+                }
                 (&Method::GET, 2, _, _) => Some(("ListLayers", None)),
                 (&Method::POST, 4, Some("versions"), false) => Some(("PublishLayerVersion", layer)),
                 (&Method::GET, 4, Some("versions"), false) => {

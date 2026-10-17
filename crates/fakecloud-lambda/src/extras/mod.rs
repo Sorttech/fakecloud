@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
+use crate::layer_access::LayerArn;
 use crate::service::LambdaService;
 use crate::state::{function_arn, qualified_function_arn};
 use crate::state::{
@@ -16,30 +17,6 @@ use crate::state::{
     FunctionScalingConfig, FunctionUrlConfig, LambdaState, Layer, LayerVersion,
     ProvisionedConcurrencyConfig, RuntimeManagementConfig,
 };
-
-/// Resolve a layer-version ARN to its current `CodeSize` from the
-/// multi-account state. Returns 0 when the ARN is unparseable, when the
-/// referenced account/layer/version is unknown, or when the version was
-/// published without ZIP content (legacy snapshots).
-pub(crate) fn resolve_layer_attachments(
-    accounts: &fakecloud_core::multi_account::MultiRegionState<LambdaState>,
-    arns: Vec<String>,
-) -> Vec<AttachedLayer> {
-    arns.into_iter()
-        .map(|arn| {
-            let code_size = parse_layer_version_arn(&arn)
-                .and_then(|(_acct, name, ver)| {
-                    accounts
-                        .by_arn(&arn)
-                        .and_then(|s| s.layers.get(&name))
-                        .and_then(|l| l.versions.iter().find(|v| v.version == ver))
-                        .map(|v| v.code_size)
-                })
-                .unwrap_or(0);
-            AttachedLayer { arn, code_size }
-        })
-        .collect()
-}
 
 fn missing(name: &str) -> AwsServiceError {
     AwsServiceError::aws_error(
@@ -63,6 +40,14 @@ fn ok(body: Value) -> Result<AwsResponse, AwsServiceError> {
 
 fn empty() -> Result<AwsResponse, AwsServiceError> {
     Ok(AwsResponse::json(StatusCode::OK, "{}".to_string()))
+}
+
+fn created(body: Value) -> Result<AwsResponse, AwsServiceError> {
+    Ok(AwsResponse::json(StatusCode::CREATED, body.to_string()))
+}
+
+fn no_content() -> Result<AwsResponse, AwsServiceError> {
+    Ok(AwsResponse::json(StatusCode::NO_CONTENT, ""))
 }
 
 fn body(req: &AwsRequest) -> Value {
@@ -180,20 +165,6 @@ pub(crate) fn function_code_url(
     format!(
         "{scheme}://{host}/_fakecloud/lambda/function-code/{account_id}/{function_name}/{file}?region={region}"
     )
-}
-
-/// AWS layer-version ARN: `arn:aws:lambda:<region>:<account>:layer:<name>:<version>`.
-/// Returns `(account_id, layer_name, version)`. Used to resolve cross-account
-/// layer references attached to a function.
-pub fn parse_layer_version_arn(arn: &str) -> Option<(String, String, i64)> {
-    let parts: Vec<&str> = arn.split(':').collect();
-    if parts.len() != 8 || parts[0] != "arn" || parts[2] != "lambda" || parts[5] != "layer" {
-        return None;
-    }
-    let account = parts[4].to_string();
-    let name = parts[6].to_string();
-    let version: i64 = parts[7].parse().ok()?;
-    Some((account, name, version))
 }
 
 /// Validate the `CompatibleArchitecture` and `CompatibleRuntime` query
@@ -356,16 +327,21 @@ impl LambdaService {
         } else {
             None
         };
+        let caller = self.layer_caller(req);
         let mut accounts = self.state.write();
         // Pre-resolve layer attachments before re-borrowing accounts mutably
-        // for the function. Layer ARNs may live in sibling accounts.
-        let layer_attachments: Option<Vec<AttachedLayer>> = body["Layers"].as_array().map(|arr| {
-            let arns: Vec<String> = arr
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-            resolve_layer_attachments(&accounts, arns)
-        });
+        // for the function. Layer ARNs may live in sibling accounts, which
+        // must share them.
+        let layer_attachments: Option<Vec<AttachedLayer>> = body["Layers"]
+            .as_array()
+            .map(|arr| {
+                let arns: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+                crate::layer_access::resolve_layer_attachments(&accounts, arns, &caller)
+            })
+            .transpose()?;
         let state = accounts.regional_mut(&req.account_id, &req.region);
         let func = state
             .functions

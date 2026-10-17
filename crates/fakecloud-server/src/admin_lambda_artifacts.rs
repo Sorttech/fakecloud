@@ -14,7 +14,6 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
-use fakecloud_lambda::extras::parse_layer_version_arn;
 use fakecloud_lambda::SharedLambdaState;
 
 /// Routes mounted under `/_fakecloud/lambda/_internal/*`.
@@ -120,26 +119,13 @@ async fn serve_layers(
             .regional(&account_id, &region)
             .and_then(|s| s.functions.get(&function_name))
         {
-            Some(f) => f.clone(),
+            Some(f) => f,
             None => {
                 return (StatusCode::NOT_FOUND, "function not found").into_response();
             }
         };
-        let mut out: Vec<Vec<u8>> = Vec::with_capacity(func.layers.len());
-        for attached in &func.layers {
-            // A layer version ARN names the account and region it lives in.
-            if let Some((_acct, name, ver)) = parse_layer_version_arn(&attached.arn) {
-                if let Some(bytes) = accounts
-                    .by_arn(&attached.arn)
-                    .and_then(|s| s.layers.get(&name))
-                    .and_then(|l| l.versions.iter().find(|v| v.version == ver))
-                    .and_then(|v| v.code_zip.clone())
-                {
-                    out.push(bytes);
-                }
-            }
-        }
-        out
+        // Each layer version ARN names the account and region it lives in.
+        fakecloud_lambda::attached_layer_zips(&accounts, func)
     };
 
     match build_layers_tar(&layer_zips) {

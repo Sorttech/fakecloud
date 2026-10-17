@@ -2165,6 +2165,13 @@ async fn main() {
         fakecloud_iam::pass_role::IamRoleTrustValidator::shared(iam_state.clone()),
     );
     lambda_service = lambda_service.with_iam_mode(cli.iam_mode());
+    // Layer version grants scoped to an organization (`aws:PrincipalOrgID`)
+    // resolve the caller's organization from the Organizations state.
+    lambda_service = lambda_service.with_org_resolver(
+        fakecloud_organizations::resolver::OrganizationsScpResolver::shared(
+            organizations_state.clone(),
+        ),
+    );
     lambda_service = lambda_service.with_s3_delivery(s3_delivery_for_logs.clone());
     if let Some(ref rt) = container_runtime {
         lambda_service = lambda_service.with_runtime(rt.clone());
