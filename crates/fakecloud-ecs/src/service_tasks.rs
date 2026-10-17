@@ -753,6 +753,118 @@ pub(super) mod multi_container_tests {
         assert_eq!(err.code(), "InvalidParameterException");
     }
 
+    /// A service whose task (returned by ARN) has ExecuteCommand enabled and
+    /// its container running as `c1`, wired to a runtime driving `cli`.
+    fn exec_ready_task(cli: &str) -> (EcsService, Arc<crate::runtime::EcsRuntime>, String) {
+        let setup = fresh_service();
+        setup
+            .register_task_definition(&make_request(
+                "RegisterTaskDefinition",
+                json!({
+                    "family": "exec",
+                    "containerDefinitions": [{"name": "app", "image": "busybox", "essential": true}]
+                }),
+            ))
+            .expect("register");
+        // Launched without a runtime, so nothing runs; the container is then
+        // marked as running under `c1`.
+        let run = setup
+            .run_task(&make_request(
+                "RunTask",
+                json!({"taskDefinition": "exec", "count": 1, "enableExecuteCommand": true}),
+            ))
+            .expect("run_task");
+        let run: Value = serde_json::from_slice(run.body.expect_bytes()).unwrap();
+        let task_arn = run["tasks"][0]["taskArn"].as_str().unwrap().to_string();
+        {
+            let mut accounts = setup.state.write();
+            let task = accounts
+                .get_mut("000000000000")
+                .unwrap()
+                .tasks
+                .values_mut()
+                .next()
+                .unwrap();
+            task.containers[0].runtime_id = Some("c1".into());
+        }
+        let rt = Arc::new(crate::runtime::EcsRuntime::with_cli_for_tests(cli));
+        let svc = EcsService::new(setup.state.clone()).with_runtime(rt.clone());
+        (svc, rt, task_arn)
+    }
+
+    /// ExecuteCommand answers with the session as soon as the command is
+    /// started, as ECS does, instead of holding the API call open until the
+    /// command exits -- which, for a hung or long-running command, used to be
+    /// never.
+    // Multi-threaded: the test blocks while polling for the background exec.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execute_command_returns_without_waiting_for_the_command() {
+        // No `timeout` in the image, so the command runs directly and hangs.
+        let (dir, cli) = crate::runtime::tests_support::exec_cli(false);
+        let (svc, rt, task_arn) = exec_ready_task(&cli);
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            svc.execute_command(&make_request(
+                "ExecuteCommand",
+                json!({"task": task_arn, "command": "sh -c 'sleep 1000'", "interactive": true}),
+            )),
+        )
+        .await
+        .expect("ExecuteCommand must not wait for its command")
+        .expect("ExecuteCommand");
+        let resp: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert!(resp["session"]["sessionId"]
+            .as_str()
+            .unwrap()
+            .starts_with("ecs-execute-command-"));
+        // The command did start, in the task's container, split into its
+        // arguments rather than handed to a shell.
+        let pids = crate::runtime::tests_support::exec_pids(&dir, 1);
+        assert_eq!(
+            crate::runtime::tests_support::exec_calls(&dir),
+            [
+                "exec c1 timeout 1200 sh -c sleep 1000",
+                "exec c1 sh -c sleep 1000"
+            ]
+        );
+        // StopTask ends it, and nothing the test started is left behind.
+        svc.stop_task(&make_request(
+            "StopTask",
+            json!({"task": task_arn, "reason": "done"}),
+        ))
+        .await
+        .expect("stop_task");
+        for pid in pids {
+            assert!(
+                fakecloud_core::test_support::pid_gone(pid),
+                "exec process {pid} survived StopTask"
+            );
+        }
+        rt.abort_execs(None);
+    }
+
+    /// A command that can't be split into a program and its arguments (an
+    /// unbalanced quote) is refused up front instead of failing unseen.
+    #[tokio::test]
+    async fn execute_command_refuses_a_command_it_cannot_split() {
+        let (dir, cli) = crate::runtime::tests_support::exec_cli(false);
+        let (svc, _rt, task_arn) = exec_ready_task(&cli);
+        for command in ["sh -c 'unterminated", "   "] {
+            let err = match svc
+                .execute_command(&make_request(
+                    "ExecuteCommand",
+                    json!({"task": task_arn, "command": command, "interactive": true}),
+                ))
+                .await
+            {
+                Ok(_) => panic!("{command:?} must be refused"),
+                Err(e) => e,
+            };
+            assert_eq!(err.code(), "InvalidParameterException", "{command:?}");
+        }
+        assert!(crate::runtime::tests_support::exec_calls(&dir).is_empty());
+    }
+
     #[test]
     fn run_task_on_missing_cluster_is_cluster_not_found() {
         let svc = fresh_service();

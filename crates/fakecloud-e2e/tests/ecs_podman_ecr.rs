@@ -172,6 +172,7 @@ async fn ecs_task_pulls_ecr_image_with_podman() {
     let task_id = arn.rsplit('/').next().unwrap().to_string();
 
     let mut stopped = None;
+    let mut last = None;
     for _ in 0..240 {
         let desc = ecs
             .describe_tasks()
@@ -185,9 +186,17 @@ async fn ecs_task_pulls_ecr_image_with_podman() {
             stopped = Some(task);
             break;
         }
+        last = Some(task);
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    let task = stopped.expect("task did not reach STOPPED");
+    let task = stopped.unwrap_or_else(|| {
+        panic!(
+            "task did not reach STOPPED; last seen: {}",
+            last.as_ref()
+                .map(helpers::ecs_task_summary)
+                .unwrap_or_default()
+        )
+    });
     assert_ne!(
         task.stop_code().map(|c| c.as_str()),
         Some("TaskFailedToStart"),
@@ -278,8 +287,12 @@ async fn ecs_task_role_credentials_at_link_local_address_with_podman() {
     let arn = run.tasks()[0].task_arn().unwrap().to_string();
     let task_id = arn.rsplit('/').next().unwrap().to_string();
 
-    let mut stopped = false;
-    for _ in 0..240 {
+    // The first task-role task builds the credentials helper image, whose
+    // build is bounded per attempt but may retry once after a stalled package
+    // mirror (see `task_creds`), so allow well past one attempt.
+    let mut stopped = None;
+    let mut last = None;
+    for _ in 0..600 {
         let desc = ecs
             .describe_tasks()
             .cluster("podman-creds")
@@ -287,13 +300,28 @@ async fn ecs_task_role_credentials_at_link_local_address_with_podman() {
             .send()
             .await
             .expect("describe_tasks");
-        if desc.tasks()[0].last_status() == Some("STOPPED") {
-            stopped = true;
+        let task = desc.tasks()[0].clone();
+        if task.last_status() == Some("STOPPED") {
+            stopped = Some(task);
             break;
         }
+        last = Some(task);
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    assert!(stopped, "task did not reach STOPPED");
+    let task = stopped.unwrap_or_else(|| {
+        panic!(
+            "task did not reach STOPPED; last seen: {}",
+            last.as_ref()
+                .map(helpers::ecs_task_summary)
+                .unwrap_or_default()
+        )
+    });
+    assert_ne!(
+        task.stop_code().map(|c| c.as_str()),
+        Some("TaskFailedToStart"),
+        "task failed to start: {}",
+        helpers::ecs_task_summary(&task)
+    );
 
     let logs: serde_json::Value = reqwest::Client::new()
         .get(format!(

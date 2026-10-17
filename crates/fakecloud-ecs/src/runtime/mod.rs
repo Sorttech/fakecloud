@@ -24,6 +24,38 @@ use tokio::process::Command;
 
 use crate::state::{LifecycleEvent, SharedEcsState};
 
+/// Budget for a container-CLI call that only talks to the local daemon
+/// (`inspect`, `logs`, `rm`, `tag`, `network create`, `stop --time 10`, ...):
+/// seconds when the daemon is healthy, so a minute only ever runs out on a
+/// wedged one.
+pub(crate) const CLI_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Budget for a detached `run -d` of an image already present locally:
+/// create plus start, which on a loaded Podman host (network namespace,
+/// rootless port forwarder) can take far longer than a lookup.
+pub(crate) const CONTAINER_RUN_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long an `ExecuteCommand` command may run before it is killed. ECS
+/// returns from the API as soon as the Session Manager session opens; the
+/// session then ends when its command exits or after Session Manager's idle
+/// session timeout, 20 minutes by default. No client is ever attached to the
+/// session here, so it is idle throughout and gets that same limit.
+pub(crate) const EXEC_COMMAND_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+/// `ExecuteCommand` commands that may run at once in one task. Each holds a
+/// CLI client on the host and a process in the container for up to
+/// [`EXEC_COMMAND_TIMEOUT`] with nothing reading its output, so a client
+/// calling ExecuteCommand in a loop would otherwise pile up processes until
+/// the host runs out. Eight is several times what a person debugging a task
+/// opens at once (a shell plus a few one-off commands).
+pub(crate) const MAX_EXECS_PER_TASK: usize = 8;
+
+/// `ExecuteCommand` commands that may run at once across every task, the
+/// same bound for a test suite fanning out over many tasks: well past any
+/// realistic local workload, well under the process and descriptor limits
+/// of a default host.
+pub(crate) const MAX_EXECS: usize = 64;
+
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
     #[error("container CLI not found (tried docker, podman)")]
@@ -106,6 +138,10 @@ pub struct EcsRuntime {
     /// Per-task IDs of the containers holding each task container's network
     /// namespace (see [`task_creds`]); removed when the task stops.
     netns_holders: RwLock<std::collections::HashMap<String, Vec<String>>>,
+    /// Per-task `ExecuteCommand` commands still running in the background
+    /// (see [`EcsRuntime::spawn_exec_command`]); aborted when the task stops.
+    exec_sessions:
+        parking_lot::Mutex<std::collections::HashMap<String, Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 mod config;
@@ -160,6 +196,7 @@ impl EcsRuntime {
             snapshot_hook: std::sync::OnceLock::new(),
             creds_helper_image: tokio::sync::Mutex::new(None),
             netns_holders: RwLock::new(std::collections::HashMap::new()),
+            exec_sessions: parking_lot::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -191,6 +228,7 @@ impl EcsRuntime {
             snapshot_hook: std::sync::OnceLock::new(),
             creds_helper_image: tokio::sync::Mutex::new(None),
             netns_holders: RwLock::new(std::collections::HashMap::new()),
+            exec_sessions: parking_lot::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -1088,11 +1126,12 @@ async fn inspect_container_state(cli: &str, container_id: &str) -> Option<Inspec
     // costs one process spawn per poll rather than four.
     let format =
         "{{.State.Status}}|{{.State.Running}}|{{.State.ExitCode}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}<none>{{end}}";
-    let out = Command::new(cli)
-        .args(["inspect", "-f", format, container_id])
-        .output()
-        .await
-        .ok()?;
+    let out = fakecloud_core::container_net::output_within(
+        Command::new(cli).args(["inspect", "-f", format, container_id]),
+        CLI_CALL_TIMEOUT,
+    )
+    .await
+    .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -2004,8 +2043,16 @@ pub async fn sleep(duration: Duration) {
 
 #[cfg(test)]
 impl EcsRuntime {
+    /// [`Self::bare_for_tests`] driving the container CLI at `cli`.
+    pub(crate) fn with_cli_for_tests(cli: &str) -> EcsRuntime {
+        EcsRuntime {
+            cli: cli.to_string(),
+            ..Self::bare_for_tests()
+        }
+    }
+
     /// A runtime with no container CLI or wired services, for unit tests.
-    pub(super) fn bare_for_tests() -> EcsRuntime {
+    pub(crate) fn bare_for_tests() -> EcsRuntime {
         EcsRuntime {
             cli: String::new(),
             net: fakecloud_core::container_net::HostNetworking {
@@ -2026,6 +2073,7 @@ impl EcsRuntime {
             snapshot_hook: std::sync::OnceLock::new(),
             creds_helper_image: tokio::sync::Mutex::new(None),
             netns_holders: RwLock::new(std::collections::HashMap::new()),
+            exec_sessions: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -2033,6 +2081,64 @@ impl EcsRuntime {
 #[cfg(test)]
 pub(crate) mod tests_support {
     use super::ContainerPlan;
+
+    /// A fake container CLI for `ExecuteCommand`. Every call (but the
+    /// warmup) goes to `calls.log`. An exec under the container's `timeout`
+    /// either fails the way the engine does when the image has none
+    /// (`has_timeout = false`), or stands in for it: it sleeps the given
+    /// seconds and exits 124, as `timeout` does when the deadline hits. A
+    /// direct exec never finishes, appending the pid of the process it is
+    /// stuck in to `pids`.
+    pub(crate) fn exec_cli(has_timeout: bool) -> (tempfile::TempDir, String) {
+        let in_timeout = if has_timeout {
+            r#"sleep "$4"; exit 124"#
+        } else {
+            r#"echo 'OCI runtime exec failed: exec failed: unable to start container process: exec: "timeout": executable file not found in $PATH: unknown' >&2; exit 126"#
+        };
+        fakecloud_core::test_support::fake_cli(
+            "cli",
+            &format!(
+                r#"d=$(dirname "$0")
+[ "$1" = warmup ] && exit 0
+echo "$*" >> "$d/calls.log"
+if [ "$1" = exec ] && [ "$3" = timeout ]; then
+  {in_timeout}
+fi
+sleep 1000 & echo $! >> "$d/pids"; wait
+"#
+            ),
+        )
+    }
+
+    /// The calls an [`exec_cli`] fake in `dir` has logged.
+    pub(crate) fn exec_calls(dir: &tempfile::TempDir) -> Vec<String> {
+        std::fs::read_to_string(dir.path().join("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+
+    /// Wait for an [`exec_cli`] fake in `dir` to have `n` direct execs
+    /// running, and return their pids.
+    pub(crate) fn exec_pids(dir: &tempfile::TempDir, n: usize) -> Vec<u32> {
+        let path = dir.path().join("pids");
+        let read = || -> Vec<u32> {
+            std::fs::read_to_string(&path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect()
+        };
+        assert!(
+            fakecloud_core::test_support::wait_until(std::time::Duration::from_secs(10), || {
+                read().len() >= n
+            }),
+            "expected {n} running execs, saw {:?}",
+            read()
+        );
+        read()
+    }
 
     pub(crate) fn minimal_plan() -> ContainerPlan {
         ContainerPlan {
