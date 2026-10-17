@@ -151,6 +151,35 @@ fn validate_nested(action: &str, body: &Value) -> Result<(), AwsServiceError> {
             }
         }
     }
+    validate_group_definitions(body)?;
+    Ok(())
+}
+
+/// `GroupDefinition.Type` is the `GroupDefinitionType` enum and
+/// `GroupDefinition.Key` is at most 1024 characters, in every operation that
+/// takes a `GroupBy` list.
+fn validate_group_definitions(body: &Value) -> Result<(), AwsServiceError> {
+    let Some(groups) = body.get("GroupBy").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for group in groups {
+        if let Some(t) = group.get("Type").and_then(Value::as_str) {
+            if !GROUP_DEFINITION_TYPE.contains(&t) {
+                return Err(invalid(format!(
+                    "GroupBy.Type '{}' is not a valid value. Valid values are: {}.",
+                    t,
+                    GROUP_DEFINITION_TYPE.join(", ")
+                )));
+            }
+        }
+        if let Some(k) = group.get("Key").and_then(Value::as_str) {
+            if k.chars().count() > 1024 {
+                return Err(invalid(
+                    "GroupBy.Key must have length less than or equal to 1024.".to_string(),
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -200,7 +229,9 @@ const DIMENSION: &[&str] = &[
     "INVOICING_ENTITY",
     "ANOMALY_TOTAL_IMPACT_ABSOLUTE",
     "ANOMALY_TOTAL_IMPACT_PERCENTAGE",
+    "PRODUCT_ATTRIBUTE",
 ];
+const GROUP_DEFINITION_TYPE: &[&str] = &["DIMENSION", "TAG", "COST_CATEGORY", "PRODUCT_ATTRIBUTE"];
 const CONTEXT: &[&str] = &["COST_AND_USAGE", "RESERVATIONS", "SAVINGS_PLANS"];
 const FEEDBACK: &[&str] = &["YES", "NO", "PLANNED_ACTIVITY"];
 const ACCOUNT_SCOPE: &[&str] = &["PAYER", "LINKED"];
@@ -398,6 +429,7 @@ fn rules_for(action: &str) -> &'static [Rule] {
             const R: &[Rule] = &[
                 Rule::str_("SearchString", None, Some(1024)),
                 Rule::enum_("Dimension", DIMENSION),
+                Rule::str_("DimensionKey", None, Some(1024)),
                 Rule::enum_("Context", CONTEXT),
                 Rule::str_("BillingViewArn", Some(20), Some(2048)),
                 Rule::int_("MaxResults", Some(1), None),

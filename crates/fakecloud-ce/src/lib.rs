@@ -24,11 +24,20 @@
 //!   forecasts, coverage, utilization, recommendations). This is the "no usage
 //!   recorded" honest state, not a stub.
 //!
+//! Product-attribute requests (`Expression.ProductAttributes`, the
+//! `PRODUCT_ATTRIBUTE` group-by type and dimension, `DimensionKey`) are held
+//! to the model's documented contract: supported operations and contexts, key
+//! and match-option rules, the SERVICE filter rules, and the 2026-09-01 data
+//! start (`DataUnavailableException` before it). Product-attribute results
+//! cover only supported-service (Amazon Bedrock) costs, which a fake account
+//! has none of, so they are empty like every other reporting series.
+//!
 //! Model-derived input validation (`@required`, `@length`, `@range`, enum
 //! value sets) rejects malformed requests with a 4xx so negative variants get
 //! the right error.
 
 pub mod persistence;
+mod product_attributes;
 pub mod service;
 pub mod state;
 mod validate;
