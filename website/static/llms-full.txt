@@ -6,7 +6,7 @@
 
 fakecloud emulates AWS locally for integration testing and development. It is a single Rust binary (~19 MB, ~300ms startup, ~10 MiB idle memory) — no Docker required to run fakecloud itself, no signup. Point any AWS SDK or the AWS CLI at `http://localhost:4566` with dummy credentials.
 
-**Coverage goal:** 100% of AWS services, each at 100% behavioral conformance, with 100% of cross-service integrations. Approach is depth-first — a service lands when it passes the full Smithy-model test variants and the cross-service wire-ups that matter for it, not when the API surface looks filled in. 106 services (7,551 operations) are shipped today, all at true 100% conformance — 257,288/257,288 generated Smithy variants pass on every commit; more land progressively as they hit the bar.
+**Coverage goal:** 100% of AWS services, each at 100% behavioral conformance, with 100% of cross-service integrations. Approach is depth-first — a service lands when it passes the full Smithy-model test variants and the cross-service wire-ups that matter for it, not when the API surface looks filled in. 106 services (7,553 operations) are shipped today, all at true 100% conformance — 257,288/257,288 generated Smithy variants pass on every commit; more land progressively as they hit the bar.
 
 Key design principles:
 - **Depth-first coverage**: every implemented service targets 100% conformance with real AWS, validated on every commit against AWS's own Smithy models — 257,288/257,288 generated test variants pass on every commit, true 100% across every implemented service. CI also runs upstream `hashicorp/terraform-provider-aws` `TestAcc*` suites against fakecloud.
@@ -667,7 +667,7 @@ Org tree (roots / OUs / accounts), `CreateAccount` real async `IN_PROGRESS -> SU
 
 Protocol: JSON 1.1
 
-### Glue (300 actions)
+### Glue (302 actions)
 
 Full Data Catalog (databases, tables, partitions with `GetPartitions` `Expression` pruning), jobs, crawlers, classifiers, connections, triggers, workflows, blueprints, dev endpoints, schema registry, interactive sessions, ML transforms, data quality, user-defined functions, usage profiles, column statistics, tagging. Real status transitions (crawler READY<->RUNNING, trigger/workflow/run lifecycles). Job/crawler/Spark execution itself is synthesized — fakecloud is not a Spark engine.
 
