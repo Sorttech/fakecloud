@@ -3167,6 +3167,7 @@ impl EksService {
             ));
         }
 
+        let configuration = normalize_capability_configuration(&type_, body.get("configuration"))?;
         let id = uuid::Uuid::new_v4().to_string();
         let arn = capability_arn(&region, &account_id, cluster_name, &name, &id);
         let now = Utc::now();
@@ -3178,7 +3179,7 @@ impl EksService {
             role_arn,
             status: "CREATING".to_string(),
             version: "v1".to_string(),
-            configuration: normalize_capability_configuration(body.get("configuration")),
+            configuration,
             tags: parse_tag_map(body.get("tags")),
             created_at: now,
             modified_at: now,
@@ -3290,19 +3291,28 @@ impl EksService {
             .and_then(|m| m.get_mut(name))
             .ok_or_else(not_found_capability(name))?;
 
+        // Resolve (and validate) the configuration delta before mutating
+        // anything, so a rejected update leaves the capability untouched.
+        let config_update = body
+            .get("configuration")
+            .filter(|v| !v.is_null())
+            .map(|update| {
+                apply_capability_configuration_update(
+                    &capability.type_,
+                    capability.configuration.as_ref(),
+                    update,
+                )
+            })
+            .transpose()?;
+
         let mut params = Vec::new();
         if let Some(role) = body.get("roleArn").and_then(|v| v.as_str()) {
             capability.role_arn = role.to_string();
             params.push(("RoleArn".to_string(), role.to_string()));
         }
-        if let Some(update) = body.get("configuration").filter(|v| !v.is_null()) {
-            params.push(("Configuration".to_string(), update.to_string()));
-            if let Some(cfg) = apply_capability_configuration_update(
-                capability.configuration.as_ref(),
-                Some(update),
-            ) {
-                capability.configuration = Some(cfg);
-            }
+        if let Some((cfg, config_params)) = config_update {
+            capability.configuration = cfg;
+            params.extend(config_params);
         }
         capability.modified_at = Utc::now();
 

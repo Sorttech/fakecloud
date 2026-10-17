@@ -1271,26 +1271,167 @@ pub(crate) fn date_to_number(ymd: &str) -> Value {
     timestamp_to_number(ts)
 }
 
-/// Keep only the `argoCd` member of a capability configuration (the sole
-/// member of `CapabilityConfigurationResponse`), so the echoed config stays
-/// shape-faithful. Returns `None` when nothing recognisable is present.
-pub(crate) fn normalize_capability_configuration(req: Option<&Value>) -> Option<Value> {
-    let argo = req.and_then(|v| v.get("argoCd"))?;
-    Some(json!({ "argoCd": argo }))
+/// Validate an `AckConfigRequest` / `UpdateAckConfig` object against the
+/// model constraints: `enableCrossNamespace` is a boolean and
+/// `disabledServices` is a list of at most 200 `AckServiceName`s (1-63
+/// chars, `^[a-z][a-z0-9]*$`). Violations are `InvalidParameterException`,
+/// the parameter error both CreateCapability and UpdateCapability declare.
+pub(crate) fn validate_ack_config(ack: &Value) -> Result<(), AwsServiceError> {
+    if ack.is_null() {
+        return Ok(());
+    }
+    let obj = ack
+        .as_object()
+        .ok_or_else(|| invalid_parameter("configuration.ack must be an object"))?;
+    if let Some(v) = obj.get("enableCrossNamespace").filter(|v| !v.is_null()) {
+        if !v.is_boolean() {
+            return Err(invalid_parameter(
+                "configuration.ack.enableCrossNamespace must be a boolean",
+            ));
+        }
+    }
+    if let Some(v) = obj.get("disabledServices").filter(|v| !v.is_null()) {
+        let list = v.as_array().ok_or_else(|| {
+            invalid_parameter("configuration.ack.disabledServices must be a list")
+        })?;
+        if list.len() > 200 {
+            return Err(invalid_parameter(
+                "configuration.ack.disabledServices must contain at most 200 service names",
+            ));
+        }
+        for item in list {
+            let name = item.as_str().unwrap_or_default();
+            let valid = (1..=63).contains(&name.len())
+                && name.starts_with(|c: char| c.is_ascii_lowercase())
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+            if !valid {
+                return Err(invalid_parameter(format!(
+                    "Invalid ACK service name '{name}' in configuration.ack.disabledServices: \
+                     must be 1-63 characters matching ^[a-z][a-z0-9]*$"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
+/// Build the stored `CapabilityConfigurationResponse` for a new capability.
+/// Each member is only used for its own capability type (`argoCd` for
+/// ARGOCD, `ack` for ACK) and is ignored otherwise. An ACK capability always
+/// reports its effective ACK settings: `enableCrossNamespace` defaults to
+/// `false` when omitted (or when `ack` is omitted entirely) and
+/// `disabledServices` is echoed exactly as supplied (empty when omitted, i.e.
+/// every service enabled). Returns `None` when nothing applies.
+pub(crate) fn normalize_capability_configuration(
+    capability_type: &str,
+    req: Option<&Value>,
+) -> Result<Option<Value>, AwsServiceError> {
+    let req = req.filter(|v| !v.is_null());
+    let ack_req = req.and_then(|v| v.get("ack")).filter(|v| !v.is_null());
+    if let Some(ack) = ack_req {
+        validate_ack_config(ack)?;
+    }
+    let mut out = serde_json::Map::new();
+    match capability_type {
+        "ARGOCD" => {
+            if let Some(argo) = req.and_then(|v| v.get("argoCd")).filter(|v| !v.is_null()) {
+                out.insert("argoCd".into(), argo.clone());
+            }
+        }
+        "ACK" => {
+            let cross = ack_req
+                .and_then(|a| a.get("enableCrossNamespace"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let disabled = ack_req
+                .and_then(|a| a.get("disabledServices"))
+                .filter(|v| v.is_array())
+                .cloned()
+                .unwrap_or_else(|| json!([]));
+            out.insert(
+                "ack".into(),
+                json!({ "enableCrossNamespace": cross, "disabledServices": disabled }),
+            );
+        }
+        _ => {}
+    }
+    Ok((!out.is_empty()).then_some(Value::Object(out)))
+}
+
+/// A capability's post-update configuration plus the `UpdateParam`
+/// (type, value) pairs its tracked Update reports.
+pub(crate) type CapabilityConfigUpdate = (Option<Value>, Vec<(String, String)>);
+
 /// Apply an `UpdateCapabilityConfiguration` onto a stored capability
-/// configuration. `UpdateArgoCdConfig` only carries `networkAccess` (which
-/// replaces the stored one) and `rbacRoleMappings` add/remove deltas; every
-/// other create-time member (`namespace`, `awsIdc`, `endpointPrefix`, which
-/// can't change after creation) is preserved.
+/// configuration, returning the new configuration and the `UpdateParam`s
+/// the tracked Update reports. Members only apply to their own capability
+/// type (`argoCd` -> ARGOCD, `ack` -> ACK) and are ignored otherwise.
+///
+/// `UpdateAckConfig` fields are independent: `enableCrossNamespace` (when
+/// present) replaces the flag and `disabledServices` (when present)
+/// replaces the whole list; each reports its own `EnableCrossNamespace` /
+/// `DisabledServices` param. The ArgoCD delta reports a `Configuration`
+/// param.
 pub(crate) fn apply_capability_configuration_update(
+    capability_type: &str,
     existing: Option<&Value>,
-    update: Option<&Value>,
-) -> Option<Value> {
-    let delta = update.and_then(|u| u.get("argoCd"))?;
+    update: &Value,
+) -> Result<CapabilityConfigUpdate, AwsServiceError> {
+    let ack_delta = update.get("ack").filter(|v| !v.is_null());
+    if let Some(ack) = ack_delta {
+        validate_ack_config(ack)?;
+    }
+    let mut cfg = existing
+        .and_then(|e| e.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let mut params = Vec::new();
+    match capability_type {
+        "ARGOCD" => {
+            if let Some(delta) = update.get("argoCd").filter(|v| !v.is_null()) {
+                let argo = apply_argocd_update(cfg.get("argoCd"), delta);
+                cfg.insert("argoCd".into(), argo);
+                params.push((
+                    "Configuration".to_string(),
+                    json!({ "argoCd": delta }).to_string(),
+                ));
+            }
+        }
+        "ACK" => {
+            let mut ack = cfg
+                .get("ack")
+                .and_then(|a| a.as_object())
+                .cloned()
+                .unwrap_or_default();
+            ack.entry("enableCrossNamespace")
+                .or_insert(Value::Bool(false));
+            ack.entry("disabledServices").or_insert_with(|| json!([]));
+            if let Some(delta) = ack_delta {
+                if let Some(cross) = delta.get("enableCrossNamespace").and_then(Value::as_bool) {
+                    ack.insert("enableCrossNamespace".into(), Value::Bool(cross));
+                    params.push(("EnableCrossNamespace".to_string(), cross.to_string()));
+                }
+                if let Some(list) = delta.get("disabledServices").filter(|v| v.is_array()) {
+                    ack.insert("disabledServices".into(), list.clone());
+                    params.push(("DisabledServices".to_string(), list.to_string()));
+                }
+            }
+            cfg.insert("ack".into(), Value::Object(ack));
+        }
+        _ => {}
+    }
+    Ok(((!cfg.is_empty()).then_some(Value::Object(cfg)), params))
+}
+
+/// Apply an `UpdateArgoCdConfig` delta onto a stored `argoCd` configuration.
+/// `UpdateArgoCdConfig` only carries `networkAccess` (which replaces the
+/// stored one) and `rbacRoleMappings` add/remove deltas; every other
+/// create-time member (`namespace`, `awsIdc`, `endpointPrefix`, which can't
+/// change after creation) is preserved.
+fn apply_argocd_update(existing: Option<&Value>, delta: &Value) -> Value {
     let mut argo = existing
-        .and_then(|e| e.get("argoCd"))
         .and_then(|a| a.as_object())
         .cloned()
         .unwrap_or_default();
@@ -1350,7 +1491,7 @@ pub(crate) fn apply_capability_configuration_update(
         }
         argo.insert("rbacRoleMappings".into(), Value::Array(mappings));
     }
-    Some(json!({ "argoCd": Value::Object(argo) }))
+    Value::Object(argo)
 }
 
 pub(crate) fn capability_json(c: &Capability) -> Value {

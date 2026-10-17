@@ -3807,3 +3807,241 @@ async fn addon_errors_match_a_live_eks_cluster() {
     assert_eq!(err.code(), "ResourceNotFoundException");
     assert_eq!(err.message(), "The requested resource does not exist.");
 }
+
+async fn create_capability_with(svc: &EksService, body: Value) -> Result<Value, AwsServiceError> {
+    let resp = svc
+        .handle(make_request(
+            Method::POST,
+            "/clusters/c1/capabilities",
+            &body.to_string(),
+        ))
+        .await?;
+    Ok(serde_json::from_slice(resp.body.expect_bytes()).unwrap())
+}
+
+async fn update_capability_with(
+    svc: &EksService,
+    name: &str,
+    body: Value,
+) -> Result<Value, AwsServiceError> {
+    let resp = svc
+        .handle(make_request(
+            Method::POST,
+            &format!("/clusters/c1/capabilities/{name}"),
+            &body.to_string(),
+        ))
+        .await?;
+    Ok(serde_json::from_slice(resp.body.expect_bytes()).unwrap())
+}
+
+async fn describe_capability_config(svc: &EksService, name: &str) -> Value {
+    let resp = svc
+        .handle(make_request(
+            Method::GET,
+            &format!("/clusters/c1/capabilities/{name}"),
+            "",
+        ))
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    v["capability"]["configuration"].clone()
+}
+
+#[tokio::test]
+async fn ack_configuration_round_trips_and_merges_on_update() {
+    let svc = EksService::new(make_state());
+    create_cluster(&svc, "c1").await;
+    let v = create_capability_with(
+        &svc,
+        json!({
+            "capabilityName": "ack",
+            "type": "ACK",
+            "roleArn": "arn:aws:iam::111122223333:role/eks-capability",
+            "configuration": {"ack": {
+                "enableCrossNamespace": true,
+                "disabledServices": ["s3", "ec2"]
+            }}
+        }),
+    )
+    .await
+    .unwrap();
+    let expected =
+        json!({"ack": {"enableCrossNamespace": true, "disabledServices": ["s3", "ec2"]}});
+    assert_eq!(v["capability"]["configuration"], expected);
+    assert_eq!(describe_capability_config(&svc, "ack").await, expected);
+
+    // Only disabledServices: replaces the list, flag unchanged, one param.
+    let v = update_capability_with(
+        &svc,
+        "ack",
+        json!({"configuration": {"ack": {"disabledServices": ["iam"]}}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["update"]["type"], "CapabilityUpdate");
+    assert_eq!(
+        v["update"]["params"],
+        json!([{"type": "DisabledServices", "value": "[\"iam\"]"}])
+    );
+    assert_eq!(
+        describe_capability_config(&svc, "ack").await,
+        json!({"ack": {"enableCrossNamespace": true, "disabledServices": ["iam"]}})
+    );
+
+    // Only enableCrossNamespace: list unchanged.
+    let v = update_capability_with(
+        &svc,
+        "ack",
+        json!({"configuration": {"ack": {"enableCrossNamespace": false}}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["update"]["params"],
+        json!([{"type": "EnableCrossNamespace", "value": "false"}])
+    );
+    assert_eq!(
+        describe_capability_config(&svc, "ack").await,
+        json!({"ack": {"enableCrossNamespace": false, "disabledServices": ["iam"]}})
+    );
+
+    // Empty list turns every service back on; both params reported.
+    let v = update_capability_with(
+        &svc,
+        "ack",
+        json!({"configuration": {"ack": {"enableCrossNamespace": true, "disabledServices": []}}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["update"]["params"],
+        json!([
+            {"type": "EnableCrossNamespace", "value": "true"},
+            {"type": "DisabledServices", "value": "[]"}
+        ])
+    );
+    assert_eq!(
+        describe_capability_config(&svc, "ack").await,
+        json!({"ack": {"enableCrossNamespace": true, "disabledServices": []}})
+    );
+}
+
+#[tokio::test]
+async fn ack_capability_defaults_when_ack_config_omitted() {
+    let svc = EksService::new(make_state());
+    create_cluster(&svc, "c1").await;
+    let v = create_capability_with(
+        &svc,
+        json!({
+            "capabilityName": "ack",
+            "type": "ACK",
+            "roleArn": "arn:aws:iam::111122223333:role/eks-capability"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["capability"]["configuration"],
+        json!({"ack": {"enableCrossNamespace": false, "disabledServices": []}})
+    );
+}
+
+#[tokio::test]
+async fn ack_configuration_ignored_for_other_capability_types() {
+    let svc = EksService::new(make_state());
+    create_cluster(&svc, "c1").await;
+    let v = create_capability_with(
+        &svc,
+        json!({
+            "capabilityName": "kro",
+            "type": "KRO",
+            "roleArn": "arn:aws:iam::111122223333:role/eks-capability",
+            "configuration": {"ack": {"enableCrossNamespace": true}}
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(v["capability"].get("configuration").is_none());
+    let v = update_capability_with(
+        &svc,
+        "kro",
+        json!({"configuration": {"ack": {"disabledServices": ["s3"]}}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["update"]["params"], json!([]));
+    assert!(describe_capability_config(&svc, "kro").await.is_null());
+}
+
+#[tokio::test]
+async fn ack_configuration_rejects_invalid_service_names() {
+    let svc = EksService::new(make_state());
+    create_cluster(&svc, "c1").await;
+    let base = |ack: Value| {
+        json!({
+            "capabilityName": "ack",
+            "type": "ACK",
+            "roleArn": "arn:aws:iam::111122223333:role/eks-capability",
+            "configuration": {"ack": ack}
+        })
+    };
+    let too_long = "a".repeat(64);
+    let too_many: Vec<String> = (0..201).map(|i| format!("svc{i}")).collect();
+    for bad in [
+        json!({"disabledServices": ["S3"]}),
+        json!({"disabledServices": ["1ec2"]}),
+        json!({"disabledServices": ["ec-2"]}),
+        json!({"disabledServices": [""]}),
+        json!({"disabledServices": [too_long]}),
+        json!({"disabledServices": too_many}),
+        json!({"enableCrossNamespace": "yes"}),
+    ] {
+        let err = create_capability_with(&svc, base(bad.clone()))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("expected rejection for {bad}"));
+        assert_eq!(err.code(), "InvalidParameterException", "{bad}");
+    }
+    // The 63-char maximum and 200-entry maximum are accepted.
+    let max_ok: Vec<String> = (0..200).map(|i| format!("svc{i}")).collect();
+    create_capability_with(
+        &svc,
+        base(json!({"disabledServices": max_ok, "enableCrossNamespace": true})),
+    )
+    .await
+    .unwrap();
+
+    // A rejected update leaves the capability (incl. roleArn) untouched.
+    let err = update_capability_with(
+        &svc,
+        "ack",
+        json!({
+            "roleArn": "arn:aws:iam::111122223333:role/other",
+            "configuration": {"ack": {"disabledServices": ["Bad"]}}
+        }),
+    )
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(err.code(), "InvalidParameterException");
+    let resp = svc
+        .handle(make_request(
+            Method::GET,
+            "/clusters/c1/capabilities/ack",
+            "",
+        ))
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(
+        v["capability"]["roleArn"],
+        "arn:aws:iam::111122223333:role/eks-capability"
+    );
+    assert_eq!(
+        v["capability"]["configuration"]["ack"]["disabledServices"]
+            .as_array()
+            .unwrap()
+            .len(),
+        200
+    );
+}
