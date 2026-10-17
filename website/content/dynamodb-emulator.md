@@ -1,6 +1,6 @@
 +++
 title = "DynamoDB emulator for tests"
-description = "Run DynamoDB locally for integration tests with fakecloud. 57 operations, transactions, PartiQL, streams, global tables. Any language, no Docker required, free."
+description = "Run DynamoDB locally for integration tests with fakecloud. 58 operations, transactions, PartiQL, streams, global tables. Any language, no Docker required, free."
 template = "page.html"
 +++
 

@@ -559,22 +559,25 @@ if [ "${#PS_FILES[@]}" -gt 0 ]; then
                 fail=1
             fi
         done < <(
-            {
-                grep -oHE "(\*\*)?${svc_re}(\*\*)?[: ]\(?[ ]*[0-9]+ (operations?|ops|actions)\b" "${PS_FILES[@]}" 2>/dev/null || true
-                # "### DynamoDB (58 actions)" / "**Bedrock** (103 ops)"
-                grep -oHE "(\*\*|### )${svc_re}(\*\*)? \([0-9]+ (operations?|ops|actions)\)" "${PS_FILES[@]}" 2>/dev/null || true
-                # "| ACM (Certificate Manager) |  40 |" aggregate table rows
-                grep -oHE "^\| *${svc_re} *\| *[0-9]+ (operations?|ops)?" "${PS_FILES[@]}" 2>/dev/null || true
-                # "<td>Cognito User Pools</td><td class=\"check\">132 operations"
-                grep -oHE "<td>${svc_re}</td><td[^>]*>[0-9]+ (operations?|ops)" "${PS_FILES[@]}" 2>/dev/null || true
-                # Number first: "**53 KMS operations** at 100% conformance". Every
-                # SEO landing page (kms-emulator, local-rds, local-s3-for-tests,
-                # dynamodb-emulator, ses-emulator, cognito-emulator) phrases it
-                # this way and none of the patterns above read it (2026-10-17).
-                # The name is cut out so last_num never reads the 3 in "S3".
-                { grep -oHE "(^|[^0-9,.])[0-9]+ (\*\*)?${svc_re}(\*\*)? operations?\b" "${PS_FILES[@]}" 2>/dev/null || true; } \
-                    | sed -E "s/ (\*\*)?${svc_re}(\*\*)? operations?\$/ operations/"
-            } | sort -u
+            # One grep per service (see PERF above), one -e per phrasing:
+            #   "**S3**: 107 operations" / "Lambda (82 operations)"
+            #   "### DynamoDB (58 actions)" / "**Bedrock** (103 ops)"
+            #   "| ACM (Certificate Manager) |  40 |" aggregate table rows
+            #   "<td>Cognito User Pools</td><td class=\"check\">132 operations"
+            #   "**53 KMS operations**" / "**53** KMS operations": number first,
+            #     how every SEO landing page phrases it; none of the patterns
+            #     above read it (KMS, RDS, DynamoDB, S3, SES and Cognito landing
+            #     pages were stale on 2026-10-17). sed cuts the name out of that
+            #     shape so last_num never reads the 3 in "S3".
+            { grep -oHE \
+                -e "(\*\*)?${svc_re}(\*\*)?[: ]\(?[ ]*[0-9]+ (operations?|ops|actions)\b" \
+                -e "(\*\*|### )${svc_re}(\*\*)? \([0-9]+ (operations?|ops|actions)\)" \
+                -e "^\| *${svc_re} *\| *[0-9]+ (operations?|ops)?" \
+                -e "<td>${svc_re}</td><td[^>]*>[0-9]+ (operations?|ops)" \
+                -e "(^|[^0-9,.])[0-9]+(\*\*)? (\*\*)?${svc_re}(\*\*)? operations?\b" \
+                "${PS_FILES[@]}" 2>/dev/null || true; } \
+                | sed -E "s/^([^:]*:[^0-9]*[0-9]+)(\*\*)? (\*\*)?${svc_re}(\*\*)? operations?\$/\1 operations/" \
+                | sort -u
         )
     done <<< "$service_ops_map"
 fi
@@ -742,10 +745,10 @@ while IFS= read -r svc_doc; do
     while IFS= read -r claim; do
         [ -z "$claim" ] && continue
         lineno=${claim%%:*}
-        # "N of M" is a headline only when N == M ("57 of 57"); "1 of 3 shards"
-        # is prose.
-        if [[ "${claim#*:}" =~ ^([0-9]+)\ of\ ([0-9]+)$ ]] && [ "${BASH_REMATCH[1]}" != "${BASH_REMATCH[2]}" ]; then
-            continue
+        # "N of M" is a count claim when M is one of the page's counts
+        # ("57 of 58" is as stale as "57 of 57"); "1 of 3 shards" is prose.
+        if [[ "${claim#*:}" =~ ^([0-9]+)\ of\ ([0-9]+)$ ]]; then
+            case "$allowed" in *" ${BASH_REMATCH[2]} "*) ;; *) continue ;; esac
         fi
         for n in $(printf '%s' "${claim#*:}" | grep -oE '[0-9]+' || true); do
             case "$allowed" in
@@ -760,6 +763,77 @@ while IFS= read -r svc_doc; do
         done
     done < <(grep -noE '\b[0-9]+ of [0-9]+\b|\*\*[0-9]+ operations\*\*|\b[Aa]ll [0-9]+ operations\b|\b[0-9]+-operation\b|\b[Cc]omplete [0-9]+-op\b|control plane: [0-9]+ operations|(^|\. )[0-9]+ operations\.' "$svc_doc" || true)
 done < <(find website/content/docs/services -maxdepth 1 -name '*.md' -type f | sort)
+
+# --- "(all N ops)" trailers in aggregate table rows -------------------------
+# "| AWS Backup | 115 | ... No real backup engine (all 109 ops) |": the count
+# cell is gated above, the prose trailer in the same row was not, and on
+# 2026-10-17 five rows of docs/services/_index.md (Backup, EKS, OpenSearch,
+# Account Management, Identity Store) contradicted themselves. A row's trailer
+# must equal its own count cell.
+while IFS= read -r bad; do
+    [ -z "$bad" ] && continue
+    problems+=("$bad")
+    fail=1
+done < <(awk -F'|' '/^\| / && $3 ~ /^ *[0-9]+ *$/ {
+        line = $0; n = $3; gsub(/ /, "", n)
+        while (match(line, /\(all [0-9]+ (ops|operations)\)/)) {
+            m = substr(line, RSTART + 5); sub(/ .*/, "", m)
+            if (m != n) print FILENAME ":" FNR ": row says " n " but its trailer says (all " m " ...)"
+            line = substr(line, RSTART + RLENGTH)
+        }
+    }' "${FILES[@]}" /dev/null)
+
+# --- Single-service landing pages ---------------------------------------------
+# "dynamodb-emulator.md" says "57 operations" in its front-matter description,
+# with no service name next to the number, so no per-service pattern can read
+# it. On a page about one service every "N operations" is that service's count.
+# Format: "<page>=<parity.md link text>" (or "=bedrock-family").
+LANDING_PAGES=(
+    "website/content/bedrock-emulator.md=bedrock-family"
+    "website/content/fake-bedrock.md=bedrock-family"
+    "website/content/test-bedrock-locally.md=bedrock-family"
+    "website/content/cognito-emulator.md=Cognito User Pools"
+    "website/content/dynamodb-emulator.md=DynamoDB"
+    "website/content/kms-emulator.md=KMS"
+    "website/content/local-ecr.md=ECR"
+    "website/content/local-ecs.md=ECS"
+    "website/content/local-elasticache.md=ElastiCache"
+    "website/content/local-elb.md=ELBv2"
+    "website/content/local-rds.md=RDS"
+    "website/content/local-s3-for-tests.md=S3"
+    "website/content/ses-emulator.md=SES"
+    "website/content/sns-emulator.md=SNS"
+    "website/content/sqs-emulator.md=SQS"
+    "website/content/test-lambda-locally.md=Lambda"
+)
+for _lp in "${LANDING_PAGES[@]}"; do
+    _page=${_lp%%=*}
+    _svc=${_lp#*=}
+    if [ ! -f "$_page" ]; then
+        problems+=("$0: LANDING_PAGES names $_page, which does not exist")
+        fail=1
+        continue
+    fi
+    if [ "$_svc" = "bedrock-family" ]; then
+        _want="$bedrock_family"
+    else
+        _want=$(printf '%s\n' "$service_ops_map" | awk -F'\t' -v s="$_svc" '$1 == s { print $2; exit }')
+        if [ -z "$_want" ]; then
+            problems+=("$0: LANDING_PAGES maps $_page to '$_svc', which is not a parity.md row")
+            fail=1
+            continue
+        fi
+    fi
+    while IFS= read -r _hit; do
+        [ -z "$_hit" ] && continue
+        _n=$(first_num "${_hit#*:}")
+        if [ "$_n" != "$_want" ] && ! is_exception "$_page" landing "$_n"; then
+            problems+=("$_page:${_hit%%:*}: claims '${_hit#*:}', expected $_want")
+            fail=1
+        fi
+    done < <(grep -noE '(^|[^0-9,.])[0-9]+(\*\*)? (\*\*)?([A-Z][A-Za-z0-9 ]+ )?(operations|ops)\b' "$_page" \
+        | sed -E 's/^([0-9]+):[^0-9]*/\1:/' || true)
+done
 
 # --- Subset-count claims -------------------------------------------------------
 # conformance.md states "N services today: a, b, c" once per suite. Check N
