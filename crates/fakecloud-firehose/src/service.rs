@@ -1188,11 +1188,16 @@ impl FirehoseService {
                     "This operation is not permitted on KinesisStreamAsSource delivery stream type.",
                 ));
             }
+            crate::admission::validate_stream_destination(stream)?;
             (stream.destination.clone(), stream.version_id.clone())
         };
         let Some(dest) = dest else {
             return Ok(());
         };
+        // Capability errors are admission errors even with no backend, an
+        // unavailable bucket, or an empty/all-invalid batch. Configuration
+        // acceptance remains governed solely by the AWS control-plane model.
+        crate::admission::validate_s3_delivery(&dest, &["UNCOMPRESSED", "GZIP"])?;
         let Some(s3) = &self.s3 else {
             return Ok(());
         };
@@ -1214,7 +1219,8 @@ impl FirehoseService {
             file_extension: dest.file_extension.as_deref(),
             compression: match dest.compression_format.as_deref() {
                 Some("GZIP") => Compression::Gzip,
-                _ => Compression::Uncompressed,
+                None | Some("UNCOMPRESSED") => Compression::Uncompressed,
+                _ => unreachable!("unsupported compression rejected before admission"),
             },
             append_delimiter: append_delimiter_enabled(dest.processing_configuration.as_ref()),
         };
@@ -1225,13 +1231,10 @@ impl FirehoseService {
         if !delimited && datas.iter().all(Vec::is_empty) {
             return Ok(());
         }
-        let bytes = match encode_records(&datas, &output) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                tracing::error!(stream = %stream_name, %err, "failed to encode firehose S3 delivery; records not delivered");
-                return Ok(());
-            }
-        };
+        let bytes = encode_records(&datas, &output).map_err(|err| {
+            tracing::error!(stream = %stream_name, %err, "failed to encode firehose S3 delivery; record admission failed");
+            AwsServiceError::aws_error(StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailableException", "Failed to encode Firehose S3 delivery")
+        })?;
         let now = Utc::now();
         let key = object_key(stream_name, &version_id, &output, now, now, Uuid::new_v4());
         // Snapshot the durable store handle before taking the S3 state lock so we
@@ -1281,6 +1284,201 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use http::{HeaderMap, Method};
+
+    #[test]
+    fn unsupported_s3_admission_rejects_before_backend_or_empty_payload() {
+        for setting in [
+            json!({"CompressionFormat": "ZIP"}),
+            json!({"CompressionFormat": "HADOOP_SNAPPY"}),
+            json!({"CompressionFormat": "Snappy"}),
+            json!({"Prefix": "!{timestamp:yyyy}/"}),
+            json!({"CustomTimeZone": "America/New_York"}),
+            json!({"ProcessingConfiguration": {"Enabled": true}}),
+            json!({"ProcessingConfiguration": {"Enabled": true, "Processors": [{"Type": "Lambda"}, {"Type": "AppendDelimiterToRecord"}]}}),
+            json!({"ProcessingConfiguration": {"Enabled": true, "Processors": [{"Type": "Decompression"}]}}),
+            json!({"ProcessingConfiguration": {"Enabled": true, "Processors": [{"Type": "RecordDeAggregation"}]}}),
+            json!({"ProcessingConfiguration": {"Enabled": true, "Processors": [{"Type": "CloudWatchLogProcessing"}]}}),
+            json!({"ProcessingConfiguration": {"Enabled": true, "Processors": [{"Type": "MetadataExtraction"}]}}),
+            json!({"DataFormatConversionConfiguration": {"Enabled": true}}),
+            json!({"DataFormatConversionConfiguration": {"SchemaConfiguration": {}}}),
+            json!({"DynamicPartitioningConfiguration": {"Enabled": true}}),
+            json!({"S3BackupMode": "Enabled"}),
+            json!({"EncryptionConfiguration": {"KMSEncryptionConfig": {"AWSKMSKeyARN": "arn:aws:kms:us-east-1:123456789012:key/example"}}}),
+        ] {
+            for (backend, bucket_arn) in [
+                (false, "arn:aws:s3:::admission"),
+                (true, "arn:aws:s3:::admission"),
+                (true, "arn:aws:s3:::missing"),
+                (true, "malformed"),
+            ] {
+                let (mut svc, disk, _tmp) = firehose_with_disk_s3("admission");
+                if !backend {
+                    svc.s3 = None;
+                }
+                let mut dest = json!({"RoleARN": "role", "BucketARN": bucket_arn});
+                dest.as_object_mut()
+                    .unwrap()
+                    .extend(setting.as_object().unwrap().clone());
+                svc.create_delivery_stream(&request("CreateDeliveryStream", json!({
+                    "DeliveryStreamName": "unsupported", "ExtendedS3DestinationConfiguration": dest,
+                }))).unwrap();
+                let field = setting.as_object().unwrap().keys().next().unwrap();
+                // Settings survive the control plane, but never earn a record ID.
+                let description = describe(&svc, "unsupported");
+                assert_eq!(
+                    description["Destinations"][0]["ExtendedS3DestinationDescription"][field],
+                    setting[field]
+                );
+                svc.update_destination(&request(
+                    "UpdateDestination",
+                    json!({
+                        "DeliveryStreamName": "unsupported", "CurrentDeliveryStreamVersionId": "1",
+                        "DestinationId": description["Destinations"][0]["DestinationId"],
+                        "ExtendedS3DestinationUpdate": {"FileExtension": ".log"},
+                    }),
+                ))
+                .unwrap();
+                for body in [json!({"Data": "eA=="}), json!({"Data": ""})] {
+                    let error = svc
+                        .put_record(&request(
+                            "PutRecord",
+                            json!({"DeliveryStreamName": "unsupported", "Record": body}),
+                        ))
+                        .err()
+                        .expect("unsupported put must fail");
+                    assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+                    assert_eq!(error.code(), "InvalidArgumentException");
+                    assert!(error.message().contains(field), "{}", error.message());
+                }
+                for records in [
+                    json!([]),
+                    json!([{"Data": "%%%"}]),
+                    json!([{"Data": "eA=="}, {"Data": "%%%"}]),
+                ] {
+                    let error = svc
+                        .put_record_batch(&request(
+                            "PutRecordBatch",
+                            json!({"DeliveryStreamName": "unsupported", "Records": records}),
+                        ))
+                        .err()
+                        .expect("unsupported batch must fail");
+                    assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+                    assert_eq!(error.code(), "InvalidArgumentException");
+                    assert!(error.message().contains(field), "{}", error.message());
+                }
+                assert!(disk.load().unwrap().buckets["admission"].objects.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_non_s3_record_admission_names_destination() {
+        let svc = service();
+        svc.create_delivery_stream(&request(
+            "CreateDeliveryStream",
+            json!({
+                "DeliveryStreamName": "unsupported", "HttpEndpointDestinationConfiguration": {
+                    "RoleARN": "role", "EndpointConfiguration": {"Url": "https://example.invalid"},
+                },
+            }),
+        ))
+        .unwrap();
+        for (action, records) in [
+            ("PutRecord", json!({"Record": {"Data": "eA=="}})),
+            ("PutRecordBatch", json!({"Records": [{"Data": "eA=="}]})),
+        ] {
+            let mut body = records;
+            body["DeliveryStreamName"] = json!("unsupported");
+            let error = if action == "PutRecord" {
+                svc.put_record(&request(action, body))
+            } else {
+                svc.put_record_batch(&request(action, body))
+            }
+            .err()
+            .expect("non-S3 delivery is not implemented");
+            assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(error.code(), "InvalidArgumentException");
+            assert!(error
+                .message()
+                .contains("HttpEndpointDestinationConfiguration"));
+        }
+    }
+
+    #[test]
+    fn disabled_delivery_features_keep_verbatim_supported_output() {
+        let (svc, disk, _tmp) = firehose_with_disk_s3("admission");
+        svc.create_delivery_stream(&request("CreateDeliveryStream", json!({
+            "DeliveryStreamName": "supported", "ExtendedS3DestinationConfiguration": {
+                "RoleARN": "role", "BucketARN": "arn:aws:s3:::admission",
+                "CompressionFormat": "UNCOMPRESSED", "CustomTimeZone": "UTC", "Prefix": "static/",
+                "ProcessingConfiguration": {"Enabled": false, "Processors": [{"Type": "Lambda"}]},
+                "DataFormatConversionConfiguration": {"Enabled": false},
+                "DynamicPartitioningConfiguration": {"Enabled": false},
+                "EncryptionConfiguration": {"NoEncryptionConfig": "NoEncryption"},
+                "S3BackupMode": "Disabled",
+            },
+        }))).unwrap();
+        svc.deliver_records(
+            S3_ACCOUNT,
+            "us-east-1",
+            "supported",
+            vec![b"abc".to_vec(), b"def".to_vec()],
+        )
+        .unwrap();
+        assert_eq!(
+            delivered_bodies(&svc, &disk, "admission"),
+            vec![b"abcdef".to_vec()]
+        );
+    }
+
+    #[test]
+    fn mixed_destination_configuration_does_not_bypass_admission() {
+        for add_s3_on_update in [false, true] {
+            let (svc, disk, _tmp) = firehose_with_disk_s3("admission");
+            let s3 = json!({"RoleARN": "role", "BucketARN": "arn:aws:s3:::admission"});
+            let mut body = json!({
+                "DeliveryStreamName": "mixed", "HttpEndpointDestinationConfiguration": {
+                    "RoleARN": "role", "EndpointConfiguration": {"Url": "https://example.invalid"},
+                },
+            });
+            if !add_s3_on_update {
+                body["ExtendedS3DestinationConfiguration"] = s3.clone();
+            }
+            svc.create_delivery_stream(&request("CreateDeliveryStream", body))
+                .unwrap();
+            if add_s3_on_update {
+                let description = describe(&svc, "mixed");
+                svc.update_destination(&request(
+                    "UpdateDestination",
+                    json!({
+                        "DeliveryStreamName": "mixed", "CurrentDeliveryStreamVersionId": "1",
+                        "DestinationId": description["Destinations"][0]["DestinationId"], "ExtendedS3DestinationUpdate": s3,
+                    }),
+                ))
+                .unwrap();
+            }
+            for result in [
+                svc.put_record(&request(
+                    "PutRecord",
+                    json!({"DeliveryStreamName": "mixed", "Record": {"Data": "eA=="}}),
+                )),
+                svc.put_record_batch(&request(
+                    "PutRecordBatch",
+                    json!({"DeliveryStreamName": "mixed", "Records": [{"Data": "eA=="}]}),
+                )),
+            ] {
+                let error = result
+                    .err()
+                    .expect("unsupported mixed destination must fail admission");
+                assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(error.code(), "InvalidArgumentException");
+                assert!(error
+                    .message()
+                    .contains("HttpEndpointDestinationConfiguration"));
+            }
+            assert!(disk.load().unwrap().buckets["admission"].objects.is_empty());
+        }
+    }
 
     fn request(action: &str, body: Value) -> AwsRequest {
         AwsRequest {
@@ -3061,7 +3259,6 @@ mod tests {
             "delim",
             "fh-delim",
             json!({"Enabled": true, "Processors": [
-                {"Type": "Lambda", "Parameters": [{"ParameterName": "LambdaArn", "ParameterValue": "arn:aws:lambda:us-east-1:123456789012:function:f"}]},
                 {"Type": "AppendDelimiterToRecord", "Parameters": [{"ParameterName": "Delimiter", "ParameterValue": "\\n"}]}
             ]}),
         );
@@ -3098,8 +3295,7 @@ mod tests {
             Value::Null,
             json!({"Enabled": false, "Processors": [{"Type": "AppendDelimiterToRecord"}]}),
             json!({"Processors": [{"Type": "AppendDelimiterToRecord"}]}),
-            json!({"Enabled": true, "Processors": [{"Type": "Lambda"}]}),
-            json!({"Enabled": true}),
+            json!({"Enabled": false, "Processors": [{"Type": "Lambda"}]}),
         ] {
             let (svc, disk, _tmp) = firehose_with_disk_s3("fh-raw");
             create_stream_with_processing(&svc, "raw", "fh-raw", processing.clone());

@@ -285,6 +285,161 @@ mod tests {
         assert_eq!(stored(&prov)["Enabled"], json!(false));
     }
 
+    #[test]
+    fn firehose_cfn_modeled_settings_survive_create_and_update() {
+        for base in [
+            "S3DestinationConfiguration",
+            "ExtendedS3DestinationConfiguration",
+        ] {
+            let prov = make_provisioner();
+            let mut existing = None;
+            for (enabled, normalized, zone, backup_mode, prefix) in [
+                ("TrUe", true, "America/New_York", "Enabled", "before/"),
+                ("FaLsE", false, "UTC", "Disabled", "after/"),
+            ] {
+                let mut resource = firehose_resource(base);
+                resource.properties[base] = json!({
+                    "RoleARN": "arn:aws:iam::123456789012:role/fh",
+                    "BucketARN": "arn:aws:s3:::bucket",
+                    "Prefix": prefix,
+                    "CompressionFormat": "GZIP",
+                    "ProcessingConfiguration": {
+                        "Enabled": enabled,
+                        "Processors": [{"Type": "AppendDelimiterToRecord"}]
+                    },
+                    "DataFormatConversionConfiguration": {
+                        "Enabled": enabled,
+                        "OutputFormatConfiguration": {"Serializer": {"ParquetSerDe": {}}}
+                    },
+                    "DynamicPartitioningConfiguration": {
+                        "Enabled": enabled, "RetryOptions": {"DurationInSeconds": 60}
+                    },
+                    "CloudWatchLoggingOptions": {
+                        "Enabled": enabled, "LogGroupName": "delivery", "LogStreamName": prefix
+                    },
+                    "CustomTimeZone": zone,
+                    "S3BackupMode": backup_mode,
+                    "EncryptionConfiguration": {"KMSEncryptionConfig": {"AWSKMSKeyARN": "arn:aws:kms:us-east-1:123456789012:key/test"}},
+                    "S3BackupConfiguration": {
+                        "RoleARN": "arn:aws:iam::123456789012:role/backup",
+                        "BucketARN": "arn:aws:s3:::backup",
+                        "Prefix": prefix,
+                        "CompressionFormat": "UNCOMPRESSED",
+                        "BufferingHints": {"SizeInMBs": 5, "IntervalInSeconds": 300},
+                        "CloudWatchLoggingOptions": {"Enabled": false}
+                    }
+                });
+                if let Some(existing) = &existing {
+                    prov.update_resource(existing, &resource)
+                        .unwrap()
+                        .expect("in-place update");
+                } else {
+                    existing = Some(prov.create_resource(&resource).unwrap());
+                }
+                let state = prov.firehose_state.read();
+                let stream = &state
+                    .get("123456789012")
+                    .unwrap()
+                    .streams("us-east-1")
+                    .unwrap()["cfn-compression"];
+                let dest = stream.destination.as_ref().unwrap();
+                assert_eq!(
+                    dest.data_format_conversion_configuration,
+                    Some(json!({
+                        "Enabled": normalized,
+                        "OutputFormatConfiguration": {"Serializer": {"ParquetSerDe": {}}}
+                    }))
+                );
+                assert_eq!(
+                    dest.processing_configuration,
+                    Some(json!({
+                        "Enabled": normalized,
+                        "Processors": [{"Type": "AppendDelimiterToRecord"}]
+                    }))
+                );
+                assert_eq!(
+                    dest.dynamic_partitioning_configuration,
+                    Some(json!({
+                        "Enabled": normalized, "RetryOptions": {"DurationInSeconds": 60}
+                    }))
+                );
+                assert_eq!(
+                    dest.cloudwatch_logging_options,
+                    Some(json!({
+                        "Enabled": normalized, "LogGroupName": "delivery", "LogStreamName": prefix
+                    }))
+                );
+                assert_eq!(dest.custom_time_zone.as_deref(), Some(zone));
+                assert_eq!(dest.s3_backup_mode.as_deref(), Some(backup_mode));
+                assert_eq!(
+                    dest.encryption_configuration,
+                    Some(json!({
+                        "KMSEncryptionConfig": {"AWSKMSKeyARN": "arn:aws:kms:us-east-1:123456789012:key/test"}
+                    }))
+                );
+                assert_eq!(
+                    dest.s3_backup_description,
+                    Some(json!({
+                        "RoleARN": "arn:aws:iam::123456789012:role/backup",
+                        "BucketARN": "arn:aws:s3:::backup",
+                        "Prefix": prefix,
+                        "CompressionFormat": "UNCOMPRESSED",
+                        "BufferingHints": {"SizeInMBs": 5, "IntervalInSeconds": 300},
+                        "CloudWatchLoggingOptions": {"Enabled": false}
+                    }))
+                );
+                assert_eq!(dest.prefix.as_deref(), Some(prefix));
+                assert_eq!(dest.compression_format.as_deref(), Some("GZIP"));
+                assert_eq!(stream.version_id, if normalized { "1" } else { "2" });
+            }
+        }
+    }
+
+    #[test]
+    fn firehose_cfn_modeled_settings_defaults_and_disabled_blocks() {
+        let base = destination(json!(".json"));
+        let dest = parse_firehose_s3_destination(&base).unwrap();
+        assert!(dest.processing_configuration.is_none());
+        assert!(dest.data_format_conversion_configuration.is_none());
+        assert!(dest.dynamic_partitioning_configuration.is_none());
+        assert!(dest.cloudwatch_logging_options.is_none());
+        assert!(dest.custom_time_zone.is_none());
+        assert!(dest.s3_backup_mode.is_none());
+        assert!(dest.encryption_configuration.is_none());
+        assert!(dest.s3_backup_description.is_none());
+
+        for enabled in [None, Some(json!(false)), Some(json!("false"))] {
+            let mut config = base.clone();
+            for field in [
+                "ProcessingConfiguration",
+                "DataFormatConversionConfiguration",
+                "DynamicPartitioningConfiguration",
+                "CloudWatchLoggingOptions",
+            ] {
+                config[field] = match &enabled {
+                    Some(enabled) => json!({"Enabled": enabled}),
+                    None => json!({}),
+                };
+            }
+            let dest = parse_firehose_s3_destination(&config).unwrap();
+            let expected = if enabled.is_some() {
+                json!({"Enabled": false})
+            } else {
+                json!({})
+            };
+            assert_eq!(dest.processing_configuration, Some(expected.clone()));
+            assert_eq!(
+                dest.data_format_conversion_configuration,
+                Some(expected.clone())
+            );
+            assert_eq!(
+                dest.dynamic_partitioning_configuration,
+                Some(expected.clone())
+            );
+            assert_eq!(dest.cloudwatch_logging_options, Some(expected));
+        }
+    }
+
     fn firehose_resource(base: &str) -> ResourceDefinition {
         let mut props = json!({
             "DeliveryStreamName": "cfn-compression",

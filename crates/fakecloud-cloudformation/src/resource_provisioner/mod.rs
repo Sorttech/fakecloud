@@ -4248,19 +4248,21 @@ fn parse_firehose_s3_destination(value: &serde_json::Value) -> Result<S3Destinat
         .get("FileExtension")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    // CloudFormation uses the API's ProcessingConfiguration shape; template
-    // values may arrive as strings, so normalize `Enabled` to a boolean.
-    let processing_configuration = value
-        .get("ProcessingConfiguration")
-        .filter(|v| v.is_object())
-        .cloned()
-        .map(|mut processing| {
-            if let Some(enabled) = processing.get("Enabled").and_then(|v| v.as_str()) {
-                let enabled = enabled.eq_ignore_ascii_case("true");
-                processing["Enabled"] = serde_json::Value::Bool(enabled);
-            }
-            processing
-        });
+    // CloudFormation uses the API's configuration shapes; template values may
+    // arrive as strings, so normalize `Enabled` to a boolean.
+    let enabled_configuration = |field: &str| {
+        value
+            .get(field)
+            .filter(|v| v.is_object())
+            .cloned()
+            .map(|mut configuration| {
+                if let Some(enabled) = configuration.get("Enabled").and_then(|v| v.as_str()) {
+                    let enabled = enabled.eq_ignore_ascii_case("true");
+                    configuration["Enabled"] = serde_json::Value::Bool(enabled);
+                }
+                configuration
+            })
+    };
 
     Ok(S3Destination {
         destination_id: "destination-1".to_string(),
@@ -4271,15 +4273,33 @@ fn parse_firehose_s3_destination(value: &serde_json::Value) -> Result<S3Destinat
         buffering_size_mb,
         buffering_interval_seconds,
         compression_format,
-        processing_configuration,
-        data_format_conversion_configuration: None,
-        cloudwatch_logging_options: None,
-        custom_time_zone: None,
-        s3_backup_mode: None,
+        processing_configuration: enabled_configuration("ProcessingConfiguration"),
+        data_format_conversion_configuration: enabled_configuration(
+            "DataFormatConversionConfiguration",
+        ),
+        cloudwatch_logging_options: enabled_configuration("CloudWatchLoggingOptions"),
+        custom_time_zone: value
+            .get("CustomTimeZone")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        s3_backup_mode: value
+            .get("S3BackupMode")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
         file_extension,
-        dynamic_partitioning_configuration: None,
-        encryption_configuration: None,
-        s3_backup_description: None,
+        dynamic_partitioning_configuration: enabled_configuration(
+            "DynamicPartitioningConfiguration",
+        ),
+        encryption_configuration: value
+            .get("EncryptionConfiguration")
+            .filter(|v| v.is_object())
+            .cloned(),
+        // Match the service parser: retain the full create block and expose it
+        // as S3BackupDescription, rather than parsing it as an update shape.
+        s3_backup_description: value
+            .get("S3BackupConfiguration")
+            .filter(|v| v.is_object())
+            .cloned(),
     })
 }
 
