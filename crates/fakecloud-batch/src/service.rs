@@ -12,7 +12,7 @@ use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::{SnapshotHook, SnapshotStore};
 
-use crate::state::{BatchSnapshot, SharedBatchState, BATCH_SNAPSHOT_SCHEMA_VERSION};
+use crate::state::{BatchSnapshot, BatchState, SharedBatchState, BATCH_SNAPSHOT_SCHEMA_VERSION};
 
 const SUPPORTED_ACTIONS: &[&str] = &[
     "CancelJob",
@@ -312,8 +312,6 @@ impl BatchService {
             "DeleteSchedulingPolicy" => self.delete_scheduling_policy(req),
             "DescribeJobs" => self.describe_jobs(req),
             "ListJobs" => self.list_jobs(req),
-            "CancelJob" => self.cancel_job(req),
-            "TerminateJob" => self.terminate_job(req),
             "TagResource" => self.tag_resource(req),
             "UntagResource" => self.untag_resource(req),
             "ListTagsForResource" => self.list_tags_for_resource(req),
@@ -351,28 +349,60 @@ pub(crate) fn client_error(code: &str, msg: impl Into<String>) -> AwsServiceErro
     AwsServiceError::aws_error(StatusCode::BAD_REQUEST, code, msg.into())
 }
 
-/// The `{resourceArn}` label of the tag operations, which AWS rejects unless it
-/// is a Batch ARN (`arn:<partition>:batch:<region>:<account>:<resource>`).
-fn tag_resource_arn(arn: &str) -> Result<String, AwsServiceError> {
-    if arn.is_empty() {
-        return Err(client_error("ClientException", "resourceArn is required"));
-    }
-    let parts: Vec<&str> = arn.splitn(6, ':').collect();
-    let valid = parts.len() == 6
-        && parts[0] == "arn"
-        && !parts[1].is_empty()
-        && parts[2] == "batch"
-        && !parts[3].is_empty()
-        && parts[4].len() == 12
-        && parts[4].bytes().all(|b| b.is_ascii_digit())
-        && !parts[5].is_empty();
-    if !valid {
+/// Every taggable Batch resource store, with the field holding its ARN.
+fn taggable_stores(st: &BatchState) -> [(&crate::state::JsonStore, &str); 9] {
+    [
+        (&st.compute_environments, "computeEnvironmentArn"),
+        (&st.job_queues, "jobQueueArn"),
+        (&st.job_definitions, "jobDefinitionArn"),
+        (&st.jobs, "jobArn"),
+        (&st.scheduling_policies, "arn"),
+        (&st.consumable_resources, "consumableResourceArn"),
+        (&st.service_environments, "serviceEnvironmentArn"),
+        (&st.quota_shares, "quotaShareArn"),
+        (&st.service_jobs, "jobArn"),
+    ]
+}
+
+/// Resolve the `{resourceArn}` label of the tag operations. AWS rejects one
+/// that is not a Batch ARN, or names no resource in the account, with
+/// `ClientException`, so tags never attach to a resource that does not exist.
+fn tagged_resource(
+    st: Option<&BatchState>,
+    label: Option<&String>,
+) -> Result<String, AwsServiceError> {
+    let arn = label.ok_or_else(|| client_error("ClientException", "resourceArn is required"))?;
+    if fakecloud_aws::arn::arn_resource(arn, "batch").is_none() {
         return Err(client_error(
             "ClientException",
             format!("Invalid resourceArn: {arn}"),
         ));
     }
-    Ok(arn.to_string())
+    let exists = st.is_some_and(|st| {
+        taggable_stores(st).iter().any(|(store, key)| {
+            store
+                .values()
+                .any(|r| r.get(*key).and_then(Value::as_str) == Some(arn.as_str()))
+        })
+    });
+    if !exists {
+        return Err(client_error(
+            "ClientException",
+            format!("Resource {arn} does not exist"),
+        ));
+    }
+    Ok(arn.clone())
+}
+
+/// `computeEnvironmentOrder` is required on JobQueueDetail; a queue fed by
+/// service environments carries it empty rather than absent or null.
+pub fn normalize_compute_environment_order(queue: &mut Map<String, Value>) {
+    let order = queue
+        .entry("computeEnvironmentOrder")
+        .or_insert_with(|| json!([]));
+    if order.is_null() {
+        *order = json!([]);
+    }
 }
 
 pub(crate) type TagStore =
@@ -555,6 +585,8 @@ impl BatchService {
         stored.insert("jobQueueArn".into(), json!(arn));
         stored.insert("status".into(), json!("VALID"));
         stored.insert("statusReason".into(), json!("JobQueue Healthy"));
+        // Required on JobQueueDetail: empty for a service-environment queue.
+        normalize_compute_environment_order(&mut stored);
         stored
             .entry("state".to_string())
             .or_insert_with(|| json!("ENABLED"));
@@ -604,15 +636,9 @@ impl BatchService {
                     .filter(|q| match_named(q, &wanted, "jobQueueName", "jobQueueArn"))
                     .map(|q| {
                         let mut q = merge_tag_overlay(q, "jobQueueArn", &st.tags);
-                        // `computeEnvironmentOrder` is required on JobQueueDetail: a
-                        // queue fed by service environments reports it empty.
+                        // Queues stored before creates normalized the field.
                         if let Some(o) = q.as_object_mut() {
-                            let order = o
-                                .entry("computeEnvironmentOrder")
-                                .or_insert_with(|| json!([]));
-                            if order.is_null() {
-                                *order = json!([]);
-                            }
+                            normalize_compute_environment_order(o);
                         }
                         q
                     })
@@ -642,17 +668,14 @@ impl BatchService {
             .and_then(Value::as_str)
             .ok_or_else(|| client_error("ClientException", "jobDefinitionName is required"))?
             .to_string();
-        match body.get("type").and_then(Value::as_str) {
-            Some("container" | "multinode") => {}
-            Some(other) => {
-                return Err(client_error(
-                    "ClientException",
-                    format!(
-                        "Invalid job definition type: {other}. Valid values: container, multinode"
-                    ),
-                ))
-            }
-            None => return Err(client_error("ClientException", "type is required")),
+        let job_type = crate::extended::required_str(&body, "type")?;
+        if !matches!(job_type, "container" | "multinode") {
+            return Err(client_error(
+                "ClientException",
+                format!(
+                    "Invalid job definition type: {job_type}. Valid values: container, multinode"
+                ),
+            ));
         }
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
@@ -865,6 +888,9 @@ impl BatchService {
             ],
             "jobQueueArn",
         );
+        if let Some(o) = q.as_object_mut() {
+            normalize_compute_environment_order(o);
+        }
         Ok(AwsResponse::ok_json(json!({
             "jobQueueName": name,
             "jobQueueArn": arn,
@@ -1394,48 +1420,61 @@ impl BatchService {
         Ok(AwsResponse::ok_json(Value::Object(resp)))
     }
 
-    fn cancel_job(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
-        self.stop_job(req, &["SUBMITTED", "PENDING", "RUNNABLE"], "CancelJob")
-    }
-
-    fn terminate_job(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
-        self.stop_job(
-            req,
-            &["SUBMITTED", "PENDING", "RUNNABLE", "STARTING", "RUNNING"],
-            "TerminateJob",
-        )
-    }
-
-    fn stop_job(
-        &self,
-        req: &AwsRequest,
-        cancelable: &[&str],
-        op: &str,
-    ) -> Result<AwsResponse, AwsServiceError> {
+    /// `CancelJob` stops jobs that have not started; `TerminateJob` also stops
+    /// `STARTING` / `RUNNING` ones. Either applies to an array job's children.
+    async fn stop_job(&self, req: &AwsRequest, op: &str) -> Result<AwsResponse, AwsServiceError> {
+        let stoppable: &[&str] = if op == "TerminateJob" {
+            &["SUBMITTED", "PENDING", "RUNNABLE", "STARTING", "RUNNING"]
+        } else {
+            &["SUBMITTED", "PENDING", "RUNNABLE"]
+        };
         let body = req.json_body();
-        let job_id = body
-            .get("jobId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| client_error("ClientException", "jobId is required"))?
-            .to_string();
-        let reason = body
-            .get("reason")
-            .and_then(Value::as_str)
-            .ok_or_else(|| client_error("ClientException", format!("reason is required for {op}")))?
-            .to_string();
-        let mut accounts = self.state.write();
-        if let Some(job) = accounts
-            .get_or_create(&req.account_id)
-            .jobs
-            .get_mut(&job_id)
+        let job_id = crate::extended::required_str(&body, "jobId")?.to_string();
+        let reason = crate::extended::required_str(&body, "reason")?.to_string();
+        let child_prefix = format!("{job_id}:");
+        // The real ECS tasks of the jobs being stopped: (cluster, task ARN).
+        let mut tasks = Vec::new();
         {
-            if let Some(o) = job.as_object_mut() {
+            let mut accounts = self.state.write();
+            let jobs = &mut accounts.get_or_create(&req.account_id).jobs;
+            for (id, job) in jobs.iter_mut() {
+                if *id != job_id && !id.starts_with(&child_prefix) {
+                    continue;
+                }
+                let Some(o) = job.as_object_mut() else {
+                    continue;
+                };
                 let cur = o.get("status").and_then(Value::as_str).unwrap_or("");
-                if cancelable.contains(&cur) {
-                    o.insert("status".into(), json!("FAILED"));
-                    o.insert("statusReason".into(), json!(reason));
+                if !stoppable.contains(&cur) {
+                    continue;
+                }
+                o.insert("status".into(), json!("FAILED"));
+                o.insert("statusReason".into(), json!(reason));
+                o.insert(
+                    "stoppedAt".into(),
+                    json!(chrono::Utc::now().timestamp_millis()),
+                );
+                if let (Some(cluster), Some(task)) = (
+                    o.get("ecsCluster").and_then(Value::as_str),
+                    o.get("ecsTaskArn").and_then(Value::as_str),
+                ) {
+                    tasks.push((cluster.to_string(), task.to_string()));
                 }
             }
+        }
+        // Stop the containers too, so a terminated job does not keep running.
+        // The status poller sees the job already terminal and leaves it FAILED.
+        if let (Some(ecs), false) = (self.ecs.as_ref(), tasks.is_empty()) {
+            for (cluster, task) in tasks {
+                let _ = ecs
+                    .handle(ecs_request(
+                        "StopTask",
+                        json!({ "cluster": cluster, "task": task, "reason": reason }),
+                        req,
+                    ))
+                    .await;
+            }
+            ecs.persist().await;
         }
         Ok(AwsResponse::ok_json(json!({})))
     }
@@ -1443,24 +1482,16 @@ impl BatchService {
     // ---- Tags ----
 
     fn tag_resource(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
-        let arn = req
-            .path_segments
-            .get(2)
-            .map(String::as_str)
-            .map(tag_resource_arn)
-            .unwrap_or_else(|| Err(client_error("ClientException", "resourceArn is required")))?;
         let body = req.json_body();
         let tags = body
             .get("tags")
             .and_then(Value::as_object)
             .cloned()
-            .unwrap_or_default();
+            .ok_or_else(|| client_error("ClientException", "tags is required"))?;
         let mut accounts = self.state.write();
-        let entry = accounts
-            .get_or_create(&req.account_id)
-            .tags
-            .entry(arn)
-            .or_default();
+        let st = accounts.get_or_create(&req.account_id);
+        let arn = tagged_resource(Some(st), req.path_segments.get(2))?;
+        let entry = st.tags.entry(arn).or_default();
         for (k, v) in tags {
             if let Some(s) = v.as_str() {
                 entry.insert(k, s.to_string());
@@ -1470,12 +1501,6 @@ impl BatchService {
     }
 
     fn untag_resource(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
-        let arn = req
-            .path_segments
-            .get(2)
-            .map(String::as_str)
-            .map(tag_resource_arn)
-            .unwrap_or_else(|| Err(client_error("ClientException", "resourceArn is required")))?;
         // `tagKeys` is an `@httpQuery` list sent as repeated `tagKeys=a&tagKeys=b`
         // pairs; `query_params` collapses repeats to the last value, so parse the
         // raw query string for every occurrence, percent-decoding each.
@@ -1486,7 +1511,9 @@ impl BatchService {
             .map(fakecloud_core::path::percent_decode_segment)
             .collect();
         let mut accounts = self.state.write();
-        if let Some(entry) = accounts.get_or_create(&req.account_id).tags.get_mut(&arn) {
+        let st = accounts.get_or_create(&req.account_id);
+        let arn = tagged_resource(Some(st), req.path_segments.get(2))?;
+        if let Some(entry) = st.tags.get_mut(&arn) {
             for k in keys {
                 entry.remove(&k);
             }
@@ -1495,15 +1522,10 @@ impl BatchService {
     }
 
     fn list_tags_for_resource(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
-        let arn = req
-            .path_segments
-            .get(2)
-            .map(String::as_str)
-            .map(tag_resource_arn)
-            .unwrap_or_else(|| Err(client_error("ClientException", "resourceArn is required")))?;
         let accounts = self.state.read();
-        let tags = accounts
-            .get(&req.account_id)
+        let st = accounts.get(&req.account_id);
+        let arn = tagged_resource(st, req.path_segments.get(2))?;
+        let tags = st
             .and_then(|st| st.tags.get(&arn))
             .map(|m| {
                 m.iter()
@@ -2021,6 +2043,9 @@ fn spawn_status_sync(
             let mut succeeded = false;
             for _ in 0..max_polls {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if job_is_terminal(&batch_state, &account_id, &job_id) {
+                    return;
+                }
                 let resp = match ecs
                     .handle(ecs_request(
                         "DescribeTasks",
@@ -2045,7 +2070,10 @@ fn spawn_status_sync(
                             .get_mut(&job_id)
                             .and_then(|j| j.as_object_mut())
                         {
-                            if j.get("status").and_then(Value::as_str) != Some("RUNNING") {
+                            if matches!(
+                                j.get("status").and_then(Value::as_str),
+                                Some("STARTING" | "RUNNABLE")
+                            ) {
                                 j.insert("status".into(), json!("RUNNING"));
                             }
                         }
@@ -2068,6 +2096,10 @@ fn spawn_status_sync(
                 }
             }
 
+            // Cancelled or terminated while this attempt ran: keep that outcome.
+            if job_is_terminal(&batch_state, &account_id, &job_id) {
+                return;
+            }
             if succeeded {
                 set_job_terminal(
                     &batch_state,
@@ -2109,7 +2141,9 @@ fn spawn_status_sync(
                 // released when the attempt failed, so it must be admitted
                 // again (atomically with the other waiters) before relaunch,
                 // and waits at RUNNABLE while capacity is held by others.
-                if !wait_for_retry_admission(&batch_state, &account_id, &job_id).await {
+                if !wait_for_retry_admission(&batch_state, &account_id, &job_id).await
+                    || job_is_terminal(&batch_state, &account_id, &job_id)
+                {
                     break;
                 }
                 let relaunched = launch_ecs_task(&ecs, &src, &job_id, &job_name, &container).await;
@@ -2160,6 +2194,18 @@ fn spawn_status_sync(
 }
 
 /// Write a job's terminal status + `container.exitCode`/reason + `stoppedAt`.
+/// True once the job reached `SUCCEEDED` / `FAILED`, including through
+/// `CancelJob` / `TerminateJob` while its task was still being polled.
+fn job_is_terminal(batch_state: &SharedBatchState, account_id: &str, job_id: &str) -> bool {
+    batch_state
+        .read()
+        .get(account_id)
+        .and_then(|st| st.jobs.get(job_id))
+        .and_then(|j| j.get("status"))
+        .and_then(Value::as_str)
+        .is_some_and(|s| matches!(s, "SUCCEEDED" | "FAILED"))
+}
+
 fn set_job_terminal(
     batch_state: &SharedBatchState,
     account_id: &str,
@@ -2411,12 +2457,12 @@ impl AwsService for BatchService {
                 format!("Unknown operation: {} {}", req.method, req.raw_path),
             ));
         };
-        // SubmitJob is async (it launches a real ECS task); everything else is
-        // a synchronous metadata op.
-        let result = if action == "SubmitJob" {
-            self.submit_job(&req).await
-        } else {
-            self.dispatch(action, &req)
+        // SubmitJob launches a real ECS task and Cancel/TerminateJob stop them,
+        // so they are async; everything else is a synchronous metadata op.
+        let result = match action {
+            "SubmitJob" => self.submit_job(&req).await,
+            "CancelJob" | "TerminateJob" => self.stop_job(&req, action).await,
+            _ => self.dispatch(action, &req),
         };
         if MUTATING_ACTIONS.contains(&action)
             && matches!(result.as_ref(), Ok(resp) if resp.status.is_success())
@@ -2636,6 +2682,84 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(d["jobDefinitions"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn tags_attach_only_to_existing_batch_resources() {
+        let s = svc();
+        let q = body_of(
+            s.handle(req(
+                "/v1/createjobqueue",
+                json!({"jobQueueName": "q", "priority": 1}),
+            ))
+            .await
+            .unwrap(),
+        );
+        let arn = q["jobQueueArn"].as_str().unwrap().to_string();
+        let path = format!("/v1/tags/{}", arn.replace('/', "%2F"));
+        let missing = "arn:aws:batch:us-east-1:123456789012:job-queue/nope";
+        let missing_path = format!("/v1/tags/{}", missing.replace('/', "%2F"));
+        let bad_partition = "/v1/tags/arn:bogus:batch:us-east-1:123456789012:job-queue%2Fq";
+
+        // `tags` is required; a well-formed ARN of nothing, or a non-Batch ARN,
+        // is rejected; nothing is recorded for any of them.
+        for (p, body) in [
+            (path.as_str(), json!({})),
+            (missing_path.as_str(), json!({"tags": {"k": "v"}})),
+            (bad_partition, json!({"tags": {"k": "v"}})),
+        ] {
+            match s.handle(req(p, body)).await {
+                Err(e) => assert!(format!("{e:?}").contains("ClientException"), "{p}"),
+                Ok(_) => panic!("TagResource {p} must be rejected"),
+            }
+        }
+        assert!(!s
+            .state
+            .read()
+            .get("123456789012")
+            .unwrap()
+            .tags
+            .contains_key(missing));
+
+        s.handle(req(&path, json!({"tags": {"k": "v"}})))
+            .await
+            .unwrap();
+        let mut lt = req(&path, json!({}));
+        lt.method = Method::GET;
+        assert_eq!(body_of(s.handle(lt).await.unwrap())["tags"]["k"], "v");
+    }
+
+    #[tokio::test]
+    async fn terminating_an_array_job_stops_every_child() {
+        let s = svc();
+        mk_queue(&s, "q").await;
+        let sub = body_of(
+            s.handle(req(
+                "/v1/submitjob",
+                json!({"jobName": "arr", "jobQueue": "q", "jobDefinition": "jd:1",
+                       "arrayProperties": {"size": 2}}),
+            ))
+            .await
+            .unwrap(),
+        );
+        let id = sub["jobId"].as_str().unwrap().to_string();
+        s.handle(req(
+            "/v1/terminatejob",
+            json!({"jobId": id, "reason": "user stop"}),
+        ))
+        .await
+        .unwrap();
+        let accounts = s.state.read();
+        let jobs = &accounts.get("123456789012").unwrap().jobs;
+        for job_id in [id.clone(), format!("{id}:0"), format!("{id}:1")] {
+            let j = &jobs[&job_id];
+            assert_eq!(j["status"], "FAILED", "{job_id}");
+            assert_eq!(j["statusReason"], "user stop", "{job_id}");
+            assert!(j["stoppedAt"].is_i64(), "{job_id}");
+        }
+        drop(accounts);
+        // The status poller treats the job as finished and never revives it.
+        assert!(job_is_terminal(&s.state, "123456789012", &id));
     }
 
     #[tokio::test]

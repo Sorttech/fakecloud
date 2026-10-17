@@ -405,3 +405,65 @@ async fn restart_fails_in_flight_job_instead_of_zombie() {
         Some("Job interrupted by a fakecloud restart")
     );
 }
+
+#[tokio::test]
+async fn terminate_job_stops_the_running_container() {
+    if !require_docker_or_skip("terminate_job_stops_the_running_container") {
+        return;
+    }
+    let s = TestServer::start().await;
+    let config = s.aws_config().await;
+    let batch = aws_sdk_batch::Client::new(&config);
+    let ecs = aws_sdk_ecs::Client::new(&config);
+    // Long enough to be terminated mid-run, short enough that a container left
+    // running would exit 0 (and flip the job to SUCCEEDED) within the test.
+    let job_id = run_job(&batch, "term", vec!["sh", "-c", "sleep 15"]).await;
+
+    let mut running = false;
+    for _ in 0..120 {
+        let d = batch.describe_jobs().jobs(&job_id).send().await.unwrap();
+        if d.jobs()[0].status().map(|s| s.as_str()) == Some("RUNNING") {
+            running = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(
+        running,
+        "job never reached RUNNING\n{}",
+        describe_for_diagnostics(&batch, &job_id).await
+    );
+
+    batch
+        .terminate_job()
+        .job_id(&job_id)
+        .reason("user stop")
+        .send()
+        .await
+        .expect("terminate job");
+
+    // The task is stopped, not left running behind a FAILED job.
+    let live = ecs
+        .list_tasks()
+        .cluster("fakecloud-batch")
+        .desired_status(aws_sdk_ecs::types::DesiredStatus::Running)
+        .send()
+        .await
+        .unwrap();
+    assert!(live.task_arns().is_empty(), "{:?}", live.task_arns());
+
+    // Past the point the container would have exited 0, the job is still the
+    // FAILED the user asked for: the status poller does not revive it.
+    for _ in 0..20 {
+        let d = batch.describe_jobs().jobs(&job_id).send().await.unwrap();
+        let job = &d.jobs()[0];
+        assert_eq!(
+            job.status().map(|s| s.as_str()),
+            Some("FAILED"),
+            "{}",
+            job_failure_detail(job)
+        );
+        assert_eq!(job.status_reason(), Some("user stop"));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}

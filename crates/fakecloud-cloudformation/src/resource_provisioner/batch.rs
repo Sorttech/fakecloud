@@ -132,6 +132,7 @@ impl ResourceProvisioner {
         ] {
             copy_prop(&mut stored, props, cfn, api);
         }
+        fakecloud_batch::normalize_compute_environment_order(&mut stored);
         self.batch_state
             .write()
             .get_or_create(&self.account_id)

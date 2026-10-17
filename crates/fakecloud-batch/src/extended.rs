@@ -38,7 +38,7 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-fn required_str<'a>(body: &'a Value, key: &str) -> Result<&'a str, AwsServiceError> {
+pub(crate) fn required_str<'a>(body: &'a Value, key: &str) -> Result<&'a str, AwsServiceError> {
     body.get(key)
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
@@ -2100,6 +2100,23 @@ mod tests {
         }
     }
 
+    /// A deleted resource's tags are purged, and listing them is a
+    /// ClientException since the resource no longer exists.
+    async fn assert_deleted_tags_gone(s: &BatchService, arn: &str) {
+        assert!(!s
+            .state
+            .read()
+            .get("123456789012")
+            .unwrap()
+            .tags
+            .contains_key(arn));
+        let path = format!("/v1/tags/{}", arn.replace('/', "%2F"));
+        match s.handle(req_with(Method::GET, &path, "", json!({}))).await {
+            Err(e) => assert_eq!(e.code(), "ClientException"),
+            Ok(_) => panic!("ListTagsForResource on deleted {arn} must be rejected"),
+        }
+    }
+
     async fn list_tags(s: &BatchService, arn: &str) -> Value {
         // The SDK percent-encodes the ARN label (its `/` becomes %2F).
         let path = format!("/v1/tags/{}", arn.replace('/', "%2F"));
@@ -2226,7 +2243,7 @@ mod tests {
             json!({"consumableResource": "licenses"}),
         )
         .await;
-        assert_eq!(list_tags(&s, &arn).await, json!({}));
+        assert_deleted_tags_gone(&s, &arn).await;
     }
 
     #[tokio::test]
@@ -2677,7 +2694,7 @@ mod tests {
         assert_eq!(d["capacityLimits"][0]["maxCapacity"], 8);
         ok(&s, "deletequotashare", json!({"quotaShareArn": arn})).await;
         client_err(&s, "describequotashare", json!({"quotaShareArn": arn})).await;
-        assert_eq!(list_tags(&s, &arn).await, json!({}));
+        assert_deleted_tags_gone(&s, &arn).await;
     }
 
     const PAYLOAD: &str = r#"{"TrainingJobName":"t","ResourceConfig":{"InstanceType":"ml.m5.large","InstanceCount":2,"VolumeSizeInGB":10}}"#;
