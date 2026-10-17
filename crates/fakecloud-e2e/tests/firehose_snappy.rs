@@ -3,6 +3,7 @@ use aws_sdk_firehose::types::{
     CompressionFormat, ExtendedS3DestinationConfiguration, ProcessingConfiguration, Processor,
     ProcessorType, Record,
 };
+use aws_sdk_s3::types::ChecksumMode;
 use fakecloud_testkit::TestServer;
 
 #[path = "../../fakecloud-firehose/tests/fixtures/xerial_decoder.rs"]
@@ -30,15 +31,37 @@ async fn snappy_object(
         .get_object()
         .bucket(bucket)
         .key(&key)
+        .checksum_mode(ChecksumMode::Enabled)
         .send()
         .await
         .unwrap();
     assert_eq!(object.content_type(), Some("application/octet-stream"));
     assert_eq!(object.content_encoding(), Some("snappy-java"));
+    let checksum = object
+        .checksum_crc64_nvme()
+        .expect("default CRC64NVME checksum")
+        .to_owned();
+    assert_eq!(
+        object.checksum_type().map(|value| value.as_str()),
+        Some("FULL_OBJECT")
+    );
     let content_length = object.content_length().unwrap();
     let raw = object.body.collect().await.unwrap().into_bytes().to_vec();
     assert_eq!(content_length, raw.len() as i64);
     let decoded = xerial::decode(&raw).unwrap().concat();
+    let head = s3
+        .head_object()
+        .bucket(bucket)
+        .key(&key)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.checksum_crc64_nvme(), Some(checksum.as_str()));
+    assert_eq!(
+        head.checksum_type().map(|value| value.as_str()),
+        Some("FULL_OBJECT")
+    );
     (key, raw, decoded)
 }
 

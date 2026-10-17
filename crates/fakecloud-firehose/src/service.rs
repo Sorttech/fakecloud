@@ -2534,6 +2534,7 @@ mod tests {
     #[test]
     fn snappy_delivery_uses_the_modeled_enum_and_xerial_metadata() {
         use crate::test_xerial_decoder::{decode, multiblock_input};
+        use fakecloud_s3::checksum::{checksum, ChecksumAlgorithm, ChecksumType};
 
         let (svc, disk, _tmp) = firehose_with_disk_s3("fh-snappy");
         create_s3_stream_with_compression(&svc, "snappy", "fh-snappy", Some("Snappy"));
@@ -2554,6 +2555,16 @@ mod tests {
         assert_eq!(object.content_type, "application/octet-stream");
         let raw = disk.open_object_body(&object.body).unwrap();
         assert_eq!(object.size, raw.len() as u64);
+        let expected_checksum = checksum(ChecksumAlgorithm::Crc64Nvme, &raw);
+        assert_eq!(
+            object.checksum_algorithm,
+            Some(ChecksumAlgorithm::Crc64Nvme)
+        );
+        assert_eq!(object.checksum_type, Some(ChecksumType::FullObject));
+        assert_eq!(
+            object.checksum_value.as_deref(),
+            Some(expected_checksum.as_str())
+        );
         let blocks = decode(&raw).unwrap();
         assert_eq!(
             blocks.iter().map(Vec::len).collect::<Vec<_>>(),
@@ -2562,6 +2573,20 @@ mod tests {
         let decoded = blocks.concat();
         assert_eq!(&decoded[..7], b"abcdef\n");
         assert_eq!(&decoded[7..], input);
+        assert_ne!(
+            expected_checksum,
+            checksum(ChecksumAlgorithm::Crc64Nvme, &decoded)
+        );
+        let key = object.key.clone();
+        drop(s3);
+
+        let loaded = disk.load().unwrap();
+        let persisted = &loaded.buckets["fh-snappy"].objects[&key];
+        assert_eq!(
+            persisted.meta.checksum_value.as_deref(),
+            Some(expected_checksum.as_str())
+        );
+        assert_eq!(disk.open_object_body(&persisted.body).unwrap(), raw);
     }
 
     #[test]
