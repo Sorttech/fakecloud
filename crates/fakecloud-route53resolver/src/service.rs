@@ -14,9 +14,9 @@ use fakecloud_persistence::SnapshotStore;
 
 use crate::persistence::save_route53resolver_snapshot;
 use crate::state::{
-    EndpointRecord, FirewallConfig, FirewallDomainList, FirewallRule, FirewallRuleGroup,
-    FirewallRuleGroupAssociation, IpAddressResponse, OutpostResolver, ResolverConfig,
-    ResolverDnssecConfig, ResolverEndpoint, ResolverQueryLogConfig,
+    endpoint_protocols, EndpointRecord, FirewallConfig, FirewallDomainList, FirewallRule,
+    FirewallRuleGroup, FirewallRuleGroupAssociation, IpAddressResponse, OutpostResolver,
+    ResolverConfig, ResolverDnssecConfig, ResolverEndpoint, ResolverQueryLogConfig,
     ResolverQueryLogConfigAssociation, ResolverRule, ResolverRuleAssociation,
     Route53ResolverAccounts, SharedRoute53ResolverState,
 };
@@ -413,8 +413,11 @@ impl Route53ResolverService {
         let Some(ec2) = self.ec2_state.as_ref() else {
             return Ok(None);
         };
-        let guard = ec2.read();
-        match ec2_in_region(&guard, account, region).and_then(|s| s.subnets.get(subnet_id)) {
+        let mut guard = ec2.write();
+        match ec2_in_region(&mut guard, account, region)
+            .subnets
+            .get(subnet_id)
+        {
             Some(subnet) => Ok(Some(subnet.vpc_id.clone())),
             None => Err(invalid_parameter(format!(
                 "The subnet ID '{subnet_id}' does not exist"
@@ -432,13 +435,10 @@ impl Route53ResolverService {
         let Some(ec2) = self.ec2_state.as_ref() else {
             return Ok(());
         };
-        let guard = ec2.read();
-        let acc = ec2_in_region(&guard, account, region);
+        let mut guard = ec2.write();
+        let acc = ec2_in_region(&mut guard, account, region);
         for sg in sgs {
-            let ok = acc
-                .map(|s| s.security_groups.contains_key(sg))
-                .unwrap_or(false);
-            if !ok {
+            if !acc.security_groups.contains_key(sg) {
                 return Err(invalid_parameter(format!(
                     "The security group '{sg}' does not exist"
                 )));
@@ -455,10 +455,10 @@ impl Route53ResolverService {
         let Some(ec2) = self.ec2_state.as_ref() else {
             return false;
         };
-        let guard = ec2.read();
-        !ec2_in_region(&guard, account, region)
-            .map(|s| s.vpcs.contains_key(vpc_id))
-            .unwrap_or(false)
+        let mut guard = ec2.write();
+        !ec2_in_region(&mut guard, account, region)
+            .vpcs
+            .contains_key(vpc_id)
     }
 }
 
@@ -468,12 +468,14 @@ impl Route53ResolverService {
 /// kept once per account (every region's VPCs together), so for now this is
 /// the account's EC2 state; the region is threaded through every lookup so it
 /// narrows to the request region as soon as EC2 state is region-partitioned.
+/// An account EC2 has not seen yet is created with its default VPC, the way
+/// EC2's own describe calls and the shared VPC lookups resolve it.
 fn ec2_in_region<'a>(
-    guard: &'a fakecloud_core::multi_account::MultiAccountState<fakecloud_ec2::Ec2State>,
+    guard: &'a mut fakecloud_core::multi_account::MultiAccountState<fakecloud_ec2::Ec2State>,
     account: &str,
     _region: &str,
-) -> Option<&'a fakecloud_ec2::Ec2State> {
-    guard.get(account)
+) -> &'a fakecloud_ec2::Ec2State {
+    guard.get_or_create(account)
 }
 
 impl Default for Route53ResolverService {
@@ -703,7 +705,7 @@ impl Route53ResolverService {
                 .and_then(Value::as_str)
                 .unwrap_or("IPV4")
                 .to_string(),
-            protocols: string_list(body.get("Protocols")),
+            protocols: endpoint_protocols(string_list(body.get("Protocols"))),
             outpost_arn: body
                 .get("OutpostArn")
                 .and_then(Value::as_str)

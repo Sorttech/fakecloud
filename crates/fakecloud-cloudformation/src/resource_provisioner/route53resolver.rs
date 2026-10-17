@@ -261,15 +261,17 @@ impl ResourceProvisioner {
                 .and_then(|v| v.as_str())
                 .unwrap_or("IPV4")
                 .to_string(),
-            protocols: props
-                .get("Protocols")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            protocols: fakecloud_route53resolver::endpoint_protocols(
+                props
+                    .get("Protocols")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            ),
             outpost_arn: props
                 .get("OutpostArn")
                 .and_then(|v| v.as_str())

@@ -1972,6 +1972,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-route53resolver"
+version = "1.107.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1672df9bd365583c3dd67b15035b28b148d3f071a55d1c6eab067bac42d7dbb4"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http 0.63.6",
+ "aws-smithy-json 0.62.5",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-s3"
 version = "1.119.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5579,6 +5603,7 @@ dependencies = [
  "aws-sdk-rds",
  "aws-sdk-rdsdata",
  "aws-sdk-route53",
+ "aws-sdk-route53resolver",
  "aws-sdk-s3",
  "aws-sdk-s3control",
  "aws-sdk-sagemaker",

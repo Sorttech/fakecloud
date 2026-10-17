@@ -142,10 +142,10 @@ fn discover_ec2(
     out: &mut Vec<DiscoveredResource>,
 ) {
     let Some(ec2) = &states.ec2 else { return };
-    let guard = ec2.read();
-    let Some(st) = guard.get(account_id) else {
-        return;
-    };
+    // An account EC2 has not seen yet still has its default VPC, subnets and
+    // security group, so materialize it as EC2's own describe calls do.
+    let mut guard = ec2.write();
+    let st = &*guard.get_or_create(account_id);
     let tags_for = |id: &str| -> std::collections::BTreeMap<String, String> {
         st.tags
             .get(id)
@@ -1126,6 +1126,26 @@ mod tests {
     use crate::state::{resource_key, AccountState, ConfigurationItem};
     use chrono::Utc;
     use std::collections::BTreeMap;
+
+    /// An account EC2 has never seen still owns its default VPC and default
+    /// security group, so discovery reports them.
+    #[test]
+    fn discovers_default_vpc_of_untouched_account() {
+        let ec2 = std::sync::Arc::new(parking_lot::RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        let states = CrossServiceStates {
+            s3: None,
+            iam: None,
+            ec2: Some(ec2),
+        };
+        let found = discover_all(&states, "111111111111", "us-east-1");
+        assert!(found.iter().any(|r| r.resource_type == "AWS::EC2::VPC"));
+        assert!(found
+            .iter()
+            .any(|r| r.resource_type == "AWS::EC2::SecurityGroup"
+                && r.resource_name.as_deref() == Some("default")));
+    }
 
     fn item(rtype: &str, rid: &str, config: Value, tags: &[(&str, &str)]) -> ConfigurationItem {
         ConfigurationItem {
