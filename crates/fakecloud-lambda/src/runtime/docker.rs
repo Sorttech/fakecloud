@@ -666,9 +666,14 @@ pub fn extract_zip(zip_bytes: &[u8], dest: &Path) -> Result<(), RuntimeError> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
+                // Keep only the rwx bits: an archive must not be able to plant
+                // setuid/setgid/sticky files in the mounted code directory.
                 if let Some(mode) = file.unix_mode() {
-                    std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode))
-                        .map_err(|e| RuntimeError::ZipExtractionFailed(e.to_string()))?;
+                    std::fs::set_permissions(
+                        &out_path,
+                        std::fs::Permissions::from_mode(mode & 0o777),
+                    )
+                    .map_err(|e| RuntimeError::ZipExtractionFailed(e.to_string()))?;
                 }
             }
         }
@@ -833,6 +838,39 @@ mod tests {
             .read_to_string(&mut content)
             .unwrap();
         assert!(content.contains("def handler"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_zip_strips_setuid_setgid_and_sticky_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default().unix_permissions(0o755);
+        writer.start_file("bootstrap", options).unwrap();
+        writer.write_all(b"#!/bin/sh\n").unwrap();
+        let mut zip_bytes = writer.finish().unwrap().into_inner();
+
+        // The writer masks modes to 0o777, so set the setuid/setgid/sticky
+        // bits by hand in the central directory's external attributes (the
+        // high 16 bits carry the Unix mode), as a hostile archive would.
+        let cd = zip_bytes
+            .windows(4)
+            .position(|w| w == [0x50, 0x4b, 0x01, 0x02])
+            .expect("central directory header");
+        let attrs = cd + 38;
+        let mut ext = u32::from_le_bytes(zip_bytes[attrs..attrs + 4].try_into().unwrap());
+        ext |= 0o7000 << 16;
+        zip_bytes[attrs..attrs + 4].copy_from_slice(&ext.to_le_bytes());
+
+        let dir = TempDir::new().unwrap();
+        extract_zip(&zip_bytes, dir.path()).unwrap();
+
+        let mode = std::fs::metadata(dir.path().join("bootstrap"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o755);
     }
 
     #[test]

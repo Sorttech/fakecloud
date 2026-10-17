@@ -269,6 +269,115 @@ pub fn bounded_status(cli: &str, args: &[&str]) -> bool {
     wait_bounded_group(&mut child) && child.wait().map(|s| s.success()).unwrap_or(false)
 }
 
+/// Why [`output_within`] produced no output.
+#[derive(Debug, thiserror::Error)]
+pub enum CliRunError {
+    /// The command could not be started.
+    #[error("could not run: {0}")]
+    Spawn(std::io::Error),
+    /// Waiting for the command or reading its output failed.
+    #[error("failed while running: {0}")]
+    Wait(std::io::Error),
+    /// The command outran its budget and was killed with its process group.
+    #[error("did not finish within {}s and was killed", .0.as_secs_f64())]
+    TimedOut(std::time::Duration),
+}
+
+/// The async counterpart of [`bounded_output`] for container-CLI calls that
+/// need a budget of their own: run `cmd` to completion and return its full
+/// output, or kill it once it outruns `timeout`.
+///
+/// Like the blocking helpers, the command reads stdin from `/dev/null` and
+/// runs in a process group of its own, and that whole group is SIGKILLed when
+/// the call expires -- and equally when the returned future is dropped before
+/// it finishes (an outer timeout, a `select!` that went the other way, an
+/// aborted task, a cancelled request). A wrapper CLI's grandchild (podman's
+/// build container, a `sudo` shim) dies with it instead of holding the output
+/// pipes, or a stalled registry download, for the life of the process. stdout
+/// and stderr are captured.
+pub async fn output_within(
+    cmd: &mut tokio::process::Command,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, CliRunError> {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd.spawn().map_err(CliRunError::Spawn)?;
+    // Declared after `child`, so on a drop mid-call it runs first: the group
+    // is signalled while its leader is still unreaped, so the group id (the
+    // child's pid) can't have been recycled. `kill_on_drop` then takes care
+    // of the child itself.
+    let mut group = GroupKill(child.id());
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    // Drain both pipes while waiting, as `wait_with_output` does: a child whose
+    // output outgrows the pipe buffer would otherwise block on write and look
+    // wedged. The child stays owned here so the timeout path can still signal
+    // its group before it is reaped.
+    let run = async {
+        let (status, out, err) = tokio::join!(child.wait(), drain(stdout), drain(stderr));
+        Ok(std::process::Output {
+            status: status.map_err(CliRunError::Wait)?,
+            stdout: out.map_err(CliRunError::Wait)?,
+            stderr: err.map_err(CliRunError::Wait)?,
+        })
+    };
+    let finished = tokio::time::timeout(timeout, run).await;
+    match finished {
+        Ok(out) => {
+            // Ran to completion: whatever is left in its group is not ours to
+            // kill (a CLI may legitimately leave a detached helper behind).
+            group.disarm();
+            out
+        }
+        Err(_) => {
+            group.fire();
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            Err(CliRunError::TimedOut(timeout))
+        }
+    }
+}
+
+/// SIGKILLs the process group led by the held pid when dropped (or fired),
+/// unless disarmed: the group id is the child's pid because
+/// [`output_within`] makes it a group leader, so this reaches the
+/// grandchildren a direct kill of the child can't.
+struct GroupKill(Option<u32>);
+
+impl GroupKill {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+
+    fn fire(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0.take() {
+            // SAFETY: `kill` with a negative pid targets that process group;
+            // any value is safe to pass.
+            let _ = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+        }
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        self.fire();
+    }
+}
+
+async fn drain<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    if let Some(mut pipe) = pipe {
+        tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut buf).await?;
+    }
+    Ok(buf)
+}
+
 /// True if the given PID is a live process on this host.
 ///
 /// On Unix this is `kill(pid, 0)`: it returns 0 if the process exists
@@ -815,21 +924,12 @@ mod tests {
         // against an unreachable daemon) must not hang the caller: the probe
         // is killed at CLI_PROBE_TIMEOUT and reported unavailable. Regression
         // test for the local-conformance-probe hang.
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = std::env::temp_dir().join(format!("fc-clitest-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let script = dir.join("hangcli");
-        std::fs::write(&script, "#!/bin/sh\nsleep 600\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::io::stdout().flush().ok();
+        let (_dir, script) = fake_cli("hangcli", "[ \"$1\" = warmup ] && exit 0\nsleep 600\n");
 
         let start = std::time::Instant::now();
-        let available = cli_available(script.to_str().unwrap());
+        let available = cli_available(&script);
         let elapsed = start.elapsed();
 
-        std::fs::remove_dir_all(&dir).ok();
         assert!(!available, "a hanging probe must report unavailable");
         assert!(
             elapsed < CLI_PROBE_TIMEOUT + std::time::Duration::from_secs(5),
@@ -906,28 +1006,8 @@ mod tests {
         assert_eq!(classify_info_output("{}"), None);
     }
 
-    /// Write an executable fake CLI named `name` in a fresh temp dir, and run
-    /// it once so a concurrent fork can't leave it ETXTBSY for the probe.
     #[cfg(unix)]
-    fn fake_cli(name: &str, body: &str) -> (tempfile::TempDir, String) {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut attempts = 0;
-        loop {
-            match std::process::Command::new(&path).arg("warmup").output() {
-                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 200 => {
-                    attempts += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                _ => break,
-            }
-        }
-        let cli = path.display().to_string();
-        (dir, cli)
-    }
+    use crate::test_support::fake_cli;
 
     #[cfg(unix)]
     #[test]
@@ -1249,6 +1329,8 @@ mod tests {
 #[cfg(test)]
 mod bounded_cli_tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::test_support::fake_cli;
 
     /// A wedged daemon leaves the CLI blocked on connect forever. Every
     /// container call has to end at the bound instead of hanging its caller,
@@ -1317,6 +1399,109 @@ mod bounded_cli_tests {
         );
     }
 
+    /// A call that finishes in budget hands back its status and both streams,
+    /// even when its output outgrows a pipe buffer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_within_returns_a_prompt_calls_output() {
+        let (_dir, cli) = fake_cli(
+            "cli",
+            "head -c 200000 /dev/zero | tr '\\0' x; echo oops >&2; exit 3\n",
+        );
+        let out = output_within(
+            tokio::process::Command::new(&cli).arg("build"),
+            std::time::Duration::from_secs(20),
+        )
+        .await
+        .expect("a prompt call must not time out");
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(out.stdout.len(), 200_000);
+        assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), "oops");
+    }
+
+    /// A call that never ends is killed at its budget -- with the grandchild
+    /// a wrapper CLI started, which would otherwise hold the pipes (and keep
+    /// the caller waiting) after the direct child died.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_within_kills_a_hung_call_and_its_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let (_cli_dir, cli) = fake_cli(
+            "cli",
+            &format!(
+                "[ \"$1\" = warmup ] && exit 0\nsleep 1000 &\necho $! > {}\nwait\n",
+                pidfile.display()
+            ),
+        );
+        let start = std::time::Instant::now();
+        let err = output_within(
+            tokio::process::Command::new(&cli).arg("build"),
+            std::time::Duration::from_millis(500),
+        )
+        .await
+        .expect_err("a hung call must time out");
+        assert!(matches!(err, CliRunError::TimedOut(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("did not finish within 0.5s"),
+            "{err}"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "the timeout returned after {:?}",
+            start.elapsed()
+        );
+        let grandchild = crate::test_support::read_pidfile(&pidfile);
+        assert!(
+            crate::test_support::pid_gone(grandchild),
+            "grandchild {grandchild} survived"
+        );
+    }
+
+    /// Dropping the call before it finishes -- an outer timeout, a lost
+    /// `select!`, an aborted task -- kills the command's whole group too, not
+    /// just the direct child `kill_on_drop` reaches.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_output_within_kills_the_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let (_cli_dir, cli) = fake_cli(
+            "cli",
+            &format!(
+                "[ \"$1\" = warmup ] && exit 0\nsleep 1000 &\necho $! > {}\nwait\n",
+                pidfile.display()
+            ),
+        );
+        let mut cmd = tokio::process::Command::new(&cli);
+        cmd.arg("build");
+        let call = output_within(&mut cmd, std::time::Duration::from_secs(600));
+        let start = std::time::Instant::now();
+        // The outer budget runs out long before the call's own.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), call)
+                .await
+                .is_err()
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        let grandchild = crate::test_support::read_pidfile(&pidfile);
+        assert!(
+            crate::test_support::pid_gone(grandchild),
+            "grandchild {grandchild} survived the dropped call"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_within_reports_a_missing_cli() {
+        let err = output_within(
+            &mut tokio::process::Command::new("/nonexistent-dir-fc/cli"),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect_err("no such binary");
+        assert!(matches!(err, CliRunError::Spawn(_)), "{err:?}");
+    }
+
     /// The happy path must still hand back the child's output *and* collect the
     /// reader, so the no-leak guarantee isn't bought by dropping output.
     #[test]
@@ -1338,19 +1523,12 @@ mod bounded_cli_tests {
     #[cfg(unix)]
     #[test]
     fn a_hanging_bridge_gateway_probe_is_cut_off() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = std::env::temp_dir().join(format!("fc-gwtest-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let script = dir.join("hangcli");
-        std::fs::write(&script, "#!/bin/sh\nsleep 600\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (_dir, script) = fake_cli("hangcli", "[ \"$1\" = warmup ] && exit 0\nsleep 600\n");
 
         let start = std::time::Instant::now();
-        let gateway = detect_bridge_gateway(script.to_str().unwrap());
+        let gateway = detect_bridge_gateway(&script);
         let elapsed = start.elapsed();
 
-        std::fs::remove_dir_all(&dir).ok();
         assert_eq!(gateway, None, "a wedged daemon must report no gateway");
         assert!(
             elapsed < CLI_PROBE_TIMEOUT + READER_DRAIN_GRACE + std::time::Duration::from_secs(5),
