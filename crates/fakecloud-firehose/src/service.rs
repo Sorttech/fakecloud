@@ -18,9 +18,7 @@ use fakecloud_s3::delivery::{
 };
 use fakecloud_s3::SharedS3State;
 
-use crate::output::{
-    append_delimiter_enabled, encode_records, object_key, Compression, OutputConfig,
-};
+use crate::output::{append_delimiter_enabled, encode_records, object_key, OutputConfig};
 use crate::state::{
     DeliveryStream, EncryptionConfig, FirehoseAccounts, FirehoseSnapshot, S3Destination,
     SharedFirehoseState, FIREHOSE_SNAPSHOT_SCHEMA_VERSION,
@@ -1197,7 +1195,7 @@ impl FirehoseService {
         // Capability errors are admission errors even with no backend, an
         // unavailable bucket, or an empty/all-invalid batch. Configuration
         // acceptance remains governed solely by the AWS control-plane model.
-        crate::admission::validate_s3_delivery(&dest, &["UNCOMPRESSED", "GZIP"])?;
+        let compression = crate::admission::validate_s3_delivery(&dest)?;
         let Some(s3) = &self.s3 else {
             return Ok(());
         };
@@ -1217,11 +1215,7 @@ impl FirehoseService {
         let output = OutputConfig {
             prefix: dest.prefix.as_deref().unwrap_or_default(),
             file_extension: dest.file_extension.as_deref(),
-            compression: match dest.compression_format.as_deref() {
-                Some("GZIP") => Compression::Gzip,
-                None | Some("UNCOMPRESSED") => Compression::Uncompressed,
-                _ => unreachable!("unsupported compression rejected before admission"),
-            },
+            compression,
             append_delimiter: append_delimiter_enabled(dest.processing_configuration.as_ref()),
         };
         // Judge emptiness by the uncompressed payload: GZIP encodes even an

@@ -4,6 +4,7 @@
 use fakecloud_core::service::AwsServiceError;
 use http::StatusCode;
 
+use crate::output::Compression;
 use crate::state::{DeliveryStream, S3Destination};
 
 fn unsupported(setting: impl Into<String>) -> AwsServiceError {
@@ -25,14 +26,12 @@ pub(crate) fn validate_stream_destination(stream: &DeliveryStream) -> Result<(),
     Ok(())
 }
 
-pub(crate) fn validate_s3_delivery(
-    dest: &S3Destination,
-    supported_codecs: &[&str],
-) -> Result<(), AwsServiceError> {
+/// Checks every capability delivery needs and returns the output codec, so
+/// admission and encoding cannot disagree about which formats are supported.
+pub(crate) fn validate_s3_delivery(dest: &S3Destination) -> Result<Compression, AwsServiceError> {
     let codec = dest.compression_format.as_deref().unwrap_or("UNCOMPRESSED");
-    if !supported_codecs.contains(&codec) {
-        return Err(unsupported(format!("CompressionFormat {codec}")));
-    }
+    let compression = Compression::from_format(codec)
+        .ok_or_else(|| unsupported(format!("CompressionFormat {codec}")))?;
     if dest
         .prefix
         .as_deref()
@@ -97,5 +96,5 @@ pub(crate) fn validate_s3_delivery(
     {
         return Err(unsupported("EncryptionConfiguration.KMSEncryptionConfig"));
     }
-    Ok(())
+    Ok(compression)
 }

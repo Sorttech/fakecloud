@@ -12,6 +12,16 @@ pub(crate) enum Compression {
 }
 
 impl Compression {
+    /// The single source of truth for which modeled `CompressionFormat`
+    /// values delivery implements; admission and output selection both use it.
+    pub(crate) fn from_format(format: &str) -> Option<Self> {
+        match format {
+            "UNCOMPRESSED" => Some(Self::Uncompressed),
+            "GZIP" => Some(Self::Gzip),
+            _ => None,
+        }
+    }
+
     pub(crate) fn content_encoding(self) -> Option<&'static str> {
         match self {
             Self::Uncompressed => None,
@@ -128,6 +138,18 @@ mod tests {
             file_extension: None,
             compression,
             append_delimiter,
+        }
+    }
+
+    #[test]
+    fn only_implemented_compression_formats_parse() {
+        assert_eq!(
+            Compression::from_format("UNCOMPRESSED"),
+            Some(Compression::Uncompressed)
+        );
+        assert_eq!(Compression::from_format("GZIP"), Some(Compression::Gzip));
+        for unsupported in ["Snappy", "ZIP", "HADOOP_SNAPPY", "gzip", ""] {
+            assert_eq!(Compression::from_format(unsupported), None, "{unsupported}");
         }
     }
 
