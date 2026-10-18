@@ -190,8 +190,9 @@ pub struct DeliveryObjectRequest<'a> {
 }
 
 /// Metadata-aware form of [`put_object_via_store`], retaining the same
-/// versioning, Object Lock, and durable-write semantics. The single
-/// implementation behind every `put_object_via_store*` variant.
+/// versioning, Object Lock, and durable-write semantics: the unguarded
+/// [`put_object_via_store_guarded`], which every `put_object_via_store*`
+/// variant goes through.
 pub fn put_object_via_store_with_options(
     state: &SharedS3State,
     store: Option<&dyn S3Store>,
@@ -200,8 +201,15 @@ pub fn put_object_via_store_with_options(
     put_object_via_store_guarded(state, store, request, || Some(())).map(|_| ())
 }
 
-/// Stage outside the producer/S3 guards, then pin the producer's configuration
-/// through the versioned durable commit and in-memory publication.
+/// Metadata-aware delivery that stages outside the producer/S3 guards, then
+/// pins the producer's configuration through the versioned durable commit and
+/// in-memory publication, with the same versioning, Object Lock, encryption,
+/// and durable-write semantics as [`put_object_via_store`].
+///
+/// Lock order: `before_commit` runs, and its guard is taken, before the S3
+/// write lock; both are released before notifications are dispatched. Callers
+/// must never take the guard's lock while holding S3 state, and returning
+/// `None` cancels the write with nothing published.
 pub fn put_object_via_store_guarded<G>(
     state: &SharedS3State,
     store: Option<&dyn S3Store>,
@@ -676,6 +684,38 @@ mod tests {
             sqs.0.lock().unwrap().is_empty(),
             "cancelled writes emit no event"
         );
+    }
+
+    #[test]
+    fn account_removed_after_staging_fails_without_recreating_it() {
+        const OTHER: &str = "210987654321";
+        let tmp = tempfile::TempDir::new().unwrap();
+        let disk = disk_store(&tmp);
+        let mut accounts: MultiAccountState<S3State> =
+            MultiAccountState::new(ACCOUNT, "us-east-1", "http://localhost");
+        accounts.get_or_create(OTHER).buckets.insert(
+            "logs-bucket".to_string(),
+            S3Bucket::new("logs-bucket", "us-east-1", "owner-id"),
+        );
+        let state: SharedS3State = Arc::new(RwLock::new(accounts));
+        let mut staged = None;
+        let request = DeliveryObjectRequest {
+            account: OTHER,
+            ..guarded_request()
+        };
+        let error = put_object_via_store_guarded(&state, Some(&disk), request, || {
+            staged = Some(staged_path(&disk));
+            // A reset between staging and commit drops every non-default account.
+            state.write().reset();
+            Some(())
+        })
+        .unwrap_err();
+        assert!(error.contains(OTHER), "{error}");
+        assert!(
+            state.read().get(OTHER).is_none(),
+            "the commit must not recreate a removed account"
+        );
+        assert!(!staged.unwrap().exists(), "staged body is cleaned up");
     }
 
     #[test]
