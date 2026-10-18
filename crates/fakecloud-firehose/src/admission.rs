@@ -89,12 +89,5 @@ pub(crate) fn validate_s3_delivery(dest: &S3Destination) -> Result<Compression, 
     {
         return Err(unsupported(format!("S3BackupMode {mode}")));
     }
-    if dest
-        .encryption_configuration
-        .as_ref()
-        .is_some_and(|value| value.get("KMSEncryptionConfig").is_some())
-    {
-        return Err(unsupported("EncryptionConfiguration.KMSEncryptionConfig"));
-    }
     Ok(compression)
 }

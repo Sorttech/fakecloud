@@ -4214,6 +4214,10 @@ fn parse_cognito_account_recovery(
 }
 
 fn parse_firehose_s3_destination(value: &serde_json::Value) -> Result<S3Destination, String> {
+    // Template values (a `Ref` to a parameter, say) arrive as strings; give
+    // every modeled boolean / number its API type before parsing, so nested
+    // blocks echoed by DescribeDeliveryStream match the Firehose model.
+    let value = &firehose::coerce_firehose_scalars(value.clone());
     let role_arn = value
         .get("RoleARN")
         .and_then(|v| v.as_str())
@@ -4248,21 +4252,7 @@ fn parse_firehose_s3_destination(value: &serde_json::Value) -> Result<S3Destinat
         .get("FileExtension")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    // CloudFormation uses the API's configuration shapes; template values may
-    // arrive as strings, so normalize `Enabled` to a boolean.
-    let enabled_configuration = |field: &str| {
-        value
-            .get(field)
-            .filter(|v| v.is_object())
-            .cloned()
-            .map(|mut configuration| {
-                if let Some(enabled) = configuration.get("Enabled").and_then(|v| v.as_str()) {
-                    let enabled = enabled.eq_ignore_ascii_case("true");
-                    configuration["Enabled"] = serde_json::Value::Bool(enabled);
-                }
-                configuration
-            })
-    };
+    let configuration = |field: &str| value.get(field).filter(|v| v.is_object()).cloned();
 
     Ok(S3Destination {
         destination_id: "destination-1".to_string(),
@@ -4273,11 +4263,9 @@ fn parse_firehose_s3_destination(value: &serde_json::Value) -> Result<S3Destinat
         buffering_size_mb,
         buffering_interval_seconds,
         compression_format,
-        processing_configuration: enabled_configuration("ProcessingConfiguration"),
-        data_format_conversion_configuration: enabled_configuration(
-            "DataFormatConversionConfiguration",
-        ),
-        cloudwatch_logging_options: enabled_configuration("CloudWatchLoggingOptions"),
+        processing_configuration: configuration("ProcessingConfiguration"),
+        data_format_conversion_configuration: configuration("DataFormatConversionConfiguration"),
+        cloudwatch_logging_options: configuration("CloudWatchLoggingOptions"),
         custom_time_zone: value
             .get("CustomTimeZone")
             .and_then(|v| v.as_str())
@@ -4287,19 +4275,11 @@ fn parse_firehose_s3_destination(value: &serde_json::Value) -> Result<S3Destinat
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         file_extension,
-        dynamic_partitioning_configuration: enabled_configuration(
-            "DynamicPartitioningConfiguration",
-        ),
-        encryption_configuration: value
-            .get("EncryptionConfiguration")
-            .filter(|v| v.is_object())
-            .cloned(),
+        dynamic_partitioning_configuration: configuration("DynamicPartitioningConfiguration"),
+        encryption_configuration: configuration("EncryptionConfiguration"),
         // Match the service parser: retain the full create block and expose it
         // as S3BackupDescription, rather than parsing it as an update shape.
-        s3_backup_description: value
-            .get("S3BackupConfiguration")
-            .filter(|v| v.is_object())
-            .cloned(),
+        s3_backup_description: configuration("S3BackupConfiguration"),
     })
 }
 

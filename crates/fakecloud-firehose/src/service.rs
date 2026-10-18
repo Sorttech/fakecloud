@@ -18,7 +18,9 @@ use fakecloud_s3::delivery::{
 };
 use fakecloud_s3::SharedS3State;
 
-use crate::output::{append_delimiter_enabled, encode_records, object_key, OutputConfig};
+use crate::output::{
+    append_delimiter_enabled, delivery_encryption, encode_records, object_key, OutputConfig,
+};
 use crate::state::{
     DeliveryStream, EncryptionConfig, FirehoseAccounts, FirehoseSnapshot, S3Destination,
     SharedFirehoseState, FIREHOSE_SNAPSHOT_SCHEMA_VERSION,
@@ -1248,6 +1250,7 @@ impl FirehoseService {
                 options: DeliveryObjectOptions {
                     content_type: None,
                     content_encoding: output.compression.content_encoding().map(str::to_owned),
+                    encryption: delivery_encryption(dest.encryption_configuration.as_ref()),
                 },
             },
         ) {
@@ -1297,7 +1300,6 @@ mod tests {
             json!({"DataFormatConversionConfiguration": {"SchemaConfiguration": {}}}),
             json!({"DynamicPartitioningConfiguration": {"Enabled": true}}),
             json!({"S3BackupMode": "Enabled"}),
-            json!({"EncryptionConfiguration": {"KMSEncryptionConfig": {"AWSKMSKeyARN": "arn:aws:kms:us-east-1:123456789012:key/example"}}}),
         ] {
             for (backend, bucket_arn) in [
                 (false, "arn:aws:s3:::admission"),

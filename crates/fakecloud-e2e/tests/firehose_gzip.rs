@@ -232,6 +232,114 @@ async fn firehose_gzip_compresses_records_after_append_delimiter() {
     assert_eq!(decoded, b"a\nb\n\n\x00\xff\n");
 }
 
+/// `KMSEncryptionConfig` makes Firehose write each delivered object with
+/// SSE-KMS under the stream's key, overriding the bucket's default
+/// encryption; S3 decrypts on read and returns the original GZIP bytes.
+#[tokio::test]
+async fn firehose_gzip_stream_kms_encryption_config_writes_sse_kms() {
+    use aws_sdk_firehose::types::{EncryptionConfiguration, KmsEncryptionConfig};
+    use aws_sdk_s3::types::{
+        ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
+        ServerSideEncryptionRule,
+    };
+
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let firehose = server.firehose_client().await;
+    let kms = server.kms_client().await;
+    let key = kms.create_key().send().await.unwrap();
+    let key_arn = key.key_metadata().unwrap().arn().unwrap().to_owned();
+    let bucket = "fh-gzip-stream-kms";
+    s3.create_bucket().bucket(bucket).send().await.unwrap();
+    s3.put_bucket_encryption()
+        .bucket(bucket)
+        .server_side_encryption_configuration(
+            ServerSideEncryptionConfiguration::builder()
+                .rules(
+                    ServerSideEncryptionRule::builder()
+                        .apply_server_side_encryption_by_default(
+                            ServerSideEncryptionByDefault::builder()
+                                .sse_algorithm(ServerSideEncryption::Aes256)
+                                .build()
+                                .unwrap(),
+                        )
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    firehose
+        .create_delivery_stream()
+        .delivery_stream_name("gzip-stream-kms")
+        .extended_s3_destination_configuration(
+            ExtendedS3DestinationConfiguration::builder()
+                .role_arn("arn:aws:iam::123456789012:role/firehose")
+                .bucket_arn(format!("arn:aws:s3:::{bucket}"))
+                .compression_format(CompressionFormat::Gzip)
+                .encryption_configuration(
+                    EncryptionConfiguration::builder()
+                        .kms_encryption_config(
+                            KmsEncryptionConfig::builder()
+                                .awskms_key_arn(&key_arn)
+                                .build()
+                                .unwrap(),
+                        )
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    firehose
+        .put_record()
+        .delivery_stream_name("gzip-stream-kms")
+        .record(
+            Record::builder()
+                .data(Blob::new(b"\x00\xffencrypted\n"))
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let (object_key, raw, decoded) = gzip_object(&s3, bucket, "", ".gz").await;
+    assert_eq!(decoded, b"\x00\xffencrypted\n");
+    let head = s3
+        .head_object()
+        .bucket(bucket)
+        .key(&object_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        head.server_side_encryption(),
+        Some(&ServerSideEncryption::AwsKms)
+    );
+    assert_eq!(head.ssekms_key_id(), Some(key_arn.as_str()));
+    let object = s3
+        .get_object()
+        .bucket(bucket)
+        .key(&object_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        object.server_side_encryption(),
+        Some(&ServerSideEncryption::AwsKms)
+    );
+    assert_eq!(object.ssekms_key_id(), Some(key_arn.as_str()));
+    assert_eq!(
+        object.body.collect().await.unwrap().into_bytes().as_ref(),
+        raw.as_slice()
+    );
+}
+
 #[tokio::test]
 async fn firehose_gzip_public_and_internal_objects_survive_restart() {
     gzip_restart(false).await;

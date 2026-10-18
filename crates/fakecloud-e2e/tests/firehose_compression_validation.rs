@@ -138,21 +138,36 @@ async fn firehose_cfn_preserves_unsupported_settings_for_admission() {
         json!({"DynamicPartitioningConfiguration": {"Enabled": true}}),
         json!({"CustomTimeZone": "America/New_York"}),
         json!({"S3BackupMode": "Enabled"}),
-        json!({"EncryptionConfiguration": {"KMSEncryptionConfig": {"AWSKMSKeyARN": "arn:aws:kms:us-east-1:123456789012:key/example"}}}),
-    ].into_iter().enumerate() {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let name = format!("unsupported-cfn-{i}");
         let field = setting.as_object().unwrap().keys().next().unwrap();
         let mut dest = json!({"RoleARN": "arn:aws:iam::123456789012:role/fh", "BucketARN": "arn:aws:s3:::missing"});
-        dest.as_object_mut().unwrap().extend(setting.as_object().unwrap().clone());
+        dest.as_object_mut()
+            .unwrap()
+            .extend(setting.as_object().unwrap().clone());
         let template = json!({"Resources": {"Stream": {"Type": "AWS::KinesisFirehose::DeliveryStream", "Properties": {
             "DeliveryStreamName": name, "ExtendedS3DestinationConfiguration": dest,
         }}}});
-        cfn.create_stack().stack_name(&name).template_body(template.to_string()).send().await.unwrap();
+        cfn.create_stack()
+            .stack_name(&name)
+            .template_body(template.to_string())
+            .send()
+            .await
+            .unwrap();
         assert_unsupported_admission(&firehose, &name, field).await;
         // A CFN update retains the unsupported setting while changing another field.
         let mut updated = template;
-        updated["Resources"]["Stream"]["Properties"]["ExtendedS3DestinationConfiguration"]["Prefix"] = json!("after/");
-        cfn.update_stack().stack_name(&name).template_body(updated.to_string()).send().await.unwrap();
+        updated["Resources"]["Stream"]["Properties"]["ExtendedS3DestinationConfiguration"]
+            ["Prefix"] = json!("after/");
+        cfn.update_stack()
+            .stack_name(&name)
+            .template_body(updated.to_string())
+            .send()
+            .await
+            .unwrap();
         assert_unsupported_admission(&firehose, &name, field).await;
     }
 }

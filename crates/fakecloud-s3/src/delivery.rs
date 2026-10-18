@@ -78,18 +78,21 @@ pub fn put_object_via_store_with_encryption(
     content_type: Option<&str>,
     encryption: DeliveredEncryption,
 ) -> Result<(), String> {
-    let bytes = Bytes::from(body);
-    let obj = S3Object {
-        key: key.to_string(),
-        content_type: content_type
-            .unwrap_or("application/octet-stream")
-            .to_string(),
-        etag: format!("{:x}", Md5::digest(&bytes)),
-        size: bytes.len() as u64,
-        ..Default::default()
-    };
-    put_delivered_object_with_encryption(state, store, account_id, bucket, obj, bytes, encryption)
-        .map(|_| ())
+    put_object_via_store_with_options(
+        state,
+        store,
+        DeliveryObjectRequest {
+            account: account_id,
+            bucket,
+            key,
+            body: Bytes::from(body),
+            options: DeliveryObjectOptions {
+                content_type: content_type.map(str::to_owned),
+                content_encoding: None,
+                encryption,
+            },
+        },
+    )
 }
 
 /// Write an object another service produced (a log export, a delivery
@@ -164,12 +167,20 @@ pub enum DeliveredEncryption {
     SseKms { key_id: Option<String> },
 }
 
+/// Object metadata a producing service sets on a delivered object.
 #[derive(Clone, Debug, Default)]
 pub struct DeliveryObjectOptions {
+    /// `Content-Type`; `application/octet-stream` when `None`.
     pub content_type: Option<String>,
+    /// `Content-Encoding` (e.g. `gzip` for a compressed Firehose batch).
     pub content_encoding: Option<String>,
+    /// Server-side encryption; [`DeliveredEncryption::AsDelivered`] applies
+    /// the bucket's default encryption.
+    pub encryption: DeliveredEncryption,
 }
 
+/// One object to write with [`put_object_via_store_with_options`]; `body` is
+/// the plaintext.
 pub struct DeliveryObjectRequest<'a> {
     pub account: &'a str,
     pub bucket: &'a str,
@@ -179,30 +190,38 @@ pub struct DeliveryObjectRequest<'a> {
 }
 
 /// Metadata-aware form of [`put_object_via_store`], retaining the same
-/// versioning, Object Lock, and durable-write semantics.
+/// versioning, Object Lock, and durable-write semantics. The single
+/// implementation behind every `put_object_via_store*` variant.
 pub fn put_object_via_store_with_options(
     state: &SharedS3State,
     store: Option<&dyn S3Store>,
     request: DeliveryObjectRequest<'_>,
 ) -> Result<(), String> {
+    let DeliveryObjectRequest {
+        account,
+        bucket,
+        key,
+        body,
+        options,
+    } = request;
     let obj = S3Object {
-        key: request.key.to_string(),
-        content_type: request
-            .options
+        key: key.to_string(),
+        content_type: options
             .content_type
             .unwrap_or_else(|| "application/octet-stream".to_string()),
-        content_encoding: request.options.content_encoding,
-        etag: format!("{:x}", Md5::digest(&request.body)),
-        size: request.body.len() as u64,
+        content_encoding: options.content_encoding,
+        etag: format!("{:x}", Md5::digest(&body)),
+        size: body.len() as u64,
         ..Default::default()
     };
-    put_delivered_object(
+    put_delivered_object_with_encryption(
         state,
         store,
-        request.account,
-        request.bucket,
+        account,
+        bucket,
         obj,
-        request.body,
+        body,
+        options.encryption,
     )
     .map(|_| ())
 }
@@ -483,6 +502,7 @@ mod tests {
                 options: DeliveryObjectOptions {
                     content_type: Some("application/octet-stream".to_owned()),
                     content_encoding: Some("gzip".to_owned()),
+                    ..Default::default()
                 },
             },
         )
@@ -530,6 +550,7 @@ mod tests {
                     options: DeliveryObjectOptions {
                         content_type: None,
                         content_encoding: Some("gzip".to_string()),
+                        ..Default::default()
                     },
                 },
             )
@@ -577,6 +598,7 @@ mod tests {
                 options: DeliveryObjectOptions {
                     content_type: None,
                     content_encoding: Some("gzip".to_owned()),
+                    ..Default::default()
                 },
             },
         );
@@ -1542,6 +1564,46 @@ mod tests {
             assert_eq!(obj.sse_kms_key_id.as_deref(), kms_key, "{key}");
             assert_eq!(read(&state, &obj.body), stored, "{key}");
         }
+    }
+
+    /// The options form carries SSE-KMS alongside the content encoding: the
+    /// body is encrypted under the requested key and the gzip metadata kept.
+    #[test]
+    fn options_write_applies_requested_sse_kms_with_content_encoding() {
+        let state = shared_state();
+        let _svc = with_s3_service(
+            &state,
+            Arc::new(SqsRecorder::default()),
+            Some(Arc::new(ReadableKms)),
+        );
+        put_object_via_store_with_options(
+            &state,
+            None,
+            DeliveryObjectRequest {
+                account: ACCOUNT,
+                bucket: "logs-bucket",
+                key: "events.gz",
+                body: Bytes::from_static(b"gz"),
+                options: DeliveryObjectOptions {
+                    content_type: None,
+                    content_encoding: Some("gzip".to_owned()),
+                    encryption: DeliveredEncryption::SseKms {
+                        key_id: Some("stream-key".to_owned()),
+                    },
+                },
+            },
+        )
+        .unwrap();
+        let obj = &bucket(&state).objects["events.gz"];
+        assert_eq!(obj.sse_algorithm.as_deref(), Some("aws:kms"));
+        assert_eq!(
+            obj.sse_kms_key_id.as_deref(),
+            Some("arn:aws:kms:us-east-1:123456789012:key/stream-key")
+        );
+        assert_eq!(obj.content_encoding.as_deref(), Some("gzip"));
+        assert_eq!(obj.content_type, "application/octet-stream");
+        assert_eq!(obj.size, 2);
+        assert_eq!(read(&state, &obj.body), b"enc:stream-key:gz");
     }
 
     /// The delivered object is committed before it is replicated, so a

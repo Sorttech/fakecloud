@@ -2,6 +2,7 @@ use std::io::Write;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use fakecloud_s3::delivery::DeliveredEncryption;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -49,7 +50,7 @@ pub(crate) struct OutputConfig<'a> {
 /// Whether an S3 destination's `ProcessingConfiguration` enables the built-in
 /// `AppendDelimiterToRecord` processor. Only `Enabled: true` counts. AWS
 /// documents only a new line delimiter, so a `Delimiter` parameter is not
-/// interpreted. Other processor types are not run.
+/// interpreted. Admission rejects enabled processing with any other processor.
 pub(crate) fn append_delimiter_enabled(processing_configuration: Option<&Value>) -> bool {
     processing_configuration.is_some_and(|processing| {
         processing["Enabled"].as_bool() == Some(true)
@@ -61,6 +62,21 @@ pub(crate) fn append_delimiter_enabled(processing_configuration: Option<&Value>)
                         .any(|processor| processor["Type"] == "AppendDelimiterToRecord")
                 })
     })
+}
+
+/// The server-side encryption of a delivered object: SSE-KMS under
+/// `EncryptionConfiguration.KMSEncryptionConfig.AWSKMSKeyARN`, as Firehose
+/// writes it; otherwise (`NoEncryptionConfig`, or none) the bucket default.
+pub(crate) fn delivery_encryption(encryption_configuration: Option<&Value>) -> DeliveredEncryption {
+    match encryption_configuration
+        .and_then(|config| config["KMSEncryptionConfig"]["AWSKMSKeyARN"].as_str())
+        .filter(|arn| !arn.is_empty())
+    {
+        Some(arn) => DeliveredEncryption::SseKms {
+            key_id: Some(arn.to_owned()),
+        },
+        None => DeliveredEncryption::AsDelivered,
+    }
 }
 
 /// Firehose concatenates the raw record bytes, then compresses the whole
@@ -125,6 +141,29 @@ mod tests {
     use chrono::{DateTime, Utc};
     use std::io::Read;
     use uuid::Uuid;
+
+    #[test]
+    fn delivery_encryption_maps_kms_config_to_sse_kms() {
+        let arn = "arn:aws:kms:us-east-1:123456789012:key/stream-key";
+        assert_eq!(
+            delivery_encryption(Some(&serde_json::json!({
+                "KMSEncryptionConfig": {"AWSKMSKeyARN": arn}
+            }))),
+            DeliveredEncryption::SseKms {
+                key_id: Some(arn.to_owned())
+            }
+        );
+        for config in [
+            None,
+            Some(serde_json::json!({"NoEncryptionConfig": "NoEncryption"})),
+            Some(serde_json::json!({})),
+        ] {
+            assert_eq!(
+                delivery_encryption(config.as_ref()),
+                DeliveredEncryption::AsDelivered
+            );
+        }
+    }
 
     fn time(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)
