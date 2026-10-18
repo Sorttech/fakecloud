@@ -11,7 +11,7 @@ mod extended;
 pub mod service;
 pub mod state;
 
-pub use service::{batch_arn, BatchService};
+pub use service::{batch_arn, normalize_compute_environment_order, BatchService};
 pub use state::{
     BatchAccounts, BatchSnapshot, BatchState, SharedBatchState, BATCH_SNAPSHOT_SCHEMA_VERSION,
 };

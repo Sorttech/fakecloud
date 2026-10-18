@@ -14,6 +14,8 @@ compute does no real work. MiniStack's Batch jumps a job straight to
 Batch behind its Ultimate tier. fakecloud already runs ECS tasks as real
 containers, and Batch is built to run real jobs on that same engine.
 
+fakecloud implements **45 of 45** AWS Batch operations at 100% Smithy conformance.
+
 ## Supported today
 
 - **Compute environments** — `CreateComputeEnvironment`, `DescribeComputeEnvironments`, `UpdateComputeEnvironment`, `DeleteComputeEnvironment`. Created `VALID` / `ENABLED`.

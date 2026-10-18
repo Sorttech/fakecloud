@@ -243,6 +243,10 @@
     "repo_dir": "backup",
     "service_name": "backup"
   },
+  "batch": {
+    "repo_dir": "batch",
+    "service_name": "batch"
+  },
   "ram": {
     "repo_dir": "ram",
     "service_name": "ram"

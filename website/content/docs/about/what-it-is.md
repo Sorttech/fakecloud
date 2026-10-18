@@ -6,7 +6,7 @@ weight = 3
 
 ## What fakecloud is
 
-A free, open-source local AWS emulator for integration testing and local development. For every service it implements, the goal is 100% behavioral parity with real AWS — measured by a schema-driven [conformance harness](/docs/about/conformance/) that runs 257,288 generated test variants against official AWS Smithy models on every commit, all of which pass.
+A free, open-source local AWS emulator for integration testing and local development. For every service it implements, the goal is 100% behavioral parity with real AWS — measured by a schema-driven [conformance harness](/docs/about/conformance/) that runs 258,545 generated test variants against official AWS Smithy models on every commit, all of which pass.
 
 The point is to let you run your application code against something that behaves like AWS, without burning an AWS account or hitting rate limits. Your tests exercise real SDK code paths end-to-end. Your CI pipeline runs fast and free.
 
@@ -14,7 +14,7 @@ The point is to let you run your application code against something that behaves
 
 **Not a production cloud.** It's not designed for scale, durability, multi-tenancy, or production workloads. State is in-memory by default. Persistence is limited to a subset of services. It's single-binary and single-process. Don't put it in front of real users.
 
-**Not a drop-in for all of AWS.** It implements 106 services — the ones most teams actually test against. If you need QuickSight, Polly, or Rekognition, fakecloud isn't the right tool (yet). See the [parity matrix](@/docs/parity.md) for what ships today.
+**Not a drop-in for all of AWS.** It implements 107 services — the ones most teams actually test against. If you need QuickSight, Polly, or Rekognition, fakecloud isn't the right tool (yet). See the [parity matrix](@/docs/parity.md) for what ships today.
 
 **Not a mock.** Mocks return predefined values regardless of whether you call them correctly. fakecloud speaks real AWS wire protocols, validates real SigV4 headers (without signature checking), and returns AWS-shaped responses that the real SDK parses and deserializes. If your code assembles the request wrong, fakecloud fails the same way real AWS would.
 
@@ -37,4 +37,4 @@ The point is to let you run your application code against something that behaves
 
 fakecloud exists because testing AWS code well is harder than it should be. Mocks lie. Staging accounts cost money and leak state between tests. Real AWS is slow, rate-limited, and unsuitable for fast CI feedback. The bet is that a correctness-first local emulator — one that matches AWS's actual wire protocol on every documented operation — is a better tradeoff for most testing workflows than any of the alternatives.
 
-That's why the project prioritizes conformance and cross-service wiring over breadth. 106 services at true 100% (257,288/257,288 Smithy variants pass) is more useful than 106 services at 50%.
+That's why the project prioritizes conformance and cross-service wiring over breadth. 107 services at true 100% (258,545/258,545 Smithy variants pass) is more useful than 107 services at 50%.

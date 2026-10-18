@@ -38,7 +38,7 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-fn required_str<'a>(body: &'a Value, key: &str) -> Result<&'a str, AwsServiceError> {
+pub(crate) fn required_str<'a>(body: &'a Value, key: &str) -> Result<&'a str, AwsServiceError> {
     body.get(key)
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
@@ -238,6 +238,8 @@ pub(crate) enum Admission {
     Admitted,
     /// At least one requirement does not fit right now: wait at RUNNABLE.
     Wait,
+    /// The job was cancelled or terminated (or finished): never start it.
+    Stopped,
 }
 
 /// Atomically admit a job against its consumable resources. On success with
@@ -248,6 +250,9 @@ pub(crate) fn admit_job(st: &mut BatchState, job_id: &str) -> Admission {
     let Some(job) = st.jobs.get(job_id) else {
         return Admission::Admitted;
     };
+    if crate::service::is_terminal(job) {
+        return Admission::Stopped;
+    }
     let reqs = job_consumable_requirements(job);
     if reqs.is_empty() {
         return Admission::Admitted;
@@ -2100,6 +2105,23 @@ mod tests {
         }
     }
 
+    /// A deleted resource's tags are purged, and listing them is a
+    /// ClientException since the resource no longer exists.
+    async fn assert_deleted_tags_gone(s: &BatchService, arn: &str) {
+        assert!(!s
+            .state
+            .read()
+            .get("123456789012")
+            .unwrap()
+            .tags
+            .contains_key(arn));
+        let path = format!("/v1/tags/{}", arn.replace('/', "%2F"));
+        match s.handle(req_with(Method::GET, &path, "", json!({}))).await {
+            Err(e) => assert_eq!(e.code(), "ClientException"),
+            Ok(_) => panic!("ListTagsForResource on deleted {arn} must be rejected"),
+        }
+    }
+
     async fn list_tags(s: &BatchService, arn: &str) -> Value {
         // The SDK percent-encodes the ARN label (its `/` becomes %2F).
         let path = format!("/v1/tags/{}", arn.replace('/', "%2F"));
@@ -2226,7 +2248,7 @@ mod tests {
             json!({"consumableResource": "licenses"}),
         )
         .await;
-        assert_eq!(list_tags(&s, &arn).await, json!({}));
+        assert_deleted_tags_gone(&s, &arn).await;
     }
 
     #[tokio::test]
@@ -2677,7 +2699,7 @@ mod tests {
         assert_eq!(d["capacityLimits"][0]["maxCapacity"], 8);
         ok(&s, "deletequotashare", json!({"quotaShareArn": arn})).await;
         client_err(&s, "describequotashare", json!({"quotaShareArn": arn})).await;
-        assert_eq!(list_tags(&s, &arn).await, json!({}));
+        assert_deleted_tags_gone(&s, &arn).await;
     }
 
     const PAYLOAD: &str = r#"{"TrainingJobName":"t","ResourceConfig":{"InstanceType":"ml.m5.large","InstanceCount":2,"VolumeSizeInGB":10}}"#;

@@ -660,12 +660,7 @@ done < <(
 # the service count, the operation total and the conformance claim at once.
 # PENDING_PARITY_ROW names such slugs while the row is being added; it must be
 # empty on main once that work lands.
-PENDING_PARITY_ROW=(
-    # AWS Batch: shipped (crates/fakecloud-batch, 45 ops) but never wired into
-    # the conformance probe (no aws-models/service-map.json entry), so it has
-    # no baseline to back a "true 100%" row yet.
-    "batch"
-)
+PENDING_PARITY_ROW=()
 OPS_INDEX_GEN="scripts/generate-operations-index.sh"
 if [ ! -f "$OPS_INDEX_GEN" ]; then
     echo "missing $OPS_INDEX_GEN (model -> slug map moved? update OPS_INDEX_GEN)" >&2
@@ -704,7 +699,7 @@ parity_slug_ops=$(awk -F'|' '/^\| \[/ {
 while IFS=$'\t' read -r slug want got; do
     [ -z "$slug" ] && continue
     pending=0
-    for _p in "${PENDING_PARITY_ROW[@]}"; do [ "$_p" = "$slug" ] && pending=1; done
+    for _p in ${PENDING_PARITY_ROW[@]+"${PENDING_PARITY_ROW[@]}"}; do [ "$_p" = "$slug" ] && pending=1; done
     if [ "$got" = "-" ]; then
         if [ "$pending" -eq 0 ]; then
             problems+=("$PARITY: no row for docs/services/$slug.md ($want modeled operations); the service is missing from every headline count")

@@ -27,7 +27,7 @@ Since LocalStack replaced its open-source Community Edition with a proprietary i
 | Startup | ~300ms | ~3s | ~3s |
 | Idle memory | ~10 MiB | ~150 MiB | ~150 MiB |
 | Install size | ~19 MB | ~1 GB Docker image | ~1 GB Docker image |
-| Conformance methodology | Smithy-validated, 257,288/257,288 test variants pass on every commit | Not published | Not published |
+| Conformance methodology | Smithy-validated, 258,545/258,545 test variants pass on every commit | Not published | Not published |
 | Terraform TestAcc CI | Yes (upstream suites run against fakecloud) | Not published | Not published |
 | Test-assertion SDKs | TypeScript, Python, Go, PHP, Java, Rust, .NET | Python, Java | Python, Java |
 | Cognito User Pools | 132 ops, full auth flows | [Paid only](https://docs.localstack.cloud/references/licensing/) | Yes |
@@ -46,7 +46,7 @@ Since LocalStack replaced its open-source Community Edition with a proprietary i
 
 **LocalStack's approach** is breadth-first — a very large catalog of AWS services at varying depth. Good for "tests need the call to resolve plausibly."
 
-**fakecloud's approach** is depth-first — 106 services today, each at 100% behavioral conformance with 100% of cross-service integrations. Good for "tests need the downstream actually to happen."
+**fakecloud's approach** is depth-first — 107 services today, each at 100% behavioral conformance with 100% of cross-service integrations. Good for "tests need the downstream actually to happen."
 
 Both are valid. Pick by whether your tests need real cross-service wiring, real Lambda execution, and real stateful backends, or whether you need surface-level plausibility across more services.
 
