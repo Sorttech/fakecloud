@@ -291,6 +291,12 @@ async fn firehose_interval_flushes_after_idle_and_starts_new_window() {
         .unwrap()
         .and_utc();
     assert!((before.timestamp()..=delivered.timestamp()).contains(&timestamp.timestamp()));
+    // The interval runs from first arrival, so delivery is never earlier (1 s
+    // of slack for the key's whole-second timestamp and wall-clock steps).
+    assert!(
+        timestamp.timestamp() >= before.timestamp() + i64::from(INTERVAL) - 1,
+        "delivered at {timestamp}, before the {INTERVAL}s interval from {before}"
+    );
     assert_eq!(
         object(&s3, bucket, &first[0], "UNCOMPRESSED").await,
         b"first\x00\xff"
@@ -402,10 +408,25 @@ async fn firehose_detached_batch_keeps_captured_config_until_late_bucket_exists(
     )
     .await;
     put(&fh, "captured", b"latest-new".to_vec()).await;
+    // A healthy stream admitted last proves the worker ran during the wait, so
+    // the empty successor bucket below is not just an idle worker.
+    s3.create_bucket()
+        .bucket("fh-captured-control")
+        .send()
+        .await
+        .unwrap();
+    create(
+        &fh,
+        "captured-control",
+        destination("fh-captured-control", 0),
+    )
+    .await;
+    put(&fh, "captured-control", b"control".to_vec()).await;
     // Admission wakes the worker at once, so the old batch has almost certainly
     // failed against the missing bucket by now; exact retry timing is covered by
     // the engine unit tests.
     tokio::time::sleep(Duration::from_millis(1500)).await;
+    wait_keys(&s3, "fh-captured-control", 1).await;
     assert!(
         keys(&s3, "fh-present-new").await.is_empty(),
         "a stream's successor must wait behind its failed head"
@@ -620,9 +641,16 @@ async fn firehose_unsupported_update_pauses_accepted_data_until_supported_again(
         .await
         .unwrap_err();
     assert_eq!(error.raw_response().unwrap().status().as_u16(), 400);
+    // A healthy stream admitted after the pause proves the worker scanned
+    // during the wait, so the empty bucket below is not just an idle worker.
+    let control = "fh-paused-control";
+    s3.create_bucket().bucket(control).send().await.unwrap();
+    create(&fh, control, destination(control, 0)).await;
+    put(&fh, control, b"control".to_vec()).await;
     // The paused data is already due (interval 0). Wait past at least two worker
     // ticks so a scan that ignored the pause would have written it by now.
     tokio::time::sleep(Duration::from_millis(2500)).await;
+    wait_keys(&s3, control, 1).await;
     assert!(keys(&s3, bucket).await.is_empty());
     update(
         &fh,
@@ -860,4 +888,184 @@ async fn firehose_buffers_separate_logs_deliveries_into_one_multi_member_gzip_ob
             "envelope {i} must carry exactly its delivery's messages in order"
         );
     }
+}
+
+async fn assert_invalid_create(
+    fh: &aws_sdk_firehose::Client,
+    stream: &str,
+    config: ExtendedS3DestinationConfiguration,
+) {
+    let error = fh
+        .create_delivery_stream()
+        .delivery_stream_name(stream)
+        .extended_s3_destination_configuration(config)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.as_service_error().unwrap().code(),
+        Some("InvalidArgumentException"),
+        "{stream}"
+    );
+    let missing = fh
+        .describe_delivery_stream()
+        .delivery_stream_name(stream)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        missing.as_service_error().unwrap().code(),
+        Some("ResourceNotFoundException"),
+        "{stream} must not be created"
+    );
+}
+
+#[tokio::test]
+async fn firehose_sdk_enforces_buffering_hint_and_destination_string_limits() {
+    let server = TestServer::start().await;
+    let fh = server.firehose_client().await;
+    let bucket = "fh-limits";
+    // Model ranges: SizeInMBs 1-128 and IntervalInSeconds 0-900, set together.
+    for (stream, hints) in [
+        ("size-zero", hints(0, 60)),
+        ("size-129", hints(129, 60)),
+        ("interval-negative", hints(1, -1)),
+        ("interval-901", hints(1, 901)),
+        (
+            "size-only",
+            BufferingHints::builder().size_in_mbs(1).build(),
+        ),
+        (
+            "interval-only",
+            BufferingHints::builder().interval_in_seconds(60).build(),
+        ),
+    ] {
+        let config = destination_builder(bucket, 0)
+            .buffering_hints(hints)
+            .build()
+            .unwrap();
+        assert_invalid_create(&fh, stream, config).await;
+    }
+    for (stream, size, interval) in [
+        ("interval-zero", 1, 0),
+        ("interval-two", 1, 2),
+        ("hints-max", 128, 900),
+    ] {
+        create(
+            &fh,
+            stream,
+            destination_builder(bucket, interval)
+                .buffering_hints(hints(size, interval))
+                .build()
+                .unwrap(),
+        )
+        .await;
+        let response = fh
+            .describe_delivery_stream()
+            .delivery_stream_name(stream)
+            .send()
+            .await
+            .unwrap();
+        let description = response
+            .delivery_stream_description()
+            .unwrap()
+            .destinations()[0]
+            .extended_s3_destination_description()
+            .unwrap()
+            .buffering_hints()
+            .unwrap();
+        assert_eq!(description.size_in_mbs(), Some(size));
+        assert_eq!(description.interval_in_seconds(), Some(interval));
+    }
+
+    // Prefix is limited to 1,024 characters on create and update alike.
+    assert_invalid_create(
+        &fh,
+        "prefix-too-long",
+        destination_builder(bucket, 0)
+            .prefix("p".repeat(1025))
+            .build()
+            .unwrap(),
+    )
+    .await;
+    let longest = "p".repeat(1024);
+    create(
+        &fh,
+        "prefix-longest",
+        destination_builder(bucket, 0)
+            .prefix(&longest)
+            .build()
+            .unwrap(),
+    )
+    .await;
+    let response = fh
+        .describe_delivery_stream()
+        .delivery_stream_name("prefix-longest")
+        .send()
+        .await
+        .unwrap();
+    let description = response.delivery_stream_description().unwrap();
+    let error = fh
+        .update_destination()
+        .delivery_stream_name("prefix-longest")
+        .current_delivery_stream_version_id(description.version_id())
+        .destination_id(description.destinations()[0].destination_id())
+        .extended_s3_destination_update(
+            ExtendedS3DestinationUpdate::builder()
+                .prefix("p".repeat(1025))
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.as_service_error().unwrap().code(),
+        Some("InvalidArgumentException")
+    );
+    let after = fh
+        .describe_delivery_stream()
+        .delivery_stream_name("prefix-longest")
+        .send()
+        .await
+        .unwrap();
+    let after = after.delivery_stream_description().unwrap();
+    assert_eq!(after.version_id(), "1");
+    assert_eq!(
+        after.destinations()[0]
+            .extended_s3_destination_description()
+            .unwrap()
+            .prefix(),
+        Some(longest.as_str())
+    );
+}
+
+#[tokio::test]
+async fn firehose_service_reset_discards_pending_buffers() {
+    let server = TestServer::start().await;
+    let fh = server.firehose_client().await;
+    let s3 = server.s3_client().await;
+    let fc = fakecloud_sdk::FakeCloud::new(server.endpoint());
+    let bucket = "fh-reset";
+    s3.create_bucket().bucket(bucket).send().await.unwrap();
+    // Long enough that a loaded CI runner still resets before the old buffer
+    // could legitimately become due.
+    const OLD_INTERVAL: u64 = 5;
+    create(&fh, bucket, destination(bucket, OLD_INTERVAL as i32)).await;
+    let admitted = std::time::Instant::now();
+    put(&fh, bucket, b"before reset".to_vec()).await;
+    // Resetting Firehose alone keeps the bucket, so the old buffer could still
+    // be delivered if reset did not discard it.
+    fc.reset_service("firehose").await.unwrap();
+    create(&fh, bucket, destination(bucket, 0)).await;
+    put(&fh, bucket, b"after reset".to_vec()).await;
+    let delivered = wait_keys(&s3, bucket, 1).await;
+    assert_eq!(
+        object(&s3, bucket, &delivered[0], "UNCOMPRESSED").await,
+        b"after reset"
+    );
+    // Wait until the discarded buffer would have been due, plus two worker
+    // ticks, to show it never surfaces.
+    let due = admitted + Duration::from_secs(OLD_INTERVAL + 2);
+    tokio::time::sleep_until(due.into()).await;
+    assert_eq!(keys(&s3, bucket).await, delivered);
 }
