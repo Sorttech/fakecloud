@@ -56,7 +56,7 @@ impl FirehoseDeliveryImpl {
 impl FirehoseDelivery for FirehoseDeliveryImpl {
     fn put_record(&self, delivery_stream_arn: &str, data: &[u8]) {
         let Some((account, region, stream_name)) = parse_arn(delivery_stream_arn) else {
-            tracing::warn!(arn = %delivery_stream_arn, "invalid firehose ARN");
+            tracing::warn!(arn = ?delivery_stream_arn, "invalid firehose ARN");
             return;
         };
         if let Err(err) = self.engine.enqueue(
@@ -66,7 +66,7 @@ impl FirehoseDelivery for FirehoseDeliveryImpl {
             vec![Bytes::copy_from_slice(data)],
         ) {
             tracing::warn!(
-                arn = %delivery_stream_arn,
+                arn = ?delivery_stream_arn,
                 error = ?err,
                 "firehose delivery failed"
             );

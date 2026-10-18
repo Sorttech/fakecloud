@@ -24,9 +24,15 @@ pub struct DrainReport {
     pub undelivered_bytes: usize,
 }
 
+/// Returned by [`FirehoseEngine::start`] when the worker already runs or
+/// shutdown has closed admission.
 #[derive(Debug, thiserror::Error)]
 #[error("Firehose worker has already started or admission is closed")]
 pub struct WorkerAlreadyStarted;
+
+/// AWS keeps retrying DirectPut delivery to S3 for up to 24 hours after the
+/// data arrives, then discards it.
+const MAX_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Runtime retry delay after `failures` consecutive failed attempts of one head:
 /// 1 s doubling to a 30 s cap. Retries still start only on worker ticks. The cap
@@ -81,6 +87,8 @@ impl ActiveBuffer {
 struct DetachedBatch {
     batch: DeliveryBatch,
     input_bytes: usize,
+    // Oldest record's arrival; bounds retries to `MAX_RETENTION`.
+    first_arrival: Instant,
 }
 
 #[derive(Default)]
@@ -91,9 +99,10 @@ struct StreamBuffer {
     retry_not_before: Option<Instant>,
     // Consecutive failed attempts of the current head; drives the retry backoff.
     failures: u32,
-    // Runtime-only diagnostic latch. Compare destination values, not versions:
-    // an unchanged unsupported update must not flood the one-second scan.
-    blocked_config: Option<serde_json::Value>,
+    // Runtime-only diagnostic latch: the stream version whose unsupported
+    // configuration was last reported, so each update warns once rather than
+    // on every one-second scan.
+    blocked_version: Option<String>,
 }
 
 impl StreamBuffer {
@@ -126,6 +135,7 @@ impl StreamBuffer {
         );
         self.queue.push_back(Arc::new(DetachedBatch {
             input_bytes: active.input_bytes,
+            first_arrival: active.first.monotonic,
             batch: DeliveryBatch {
                 stream: key.clone(),
                 version_id: stream.version_id.clone(),
@@ -221,8 +231,8 @@ impl FirehoseEngine {
         name: &str,
         records: Vec<Bytes>,
     ) -> Result<(), AwsServiceError> {
-        // Configuration -> registry is the sole nested lock order. Keep the read
-        // guard until admission and immediate detachment have both committed.
+        // Every path holding both takes configuration before the registry. Keep
+        // the read guard until admission and immediate detachment both commit.
         let config = self.core.state.read();
         let mut registry = self.core.registry.lock();
         if registry.closed {
@@ -252,11 +262,9 @@ impl FirehoseEngine {
                 "This operation is not permitted on KinesisStreamAsSource delivery stream type.",
             ));
         }
-        crate::admission::validate_stream_destination(stream)?;
-        let Some(destination) = &stream.destination else {
+        let Some(destination) = stream_delivery(stream)? else {
             return Ok(());
         };
-        let destination = delivery_config(destination)?;
         let key = StreamKey {
             account_id: account.into(),
             region: region.into(),
@@ -326,7 +334,7 @@ impl FirehoseEngine {
             if let Err(error) = handle.await {
                 // Blocking task failures are normally handled individually. A
                 // worker failure must still retain and account for every head.
-                tracing::warn!(%error, "Firehose worker stopped unexpectedly");
+                tracing::warn!(?error, "Firehose worker stopped unexpectedly");
                 // An unexpected worker failure cannot prove its blocking jobs
                 // have stopped; retain those heads instead of duplicating them.
                 drain
@@ -343,6 +351,8 @@ impl FirehoseEngine {
             if let Some(completion) = drain.jobs.next().await {
                 let key = completion.batch.batch.stream.clone();
                 if !self.core.complete(completion) {
+                    tracing::warn!(stream = ?key.name, account = %key.account_id, region = %key.region,
+                        "Firehose final delivery attempt failed; batch retained undelivered");
                     drain.blocked.insert(key);
                 }
             } else if let Some(report) = self.core.finish_shutdown(&drain.blocked) {
@@ -453,12 +463,8 @@ impl EngineCore {
                 continue;
             }
             let stream = current(&config, key).unwrap();
-            let supported_active = buffer.active.is_some()
-                && crate::admission::validate_stream_destination(stream).is_ok()
-                && stream
-                    .destination
-                    .as_ref()
-                    .is_some_and(|d| delivery_config(d).is_ok());
+            let supported_active =
+                buffer.active.is_some() && matches!(stream_delivery(stream), Ok(Some(_)));
             if !buffer.queue.is_empty() || supported_active {
                 return None;
             }
@@ -513,27 +519,19 @@ impl EngineCore {
             let stream = current(&config, key).unwrap();
             // Unsupported updates pause accepted active data in place. Detached
             // batches continue using their original, supported configuration.
-            let destination = crate::admission::validate_stream_destination(stream)
-                .map_err(|error| error.message())
-                .and_then(|()| {
-                    stream
-                        .destination
-                        .as_ref()
-                        .ok_or_else(|| "S3 destination is not configured".to_owned())
-                })
-                .and_then(|d| delivery_config(d).map_err(|error| error.message()));
+            let destination = match stream_delivery(stream) {
+                Ok(Some(destination)) => Ok(destination),
+                Ok(None) => Err("S3 destination is not configured".to_owned()),
+                Err(error) => Err(error.message()),
+            };
             match destination {
                 Ok(destination) => {
-                    buffer.blocked_config = None;
+                    buffer.blocked_version = None;
                     buffer.detach(key, stream, destination, &now, force);
                 }
                 Err(reason) => {
                     if let Some(active) = &buffer.active {
-                        let blocking_config = serde_json::json!({
-                            "destination": &stream.destination,
-                            "extra_destinations": &stream.extra_destinations,
-                        });
-                        if buffer.blocked_config.as_ref() != Some(&blocking_config) {
+                        if buffer.blocked_version.as_deref() != Some(stream.version_id.as_str()) {
                             let retained_records = active.records.len()
                                 + buffer
                                     .queue
@@ -542,14 +540,15 @@ impl EngineCore {
                                     .sum::<usize>();
                             let retained_bytes = active.input_bytes
                                 + buffer.queue.iter().map(|b| b.input_bytes).sum::<usize>();
+                            // Debug formatting escapes caller-supplied values in the reason.
                             tracing::warn!(account = %key.account_id, region = %key.region,
-                                stream = %key.name, version = %stream.version_id,
-                                retained_records, retained_bytes, %reason,
+                                stream = ?key.name, version = %stream.version_id,
+                                retained_records, retained_bytes, ?reason,
                                 "Firehose active delivery paused by configuration");
-                            buffer.blocked_config = Some(blocking_config);
+                            buffer.blocked_version = Some(stream.version_id.clone());
                         }
                     } else {
-                        buffer.blocked_config = None;
+                        buffer.blocked_version = None;
                     }
                 }
             }
@@ -613,23 +612,44 @@ impl EngineCore {
             }
             Err(error) => {
                 buffer.failures = buffer.failures.saturating_add(1);
+                // Keys, errors, and CloudFormation-created stream names can carry
+                // caller-supplied text; Debug formatting escapes line breaks.
                 let object_key = &completion.batch.batch.object_key;
                 if closed {
-                    // The final drain blocks this stream instead of retrying it.
-                    tracing::warn!(stream = %key.name, account = %key.account_id, region = %key.region,
-                        %object_key, attempt = buffer.failures, %error,
-                        "Firehose final delivery attempt failed; batch retained undelivered");
+                    // The drain decides whether this stream gets a final attempt.
+                    tracing::warn!(stream = ?key.name, account = %key.account_id, region = %key.region,
+                        ?object_key, attempt = buffer.failures, ?error,
+                        "Firehose delivery attempt failed after admission closed");
+                } else if now.monotonic.duration_since(completion.batch.first_arrival)
+                    >= MAX_RETENTION
+                {
+                    buffer.queue.pop_front();
+                    buffer.retry_not_before = None;
+                    buffer.failures = 0;
+                    tracing::warn!(stream = ?key.name, account = %key.account_id, region = %key.region,
+                        ?object_key, records = completion.batch.batch.records.len(),
+                        bytes = completion.batch.input_bytes, ?error,
+                        "Firehose batch discarded after failing delivery for 24 hours");
+                    return true;
                 } else {
                     let delay = retry_delay(buffer.failures);
                     buffer.retry_not_before = Some(now.monotonic + delay);
-                    tracing::warn!(stream = %key.name, account = %key.account_id, region = %key.region,
-                        %object_key, attempt = buffer.failures, retry_in_secs = delay.as_secs(), %error,
+                    tracing::warn!(stream = ?key.name, account = %key.account_id, region = %key.region,
+                        ?object_key, attempt = buffer.failures, retry_in_secs = delay.as_secs(), ?error,
                         "Firehose batch retained for retry");
                 }
                 false
             }
         }
     }
+}
+
+/// The one delivery decision shared by admission, scheduling, and the final
+/// drain, so they cannot disagree about whether a stream can deliver.
+/// `Ok(None)`: no destination is configured, so nothing is written.
+fn stream_delivery(stream: &DeliveryStream) -> Result<Option<DeliveryConfig>, AwsServiceError> {
+    crate::admission::validate_stream_destination(stream)?;
+    stream.destination.as_ref().map(delivery_config).transpose()
 }
 
 fn current<'a>(config: &'a crate::FirehoseAccounts, key: &StreamKey) -> Option<&'a DeliveryStream> {
@@ -1429,6 +1449,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_batches_are_discarded_after_24_hours_of_retries() {
+        let f = Fixture::new(0);
+        *f.engine.core.writer.write() = Some(Arc::new(FailingWriter));
+        f.enqueue(vec![Bytes::from_static(b"stale")]);
+        f.turn().await;
+        let queued = |f: &Fixture| {
+            f.engine
+                .core
+                .registry
+                .lock()
+                .streams
+                .values()
+                .map(|buffer| buffer.queue.len())
+                .sum::<usize>()
+        };
+        assert_eq!(queued(&f), 1);
+        // Just inside the window: the retry fails and the batch is kept.
+        f.advance(86_399);
+        f.turn().await;
+        assert_eq!(queued(&f), 1);
+        // The next failed retry is past 24 hours from arrival: discarded.
+        f.advance(2);
+        let capture = CapturedEvents::default();
+        {
+            let _default = tracing::subscriber::set_default(capture.clone());
+            f.turn().await;
+        }
+        assert_eq!(queued(&f), 0);
+        let warnings = capture.0.lock().clone();
+        let discarded = warnings
+            .iter()
+            .find(|warning| warning["message"].contains("discarded"))
+            .expect("discard warning");
+        assert_eq!(discarded["records"], "1");
+        assert_eq!(discarded["bytes"], "5");
+        // A newer batch on the same stream is retained and retried normally.
+        f.enqueue(vec![Bytes::from_static(b"fresh")]);
+        f.turn().await;
+        assert_eq!(queued(&f), 1);
+        *f.engine.core.writer.write() = Some(f.writer.clone());
+        f.advance(1);
+        f.turn().await;
+        assert_eq!(queued(&f), 0);
+        assert_eq!(
+            f.batches()
+                .into_iter()
+                .map(|batch| batch.records)
+                .collect::<Vec<_>>(),
+            vec![vec![Bytes::from_static(b"fresh")]]
+        );
+    }
+
+    #[tokio::test]
+    async fn batches_older_than_24_hours_still_get_the_final_drain_attempt() {
+        let f = Fixture::new(0);
+        *f.engine.core.writer.write() = Some(Arc::new(FailingWriter));
+        f.enqueue(vec![Bytes::from_static(b"old")]);
+        f.turn().await;
+        // Retention is enforced only when an ordinary retry fails; shutdown
+        // still makes its single final attempt.
+        f.advance(86_401);
+        *f.engine.core.writer.write() = Some(f.writer.clone());
+        assert_eq!(
+            f.engine.shutdown().await,
+            DrainReport {
+                delivered_batches: 1,
+                undelivered_records: 0,
+                undelivered_bytes: 0
+            }
+        );
+        assert_eq!(f.batches()[0].records, vec![Bytes::from_static(b"old")]);
+    }
+
+    #[tokio::test]
+    async fn caller_supplied_values_are_escaped_in_warnings() {
+        struct KeyEchoWriter;
+        impl BatchWriter for KeyEchoWriter {
+            fn write(&self, batch: &DeliveryBatch) -> Result<DeliveryWriteOutcome, String> {
+                Err(format!("cannot write {}", batch.object_key))
+            }
+        }
+        let f = Fixture::new(0);
+        f.update(NAME, |stream| {
+            stream.destination.as_mut().unwrap().prefix = Some("forged\nWARN line/".into());
+        });
+        *f.engine.core.writer.write() = Some(Arc::new(KeyEchoWriter));
+        f.enqueue(vec![Bytes::from_static(b"x")]);
+        let capture = CapturedEvents::default();
+        {
+            let _default = tracing::subscriber::set_default(capture.clone());
+            f.turn().await;
+        }
+        let warnings = capture.0.lock().clone();
+        let retained = warnings
+            .iter()
+            .find(|warning| warning["message"].contains("retained for retry"))
+            .expect("retry warning");
+        for field in ["object_key", "error"] {
+            assert!(
+                retained[field].contains("forged\\nWARN line/"),
+                "{field}: {}",
+                retained[field]
+            );
+        }
+        for warning in &warnings {
+            for value in warning.values() {
+                assert!(!value.contains('\n'), "unescaped line break: {value}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn panic_retains_batch_and_counts() {
         let f = Fixture::new(0);
         let mut entered = f.controlled();
@@ -1899,19 +2031,24 @@ mod tests {
             };
             scan();
             scan();
-            f.update(NAME, |stream| stream.version_id = "3".into());
-            scan(); // A version bump alone does not change the blocking config.
-            let warnings = capture.0.lock().clone();
             assert_eq!(
-                warnings.len(),
+                capture.0.lock().len(),
                 1,
-                "pending unsupported data needs one observed warning"
+                "pending unsupported data needs one observed warning per version"
             );
+            // Every UpdateDestination bumps the version: each update warns once,
+            // never once per scan, without comparing configuration bodies.
+            f.update(NAME, |stream| stream.version_id = "3".into());
+            scan();
+            scan();
+            let warnings = capture.0.lock().clone();
+            assert_eq!(warnings.len(), 2);
+            assert_eq!(warnings[1]["version"], "3");
             let warning = &warnings[0];
             assert_eq!(warning["level"], "WARN");
             assert_eq!(warning["account"], ACCOUNT);
             assert_eq!(warning["region"], REGION);
-            assert_eq!(warning["stream"], NAME);
+            assert_eq!(warning["stream"], format!("{NAME:?}"));
             assert_eq!(warning["version"], "2");
             assert_eq!(warning["retained_records"], "2");
             assert_eq!(warning["retained_bytes"], "8");
@@ -1949,12 +2086,12 @@ mod tests {
             scan();
             assert_eq!(
                 capture.0.lock().len(),
-                2,
+                3,
                 "restoration must re-arm the warning"
             );
             f.advance(1);
             scan();
-            assert_eq!(capture.0.lock().len(), 2);
+            assert_eq!(capture.0.lock().len(), 3);
             f.update(NAME, restore);
             f.turn().await;
             let batches = f.batches();
@@ -2043,6 +2180,7 @@ mod tests {
         };
         scan();
         f.update(NAME, |stream| {
+            stream.version_id = "2".into();
             stream.destination.as_mut().unwrap().prefix = Some("changed/".into());
         });
         scan();
