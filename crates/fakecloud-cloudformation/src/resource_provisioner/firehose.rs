@@ -20,6 +20,93 @@ fn validate_firehose_compression(props: &serde_json::Value) -> Result<(), String
     Ok(())
 }
 
+/// Members of the Firehose S3 destination shapes (and every block nested in
+/// them: backup configuration, buffering hints, logging options, dynamic
+/// partitioning retry options, format conversion SerDes) that the Firehose
+/// Smithy model types as `boolean`. No member of these names is a string.
+const FIREHOSE_BOOLEAN_MEMBERS: &[&str] = &[
+    "CaseInsensitive",
+    "ConvertDotsInJsonKeysToUnderscores",
+    "EnableDictionaryCompression",
+    "EnablePadding",
+    "Enabled",
+];
+
+/// The same shapes' `integer` members.
+const FIREHOSE_INTEGER_MEMBERS: &[&str] = &[
+    "BlockSizeBytes",
+    "DurationInSeconds",
+    "IntervalInSeconds",
+    "MaxPaddingBytes",
+    "PageSizeBytes",
+    "RowIndexStride",
+    "SizeInMBs",
+    "StripeSizeBytes",
+];
+
+/// The same shapes' `double` members.
+const FIREHOSE_DOUBLE_MEMBERS: &[&str] = &[
+    "BloomFilterFalsePositiveProbability",
+    "DictionaryKeyThreshold",
+    "PaddingTolerance",
+];
+
+/// Map members whose keys are user data, not model member names.
+const FIREHOSE_FREE_FORM_MAPS: &[&str] = &["ColumnToJsonKeyMappings"];
+
+/// Give the modeled boolean and numeric members of a Firehose S3 destination
+/// block their API types. CloudFormation passes template parameters (`Ref`)
+/// as strings, so `"false"` or `"60"` would otherwise be stored and echoed
+/// by `DescribeDeliveryStream` where SDKs expect a boolean or a number. A
+/// string that does not parse is left as is.
+pub(super) fn coerce_firehose_scalars(mut value: serde_json::Value) -> serde_json::Value {
+    coerce_firehose_scalars_in_place(&mut value);
+    value
+}
+
+fn coerce_firehose_scalars_in_place(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(members) => {
+            for (name, member) in members.iter_mut() {
+                let name = name.as_str();
+                if FIREHOSE_FREE_FORM_MAPS.contains(&name) {
+                    continue;
+                }
+                if let Some(text) = member.as_str() {
+                    let text = text.trim();
+                    let coerced = if FIREHOSE_BOOLEAN_MEMBERS.contains(&name) {
+                        if text.eq_ignore_ascii_case("true") {
+                            Some(serde_json::Value::Bool(true))
+                        } else if text.eq_ignore_ascii_case("false") {
+                            Some(serde_json::Value::Bool(false))
+                        } else {
+                            None
+                        }
+                    } else if FIREHOSE_INTEGER_MEMBERS.contains(&name) {
+                        text.parse::<i64>().ok().map(serde_json::Value::from)
+                    } else if FIREHOSE_DOUBLE_MEMBERS.contains(&name) {
+                        text.parse::<f64>()
+                            .ok()
+                            .and_then(serde_json::Number::from_f64)
+                            .map(serde_json::Value::Number)
+                    } else {
+                        None
+                    };
+                    if let Some(coerced) = coerced {
+                        *member = coerced;
+                    }
+                } else {
+                    coerce_firehose_scalars_in_place(member);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            items.iter_mut().for_each(coerce_firehose_scalars_in_place)
+        }
+        _ => {}
+    }
+}
+
 impl ResourceProvisioner {
     // --- Firehose ---
 
@@ -283,6 +370,272 @@ mod tests {
         prov.update_resource(&existing, &delivery_stream(with_processing(json!("false"))))
             .unwrap();
         assert_eq!(stored(&prov)["Enabled"], json!(false));
+    }
+
+    #[test]
+    fn firehose_cfn_modeled_settings_survive_create_and_update() {
+        for base in [
+            "S3DestinationConfiguration",
+            "ExtendedS3DestinationConfiguration",
+        ] {
+            let prov = make_provisioner();
+            let mut existing = None;
+            for (enabled, normalized, zone, backup_mode, prefix) in [
+                ("TrUe", true, "America/New_York", "Enabled", "before/"),
+                ("FaLsE", false, "UTC", "Disabled", "after/"),
+            ] {
+                let mut resource = firehose_resource(base);
+                resource.properties[base] = json!({
+                    "RoleARN": "arn:aws:iam::123456789012:role/fh",
+                    "BucketARN": "arn:aws:s3:::bucket",
+                    "Prefix": prefix,
+                    "CompressionFormat": "GZIP",
+                    "ProcessingConfiguration": {
+                        "Enabled": enabled,
+                        "Processors": [{"Type": "AppendDelimiterToRecord"}]
+                    },
+                    "DataFormatConversionConfiguration": {
+                        "Enabled": enabled,
+                        "OutputFormatConfiguration": {"Serializer": {"ParquetSerDe": {}}}
+                    },
+                    "DynamicPartitioningConfiguration": {
+                        "Enabled": enabled, "RetryOptions": {"DurationInSeconds": 60}
+                    },
+                    "CloudWatchLoggingOptions": {
+                        "Enabled": enabled, "LogGroupName": "delivery", "LogStreamName": prefix
+                    },
+                    "CustomTimeZone": zone,
+                    "S3BackupMode": backup_mode,
+                    "EncryptionConfiguration": {"KMSEncryptionConfig": {"AWSKMSKeyARN": "arn:aws:kms:us-east-1:123456789012:key/test"}},
+                    "S3BackupConfiguration": {
+                        "RoleARN": "arn:aws:iam::123456789012:role/backup",
+                        "BucketARN": "arn:aws:s3:::backup",
+                        "Prefix": prefix,
+                        "CompressionFormat": "UNCOMPRESSED",
+                        "BufferingHints": {"SizeInMBs": 5, "IntervalInSeconds": 300},
+                        "CloudWatchLoggingOptions": {"Enabled": false}
+                    }
+                });
+                if let Some(existing) = &existing {
+                    prov.update_resource(existing, &resource)
+                        .unwrap()
+                        .expect("in-place update");
+                } else {
+                    existing = Some(prov.create_resource(&resource).unwrap());
+                }
+                let state = prov.firehose_state.read();
+                let stream = &state
+                    .get("123456789012")
+                    .unwrap()
+                    .streams("us-east-1")
+                    .unwrap()["cfn-compression"];
+                let dest = stream.destination.as_ref().unwrap();
+                assert_eq!(
+                    dest.data_format_conversion_configuration,
+                    Some(json!({
+                        "Enabled": normalized,
+                        "OutputFormatConfiguration": {"Serializer": {"ParquetSerDe": {}}}
+                    }))
+                );
+                assert_eq!(
+                    dest.processing_configuration,
+                    Some(json!({
+                        "Enabled": normalized,
+                        "Processors": [{"Type": "AppendDelimiterToRecord"}]
+                    }))
+                );
+                assert_eq!(
+                    dest.dynamic_partitioning_configuration,
+                    Some(json!({
+                        "Enabled": normalized, "RetryOptions": {"DurationInSeconds": 60}
+                    }))
+                );
+                assert_eq!(
+                    dest.cloudwatch_logging_options,
+                    Some(json!({
+                        "Enabled": normalized, "LogGroupName": "delivery", "LogStreamName": prefix
+                    }))
+                );
+                assert_eq!(dest.custom_time_zone.as_deref(), Some(zone));
+                assert_eq!(dest.s3_backup_mode.as_deref(), Some(backup_mode));
+                assert_eq!(
+                    dest.encryption_configuration,
+                    Some(json!({
+                        "KMSEncryptionConfig": {"AWSKMSKeyARN": "arn:aws:kms:us-east-1:123456789012:key/test"}
+                    }))
+                );
+                assert_eq!(
+                    dest.s3_backup_description,
+                    Some(json!({
+                        "RoleARN": "arn:aws:iam::123456789012:role/backup",
+                        "BucketARN": "arn:aws:s3:::backup",
+                        "Prefix": prefix,
+                        "CompressionFormat": "UNCOMPRESSED",
+                        "BufferingHints": {"SizeInMBs": 5, "IntervalInSeconds": 300},
+                        "CloudWatchLoggingOptions": {"Enabled": false}
+                    }))
+                );
+                assert_eq!(dest.prefix.as_deref(), Some(prefix));
+                assert_eq!(dest.compression_format.as_deref(), Some("GZIP"));
+                assert_eq!(stream.version_id, if normalized { "1" } else { "2" });
+            }
+        }
+    }
+
+    #[test]
+    fn firehose_cfn_modeled_settings_defaults_and_disabled_blocks() {
+        let base = destination(json!(".json"));
+        let dest = parse_firehose_s3_destination(&base).unwrap();
+        assert!(dest.processing_configuration.is_none());
+        assert!(dest.data_format_conversion_configuration.is_none());
+        assert!(dest.dynamic_partitioning_configuration.is_none());
+        assert!(dest.cloudwatch_logging_options.is_none());
+        assert!(dest.custom_time_zone.is_none());
+        assert!(dest.s3_backup_mode.is_none());
+        assert!(dest.encryption_configuration.is_none());
+        assert!(dest.s3_backup_description.is_none());
+
+        for enabled in [None, Some(json!(false)), Some(json!("false"))] {
+            let mut config = base.clone();
+            for field in [
+                "ProcessingConfiguration",
+                "DataFormatConversionConfiguration",
+                "DynamicPartitioningConfiguration",
+                "CloudWatchLoggingOptions",
+            ] {
+                config[field] = match &enabled {
+                    Some(enabled) => json!({"Enabled": enabled}),
+                    None => json!({}),
+                };
+            }
+            let dest = parse_firehose_s3_destination(&config).unwrap();
+            let expected = if enabled.is_some() {
+                json!({"Enabled": false})
+            } else {
+                json!({})
+            };
+            assert_eq!(dest.processing_configuration, Some(expected.clone()));
+            assert_eq!(
+                dest.data_format_conversion_configuration,
+                Some(expected.clone())
+            );
+            assert_eq!(
+                dest.dynamic_partitioning_configuration,
+                Some(expected.clone())
+            );
+            assert_eq!(dest.cloudwatch_logging_options, Some(expected));
+        }
+    }
+
+    /// Template parameters arrive as strings; every nested modeled boolean
+    /// and number is stored with its API type (so DescribeDeliveryStream
+    /// echoes what SDKs deserialize), while string members, free-form map
+    /// values, and unparseable strings are left untouched.
+    #[test]
+    fn firehose_cfn_coerces_nested_template_scalars() {
+        let prov = make_provisioner();
+        prov.create_resource(&delivery_stream(json!({
+            "RoleARN": "arn:aws:iam::123456789012:role/fh",
+            "BucketARN": "arn:aws:s3:::bucket",
+            "Prefix": "60",
+            "BufferingHints": {"SizeInMBs": "64", "IntervalInSeconds": "60"},
+            "CloudWatchLoggingOptions": {"Enabled": "false", "LogGroupName": "true"},
+            "ProcessingConfiguration": {
+                "Enabled": "True",
+                "Processors": [{
+                    "Type": "AppendDelimiterToRecord",
+                    "Parameters": [{"ParameterName": "Delimiter", "ParameterValue": "60"}]
+                }]
+            },
+            "DataFormatConversionConfiguration": {
+                "Enabled": "false",
+                "InputFormatConfiguration": {"Deserializer": {"OpenXJsonSerDe": {
+                    "CaseInsensitive": "true",
+                    "ConvertDotsInJsonKeysToUnderscores": "FALSE",
+                    "ColumnToJsonKeyMappings": {"Enabled": "true", "SizeInMBs": "1"}
+                }}},
+                "OutputFormatConfiguration": {"Serializer": {"OrcSerDe": {
+                    "StripeSizeBytes": "8388608",
+                    "BlockSizeBytes": "67108864",
+                    "RowIndexStride": "1000",
+                    "EnablePadding": "true",
+                    "PaddingTolerance": "0.05",
+                    "BloomFilterFalsePositiveProbability": "0.1",
+                    "DictionaryKeyThreshold": "0.5",
+                    "BloomFilterColumns": ["60"]
+                }}}
+            },
+            "DynamicPartitioningConfiguration": {
+                "Enabled": "false", "RetryOptions": {"DurationInSeconds": "300"}
+            },
+            "EncryptionConfiguration": {"NoEncryptionConfig": "NoEncryption"},
+            "S3BackupConfiguration": {
+                "RoleARN": "arn:aws:iam::123456789012:role/backup",
+                "BucketARN": "arn:aws:s3:::backup",
+                "BufferingHints": {"SizeInMBs": "5", "IntervalInSeconds": "not-a-number"},
+                "CloudWatchLoggingOptions": {"Enabled": "true"}
+            }
+        })))
+        .unwrap();
+
+        let state = prov.firehose_state.read();
+        let dest = state
+            .get("123456789012")
+            .unwrap()
+            .streams("us-east-1")
+            .unwrap()["events"]
+            .destination
+            .clone()
+            .unwrap();
+        assert_eq!(dest.prefix.as_deref(), Some("60"));
+        assert_eq!(dest.buffering_size_mb, Some(64));
+        assert_eq!(dest.buffering_interval_seconds, Some(60));
+        assert_eq!(
+            dest.cloudwatch_logging_options,
+            Some(json!({"Enabled": false, "LogGroupName": "true"}))
+        );
+        let processing = dest.processing_configuration.unwrap();
+        assert_eq!(processing["Enabled"], json!(true));
+        assert_eq!(
+            processing["Processors"][0]["Parameters"][0]["ParameterValue"],
+            json!("60")
+        );
+        let conversion = dest.data_format_conversion_configuration.unwrap();
+        assert_eq!(conversion["Enabled"], json!(false));
+        let openx = &conversion["InputFormatConfiguration"]["Deserializer"]["OpenXJsonSerDe"];
+        assert_eq!(openx["CaseInsensitive"], json!(true));
+        assert_eq!(openx["ConvertDotsInJsonKeysToUnderscores"], json!(false));
+        assert_eq!(
+            openx["ColumnToJsonKeyMappings"],
+            json!({"Enabled": "true", "SizeInMBs": "1"})
+        );
+        assert_eq!(
+            conversion["OutputFormatConfiguration"]["Serializer"]["OrcSerDe"],
+            json!({
+                "StripeSizeBytes": 8388608,
+                "BlockSizeBytes": 67108864,
+                "RowIndexStride": 1000,
+                "EnablePadding": true,
+                "PaddingTolerance": 0.05,
+                "BloomFilterFalsePositiveProbability": 0.1,
+                "DictionaryKeyThreshold": 0.5,
+                "BloomFilterColumns": ["60"]
+            })
+        );
+        assert_eq!(
+            dest.dynamic_partitioning_configuration,
+            Some(json!({"Enabled": false, "RetryOptions": {"DurationInSeconds": 300}}))
+        );
+        assert_eq!(
+            dest.encryption_configuration,
+            Some(json!({"NoEncryptionConfig": "NoEncryption"}))
+        );
+        let backup = dest.s3_backup_description.unwrap();
+        assert_eq!(
+            backup["BufferingHints"],
+            json!({"SizeInMBs": 5, "IntervalInSeconds": "not-a-number"})
+        );
+        assert_eq!(backup["CloudWatchLoggingOptions"], json!({"Enabled": true}));
     }
 
     fn firehose_resource(base: &str) -> ResourceDefinition {

@@ -1,11 +1,47 @@
+use std::io::Write;
+
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use fakecloud_s3::delivery::DeliveredEncryption;
 use serde_json::Value;
 use uuid::Uuid;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Compression {
+    Uncompressed,
+    Gzip,
+}
+
+impl Compression {
+    /// The single source of truth for which modeled `CompressionFormat`
+    /// values delivery implements; admission and output selection both use it.
+    pub(crate) fn from_format(format: &str) -> Option<Self> {
+        match format {
+            "UNCOMPRESSED" => Some(Self::Uncompressed),
+            "GZIP" => Some(Self::Gzip),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn content_encoding(self) -> Option<&'static str> {
+        match self {
+            Self::Uncompressed => None,
+            Self::Gzip => Some("gzip"),
+        }
+    }
+
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Uncompressed => "",
+            Self::Gzip => ".gz",
+        }
+    }
+}
 
 pub(crate) struct OutputConfig<'a> {
     pub prefix: &'a str,
     pub file_extension: Option<&'a str>,
+    pub compression: Compression,
     /// The built-in `AppendDelimiterToRecord` processor: write `\n` after
     /// every record.
     pub append_delimiter: bool,
@@ -14,7 +50,7 @@ pub(crate) struct OutputConfig<'a> {
 /// Whether an S3 destination's `ProcessingConfiguration` enables the built-in
 /// `AppendDelimiterToRecord` processor. Only `Enabled: true` counts. AWS
 /// documents only a new line delimiter, so a `Delimiter` parameter is not
-/// interpreted. Other processor types are not run.
+/// interpreted. Admission rejects enabled processing with any other processor.
 pub(crate) fn append_delimiter_enabled(processing_configuration: Option<&Value>) -> bool {
     processing_configuration.is_some_and(|processing| {
         processing["Enabled"].as_bool() == Some(true)
@@ -28,21 +64,53 @@ pub(crate) fn append_delimiter_enabled(processing_configuration: Option<&Value>)
     })
 }
 
-/// Firehose concatenates the raw record bytes; producers supply any record
-/// delimiters unless `AppendDelimiterToRecord` adds `\n` after each record.
-pub(crate) fn encode_records(records: &[Vec<u8>], config: &OutputConfig<'_>) -> Bytes {
-    let delimiter: &[u8] = if config.append_delimiter { b"\n" } else { b"" };
-    let mut payload = Vec::with_capacity(
-        records
-            .iter()
-            .map(|record| record.len() + delimiter.len())
-            .sum(),
-    );
-    for record in records {
-        payload.extend_from_slice(record);
-        payload.extend_from_slice(delimiter);
+/// The server-side encryption of a delivered object: SSE-KMS under
+/// `EncryptionConfiguration.KMSEncryptionConfig.AWSKMSKeyARN`, as Firehose
+/// writes it; otherwise (`NoEncryptionConfig`, or none) the bucket default.
+pub(crate) fn delivery_encryption(encryption_configuration: Option<&Value>) -> DeliveredEncryption {
+    match encryption_configuration
+        .and_then(|config| config["KMSEncryptionConfig"]["AWSKMSKeyARN"].as_str())
+        .filter(|arn| !arn.is_empty())
+    {
+        Some(arn) => DeliveredEncryption::SseKms {
+            key_id: Some(arn.to_owned()),
+        },
+        None => DeliveredEncryption::AsDelivered,
     }
-    Bytes::from(payload)
+}
+
+/// Firehose concatenates the raw record bytes, then compresses the whole
+/// payload as one stream. Producers supply any record delimiters unless
+/// `AppendDelimiterToRecord` adds `\n` after each record (before compression).
+pub(crate) fn encode_records(
+    records: &[Vec<u8>],
+    config: &OutputConfig<'_>,
+) -> std::io::Result<Bytes> {
+    let delimiter: &[u8] = if config.append_delimiter { b"\n" } else { b"" };
+    match config.compression {
+        Compression::Uncompressed => {
+            let mut payload = Vec::with_capacity(
+                records
+                    .iter()
+                    .map(|record| record.len() + delimiter.len())
+                    .sum(),
+            );
+            for record in records {
+                payload.extend_from_slice(record);
+                payload.extend_from_slice(delimiter);
+            }
+            Ok(Bytes::from(payload))
+        }
+        Compression::Gzip => {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            for record in records {
+                encoder.write_all(record)?;
+                encoder.write_all(delimiter)?;
+            }
+            Ok(Bytes::from(encoder.finish()?))
+        }
+    }
 }
 
 /// S3 keys are logical names, not filesystem paths. Do not normalize the prefix
@@ -60,7 +128,10 @@ pub(crate) fn object_key(
         config.prefix,
         oldest_arrival.format("%Y/%m/%d/%H"),
         delivery_time.format("%Y-%m-%d-%H-%M-%S"),
-        config.file_extension.unwrap_or_default(),
+        config
+            .file_extension
+            .filter(|extension| !extension.is_empty())
+            .unwrap_or_else(|| config.compression.extension()),
     )
 }
 
@@ -68,7 +139,31 @@ pub(crate) fn object_key(
 mod tests {
     use super::*;
     use chrono::{DateTime, Utc};
+    use std::io::Read;
     use uuid::Uuid;
+
+    #[test]
+    fn delivery_encryption_maps_kms_config_to_sse_kms() {
+        let arn = "arn:aws:kms:us-east-1:123456789012:key/stream-key";
+        assert_eq!(
+            delivery_encryption(Some(&serde_json::json!({
+                "KMSEncryptionConfig": {"AWSKMSKeyARN": arn}
+            }))),
+            DeliveredEncryption::SseKms {
+                key_id: Some(arn.to_owned())
+            }
+        );
+        for config in [
+            None,
+            Some(serde_json::json!({"NoEncryptionConfig": "NoEncryption"})),
+            Some(serde_json::json!({})),
+        ] {
+            assert_eq!(
+                delivery_encryption(config.as_ref()),
+                DeliveredEncryption::AsDelivered
+            );
+        }
+    }
 
     fn time(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)
@@ -76,11 +171,68 @@ mod tests {
             .with_timezone(&Utc)
     }
 
-    fn config(append_delimiter: bool) -> OutputConfig<'static> {
+    fn config(compression: Compression, append_delimiter: bool) -> OutputConfig<'static> {
         OutputConfig {
             prefix: "",
             file_extension: None,
+            compression,
             append_delimiter,
+        }
+    }
+
+    #[test]
+    fn only_implemented_compression_formats_parse() {
+        assert_eq!(
+            Compression::from_format("UNCOMPRESSED"),
+            Some(Compression::Uncompressed)
+        );
+        assert_eq!(Compression::from_format("GZIP"), Some(Compression::Gzip));
+        for unsupported in ["Snappy", "ZIP", "HADOOP_SNAPPY", "gzip", ""] {
+            assert_eq!(Compression::from_format(unsupported), None, "{unsupported}");
+        }
+    }
+
+    /// Decode exactly one GZIP member: a second member or trailing bytes after
+    /// the first member's trailer fail the assertion.
+    fn gunzip(encoded: &[u8]) -> Vec<u8> {
+        assert!(encoded.starts_with(&[0x1f, 0x8b, 8]));
+        let mut decoder = flate2::bufread::GzDecoder::new(encoded);
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert!(decoder.into_inner().is_empty(), "expected one GZIP member");
+        decoded
+    }
+
+    #[test]
+    fn gzip_encodes_a_single_stream_of_verbatim_binary_records() {
+        let binary: Vec<u8> = (0..70_000).map(|i| ((i * 31 + 7) % 256) as u8).collect();
+        let encoded = encode_records(
+            &[b"abc".to_vec(), b"def\n".to_vec(), binary.clone()],
+            &config(Compression::Gzip, false),
+        )
+        .unwrap();
+        let decoded = gunzip(&encoded);
+        assert_eq!(&decoded[..7], b"abcdef\n");
+        assert_eq!(&decoded[7..], binary);
+    }
+
+    #[test]
+    fn gzip_extensions_replace_the_default() {
+        let now = time("2026-10-12T09:00:00Z");
+        let uuid = Uuid::parse_str("12345678-1234-4234-8234-123456789abc").unwrap();
+        for (extension, suffix) in [
+            (None, ".gz"),
+            (Some(""), ".gz"),
+            (Some(".custom.log"), ".custom.log"),
+        ] {
+            let config = OutputConfig {
+                prefix: "",
+                file_extension: extension,
+                compression: Compression::Gzip,
+                append_delimiter: false,
+            };
+            assert_eq!(object_key("events", "1", &config, now, now, uuid), format!(
+                "2026/10/12/09/events-1-2026-10-12-09-00-00-12345678-1234-4234-8234-123456789abc{suffix}"));
         }
     }
 
@@ -89,26 +241,30 @@ mod tests {
         assert_eq!(
             encode_records(
                 &[b"abc".to_vec(), b"def\n".to_vec(), vec![0, 255]],
-                &config(false)
+                &config(Compression::Uncompressed, false)
             )
+            .unwrap()
             .as_ref(),
             b"abcdef\n\x00\xff"
         );
-        assert!(encode_records(&[vec![], vec![]], &config(false)).is_empty());
+        assert!(
+            encode_records(&[vec![], vec![]], &config(Compression::Uncompressed, false))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn append_delimiter_terminates_every_record() {
-        assert_eq!(
-            encode_records(
-                &[b"a".to_vec(), b"b\n".to_vec(), vec![0, 255]],
-                &config(true)
-            )
-            .as_ref(),
-            b"a\nb\n\n\x00\xff\n"
-        );
-        assert_eq!(encode_records(&[vec![]], &config(true)).as_ref(), b"\n");
-        assert!(encode_records(&[], &config(true)).is_empty());
+        let records = [b"a".to_vec(), b"b\n".to_vec(), vec![0, 255]];
+        let expected = b"a\nb\n\n\x00\xff\n";
+        let plain = config(Compression::Uncompressed, true);
+        assert_eq!(encode_records(&records, &plain).unwrap().as_ref(), expected);
+        assert_eq!(encode_records(&[vec![]], &plain).unwrap().as_ref(), b"\n");
+        assert!(encode_records(&[], &plain).unwrap().is_empty());
+        // The delimiter is part of the payload that GZIP compresses.
+        let gzip = config(Compression::Gzip, true);
+        assert_eq!(gunzip(&encode_records(&records, &gzip).unwrap()), expected);
     }
 
     #[test]
@@ -160,6 +316,7 @@ mod tests {
         let config = OutputConfig {
             prefix: "events/",
             file_extension: None,
+            compression: Compression::Uncompressed,
             append_delimiter: false,
         };
         let key = object_key(
@@ -181,7 +338,7 @@ mod tests {
             ("events", Some(""), "events2026/10/12/09/events-1-2026-10-12-09-00-00-12345678-1234-4234-8234-123456789abc"),
             ("events/", Some(".custom.log"), "events/2026/10/12/09/events-1-2026-10-12-09-00-00-12345678-1234-4234-8234-123456789abc.custom.log"),
         ] {
-            let config = OutputConfig { prefix, file_extension: extension, append_delimiter: false };
+            let config = OutputConfig { prefix, file_extension: extension, compression: Compression::Uncompressed, append_delimiter: false };
             let now = time("2026-10-12T09:00:00Z");
             assert_eq!(object_key("events", "1", &config, now, now,
                 Uuid::parse_str("12345678-1234-4234-8234-123456789abc").unwrap()), expected);

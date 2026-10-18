@@ -5,6 +5,173 @@ use aws_sdk_firehose::types::{
 };
 use fakecloud_testkit::TestServer;
 
+async fn assert_unsupported_admission(
+    client: &aws_sdk_firehose::Client,
+    name: &str,
+    setting: &str,
+) {
+    use aws_sdk_firehose::{primitives::Blob, types::Record};
+    let error = client
+        .put_record()
+        .delivery_stream_name(name)
+        .record(
+            Record::builder()
+                .data(Blob::new(b"reject"))
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(error.raw_response().unwrap().status().as_u16(), 400);
+    let error = error.as_service_error().unwrap();
+    assert_eq!(error.code(), Some("InvalidArgumentException"));
+    assert!(error.message().unwrap().contains(setting), "{error}");
+    let error = client
+        .put_record_batch()
+        .delivery_stream_name(name)
+        .records(
+            Record::builder()
+                .data(Blob::new(b"reject-batch"))
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(error.raw_response().unwrap().status().as_u16(), 400);
+    let error = error.as_service_error().unwrap();
+    assert_eq!(error.code(), Some("InvalidArgumentException"));
+    assert!(error.message().unwrap().contains(setting), "{error}");
+}
+
+#[tokio::test]
+async fn firehose_mixed_destinations_do_not_bypass_admission() {
+    use aws_sdk_firehose::types::{
+        HttpEndpointConfiguration, HttpEndpointDestinationConfiguration,
+    };
+    let server = TestServer::start().await;
+    let firehose = server.firehose_client().await;
+    let s3 = server.s3_client().await;
+    s3.create_bucket()
+        .bucket("compression-bucket")
+        .send()
+        .await
+        .unwrap();
+    s3.put_bucket_versioning()
+        .bucket("compression-bucket")
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    for add_s3_on_update in [false, true] {
+        let name = format!("mixed-{add_s3_on_update}");
+        let mut create = firehose
+            .create_delivery_stream()
+            .delivery_stream_name(&name)
+            .http_endpoint_destination_configuration(
+                HttpEndpointDestinationConfiguration::builder()
+                    .endpoint_configuration(
+                        HttpEndpointConfiguration::builder()
+                            .url("https://example.invalid/ingest")
+                            .build()
+                            .unwrap(),
+                    )
+                    .role_arn("arn:aws:iam::123456789012:role/fh")
+                    .build(),
+            );
+        if !add_s3_on_update {
+            create = create.extended_s3_destination_configuration(destination("UNCOMPRESSED"));
+        }
+        create.send().await.unwrap();
+        if add_s3_on_update {
+            let description = firehose
+                .describe_delivery_stream()
+                .delivery_stream_name(&name)
+                .send()
+                .await
+                .unwrap();
+            let description = description.delivery_stream_description().unwrap();
+            firehose
+                .update_destination()
+                .delivery_stream_name(&name)
+                .current_delivery_stream_version_id(description.version_id())
+                .destination_id(description.destinations()[0].destination_id())
+                .extended_s3_destination_update(
+                    ExtendedS3DestinationUpdate::builder()
+                        .role_arn("arn:aws:iam::123456789012:role/fh")
+                        .bucket_arn("arn:aws:s3:::compression-bucket")
+                        .build(),
+                )
+                .send()
+                .await
+                .unwrap();
+        }
+        assert_unsupported_admission(&firehose, &name, "HttpEndpointDestinationConfiguration")
+            .await;
+    }
+    let versions = s3
+        .list_object_versions()
+        .bucket("compression-bucket")
+        .send()
+        .await
+        .unwrap();
+    assert!(versions.versions().is_empty());
+    assert!(versions.delete_markers().is_empty());
+}
+
+#[tokio::test]
+async fn firehose_cfn_preserves_unsupported_settings_for_admission() {
+    use serde_json::json;
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let firehose = server.firehose_client().await;
+    for (i, setting) in [
+        json!({"CompressionFormat": "ZIP"}),
+        json!({"ProcessingConfiguration": {"Enabled": true, "Processors": [{"Type": "Lambda"}]}}),
+        json!({"DataFormatConversionConfiguration": {"Enabled": true}}),
+        json!({"DataFormatConversionConfiguration": {"SchemaConfiguration": {}}}),
+        json!({"DynamicPartitioningConfiguration": {"Enabled": true}}),
+        json!({"CustomTimeZone": "America/New_York"}),
+        json!({"S3BackupMode": "Enabled"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("unsupported-cfn-{i}");
+        let field = setting.as_object().unwrap().keys().next().unwrap();
+        let mut dest = json!({"RoleARN": "arn:aws:iam::123456789012:role/fh", "BucketARN": "arn:aws:s3:::missing"});
+        dest.as_object_mut()
+            .unwrap()
+            .extend(setting.as_object().unwrap().clone());
+        let template = json!({"Resources": {"Stream": {"Type": "AWS::KinesisFirehose::DeliveryStream", "Properties": {
+            "DeliveryStreamName": name, "ExtendedS3DestinationConfiguration": dest,
+        }}}});
+        cfn.create_stack()
+            .stack_name(&name)
+            .template_body(template.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_unsupported_admission(&firehose, &name, field).await;
+        // A CFN update retains the unsupported setting while changing another field.
+        let mut updated = template;
+        updated["Resources"]["Stream"]["Properties"]["ExtendedS3DestinationConfiguration"]
+            ["Prefix"] = json!("after/");
+        cfn.update_stack()
+            .stack_name(&name)
+            .template_body(updated.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_unsupported_admission(&firehose, &name, field).await;
+    }
+}
+
 fn destination(format: &str) -> ExtendedS3DestinationConfiguration {
     ExtendedS3DestinationConfiguration::builder()
         .role_arn("arn:aws:iam::123456789012:role/firehose")
@@ -338,6 +505,22 @@ async fn firehose_sdk_unknown_compression_rejected_without_mutation() {
 async fn firehose_sdk_all_valid_compression_values_round_trip() {
     let server = TestServer::start().await;
     let client = server.firehose_client().await;
+    let s3 = server.s3_client().await;
+    s3.create_bucket()
+        .bucket("compression-bucket")
+        .send()
+        .await
+        .unwrap();
+    s3.put_bucket_versioning()
+        .bucket("compression-bucket")
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
     for (format, updated_format) in [
         ("UNCOMPRESSED", "GZIP"),
         ("GZIP", "ZIP"),
@@ -368,6 +551,9 @@ async fn firehose_sdk_all_valid_compression_values_round_trip() {
                 .as_str(),
             format
         );
+        if ["ZIP", "Snappy", "HADOOP_SNAPPY"].contains(&format) {
+            assert_unsupported_admission(&client, &name, format).await;
+        }
         client
             .update_destination()
             .delivery_stream_name(&name)
@@ -395,5 +581,19 @@ async fn firehose_sdk_all_valid_compression_values_round_trip() {
             .unwrap();
         assert_eq!(s3.compression_format().as_str(), updated_format);
         assert_eq!(s3.prefix(), Some("after/"));
+        if ["ZIP", "Snappy", "HADOOP_SNAPPY"].contains(&updated_format) {
+            assert_unsupported_admission(&client, &name, updated_format).await;
+        }
     }
+    let versions = s3
+        .list_object_versions()
+        .bucket("compression-bucket")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        versions.versions().is_empty(),
+        "rejected settings must never write fallback objects"
+    );
+    assert!(versions.delete_markers().is_empty());
 }

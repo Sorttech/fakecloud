@@ -78,18 +78,21 @@ pub fn put_object_via_store_with_encryption(
     content_type: Option<&str>,
     encryption: DeliveredEncryption,
 ) -> Result<(), String> {
-    let bytes = Bytes::from(body);
-    let obj = S3Object {
-        key: key.to_string(),
-        content_type: content_type
-            .unwrap_or("application/octet-stream")
-            .to_string(),
-        etag: format!("{:x}", Md5::digest(&bytes)),
-        size: bytes.len() as u64,
-        ..Default::default()
-    };
-    put_delivered_object_with_encryption(state, store, account_id, bucket, obj, bytes, encryption)
-        .map(|_| ())
+    put_object_via_store_with_options(
+        state,
+        store,
+        DeliveryObjectRequest {
+            account: account_id,
+            bucket,
+            key,
+            body: Bytes::from(body),
+            options: DeliveryObjectOptions {
+                content_type: content_type.map(str::to_owned),
+                content_encoding: None,
+                encryption,
+            },
+        },
+    )
 }
 
 /// Write an object another service produced (a log export, a delivery
@@ -162,6 +165,65 @@ pub enum DeliveredEncryption {
     /// SSE-KMS under `key_id`, or the AWS-managed `aws/s3` key when `None`;
     /// the body is encrypted on the way in.
     SseKms { key_id: Option<String> },
+}
+
+/// Object metadata a producing service sets on a delivered object.
+#[derive(Clone, Debug, Default)]
+pub struct DeliveryObjectOptions {
+    /// `Content-Type`; `application/octet-stream` when `None`.
+    pub content_type: Option<String>,
+    /// `Content-Encoding` (e.g. `gzip` for a compressed Firehose batch).
+    pub content_encoding: Option<String>,
+    /// Server-side encryption; [`DeliveredEncryption::AsDelivered`] applies
+    /// the bucket's default encryption.
+    pub encryption: DeliveredEncryption,
+}
+
+/// One object to write with [`put_object_via_store_with_options`]; `body` is
+/// the plaintext.
+pub struct DeliveryObjectRequest<'a> {
+    pub account: &'a str,
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub body: Bytes,
+    pub options: DeliveryObjectOptions,
+}
+
+/// Metadata-aware form of [`put_object_via_store`], retaining the same
+/// versioning, Object Lock, and durable-write semantics. The single
+/// implementation behind every `put_object_via_store*` variant.
+pub fn put_object_via_store_with_options(
+    state: &SharedS3State,
+    store: Option<&dyn S3Store>,
+    request: DeliveryObjectRequest<'_>,
+) -> Result<(), String> {
+    let DeliveryObjectRequest {
+        account,
+        bucket,
+        key,
+        body,
+        options,
+    } = request;
+    let obj = S3Object {
+        key: key.to_string(),
+        content_type: options
+            .content_type
+            .unwrap_or_else(|| "application/octet-stream".to_string()),
+        content_encoding: options.content_encoding,
+        etag: format!("{:x}", Md5::digest(&body)),
+        size: body.len() as u64,
+        ..Default::default()
+    };
+    put_delivered_object_with_encryption(
+        state,
+        store,
+        account,
+        bucket,
+        obj,
+        body,
+        options.encryption,
+    )
+    .map(|_| ())
 }
 
 /// [`put_delivered_object`] with the encryption the producer asked for. See
@@ -410,6 +472,143 @@ mod tests {
     }
 
     #[test]
+    fn options_write_persists_encoding_and_canonical_body() {
+        use fakecloud_persistence::{s3::DiskS3Store, BodyRef, BucketMeta};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let disk = DiskS3Store::new(
+            tmp.path().join("s3"),
+            Arc::new(fakecloud_persistence::cache::BodyCache::new(1024)),
+        );
+        disk.put_bucket_meta(
+            "logs-bucket",
+            &BucketMeta {
+                name: "logs-bucket".to_owned(),
+                region: "us-east-1".to_owned(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let state = shared_state();
+        let body = Bytes::from_static(b"opaque encoded bytes");
+        put_object_via_store_with_options(
+            &state,
+            Some(&disk),
+            DeliveryObjectRequest {
+                account: ACCOUNT,
+                bucket: "logs-bucket",
+                key: "events.gz",
+                body: body.clone(),
+                options: DeliveryObjectOptions {
+                    content_type: Some("application/octet-stream".to_owned()),
+                    content_encoding: Some("gzip".to_owned()),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+        let accounts = state.read();
+        let object = &accounts.get(ACCOUNT).unwrap().buckets["logs-bucket"].objects["events.gz"];
+        assert!(matches!(object.body, BodyRef::Disk { .. }));
+        assert_eq!(object.size, body.len() as u64);
+        assert_eq!(object.etag, format!("{:x}", Md5::digest(&body)));
+        assert_eq!(object.content_encoding.as_deref(), Some("gzip"));
+        assert_eq!(object.storage_class, "STANDARD");
+        assert_eq!(disk.open_object_body(&object.body).unwrap(), body);
+        drop(accounts);
+
+        let loaded = disk.load().unwrap();
+        let object = &loaded.buckets["logs-bucket"].objects["events.gz"];
+        assert_eq!(object.meta.content_type, "application/octet-stream");
+        assert_eq!(object.meta.content_encoding.as_deref(), Some("gzip"));
+        assert_eq!(object.meta.storage_class, "STANDARD");
+        assert_eq!(object.meta.etag, format!("{:x}", Md5::digest(&body)));
+        assert_eq!(disk.open_object_body(&object.body).unwrap(), body);
+    }
+
+    #[test]
+    fn options_write_preserves_versioning_and_default_retention() {
+        let state = shared_state();
+        set_bucket(&state, |bucket| {
+            bucket.versioning = Some("Enabled".to_string());
+            bucket.object_lock_config = Some(
+                "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+                 <Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>1</Days>\
+                 </DefaultRetention></Rule></ObjectLockConfiguration>"
+                    .to_string(),
+            );
+        });
+        for body in [b"first".as_slice(), b"second".as_slice()] {
+            put_object_via_store_with_options(
+                &state,
+                None,
+                DeliveryObjectRequest {
+                    account: ACCOUNT,
+                    bucket: "logs-bucket",
+                    key: "events.gz",
+                    body: Bytes::copy_from_slice(body),
+                    options: DeliveryObjectOptions {
+                        content_type: None,
+                        content_encoding: Some("gzip".to_string()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap();
+        }
+        let bucket = bucket(&state);
+        let versions = &bucket.object_versions["events.gz"];
+        assert_eq!(versions.len(), 2);
+        assert_ne!(versions[0].version_id, versions[1].version_id);
+        for (object, body) in versions
+            .iter()
+            .zip([b"first".as_slice(), b"second".as_slice()])
+        {
+            assert_eq!(object.content_encoding.as_deref(), Some("gzip"));
+            assert_eq!(object.lock_mode.as_deref(), Some("GOVERNANCE"));
+            assert!(object.lock_retain_until.is_some());
+            assert_eq!(read(&state, &object.body), body);
+        }
+        assert_eq!(
+            bucket.objects["events.gz"].version_id,
+            versions[1].version_id
+        );
+    }
+
+    #[test]
+    fn options_write_failure_does_not_publish_memory_success() {
+        use fakecloud_persistence::s3::DiskS3Store;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocked = tmp.path().join("not-a-directory");
+        std::fs::write(&blocked, b"blocks staging").unwrap();
+        let disk = DiskS3Store::new(
+            blocked,
+            Arc::new(fakecloud_persistence::cache::BodyCache::new(1024)),
+        );
+        let state = shared_state();
+        let result = put_object_via_store_with_options(
+            &state,
+            Some(&disk),
+            DeliveryObjectRequest {
+                account: ACCOUNT,
+                bucket: "logs-bucket",
+                key: "events.gz",
+                body: Bytes::from_static(b"encoded bytes"),
+                options: DeliveryObjectOptions {
+                    content_type: None,
+                    content_encoding: Some("gzip".to_owned()),
+                    ..Default::default()
+                },
+            },
+        );
+        assert!(result.is_err());
+        assert!(state.read().get(ACCOUNT).unwrap().buckets["logs-bucket"]
+            .objects
+            .is_empty());
+    }
+
+    #[test]
     fn put_object_writes_to_bucket() {
         let state = shared_state();
         let delivery = S3DeliveryImpl::new(state.clone());
@@ -428,6 +627,8 @@ mod tests {
         let obj = bucket.objects.get("exports/run-1.txt").unwrap();
         assert_eq!(obj.size, 11);
         assert_eq!(obj.content_type, "text/plain");
+        assert_eq!(obj.content_encoding, None);
+        assert_eq!(obj.storage_class, "STANDARD");
         assert!(!obj.etag.is_empty());
     }
 
@@ -1363,6 +1564,46 @@ mod tests {
             assert_eq!(obj.sse_kms_key_id.as_deref(), kms_key, "{key}");
             assert_eq!(read(&state, &obj.body), stored, "{key}");
         }
+    }
+
+    /// The options form carries SSE-KMS alongside the content encoding: the
+    /// body is encrypted under the requested key and the gzip metadata kept.
+    #[test]
+    fn options_write_applies_requested_sse_kms_with_content_encoding() {
+        let state = shared_state();
+        let _svc = with_s3_service(
+            &state,
+            Arc::new(SqsRecorder::default()),
+            Some(Arc::new(ReadableKms)),
+        );
+        put_object_via_store_with_options(
+            &state,
+            None,
+            DeliveryObjectRequest {
+                account: ACCOUNT,
+                bucket: "logs-bucket",
+                key: "events.gz",
+                body: Bytes::from_static(b"gz"),
+                options: DeliveryObjectOptions {
+                    content_type: None,
+                    content_encoding: Some("gzip".to_owned()),
+                    encryption: DeliveredEncryption::SseKms {
+                        key_id: Some("stream-key".to_owned()),
+                    },
+                },
+            },
+        )
+        .unwrap();
+        let obj = &bucket(&state).objects["events.gz"];
+        assert_eq!(obj.sse_algorithm.as_deref(), Some("aws:kms"));
+        assert_eq!(
+            obj.sse_kms_key_id.as_deref(),
+            Some("arn:aws:kms:us-east-1:123456789012:key/stream-key")
+        );
+        assert_eq!(obj.content_encoding.as_deref(), Some("gzip"));
+        assert_eq!(obj.content_type, "application/octet-stream");
+        assert_eq!(obj.size, 2);
+        assert_eq!(read(&state, &obj.body), b"enc:stream-key:gz");
     }
 
     /// The delivered object is committed before it is replicated, so a

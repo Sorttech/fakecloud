@@ -1,3 +1,4 @@
+use aws_sdk_firehose::error::ProvideErrorMetadata;
 use aws_sdk_firehose::primitives::Blob;
 use aws_sdk_firehose::types::{
     BufferingHints, DeliveryStreamType, ExtendedS3DestinationConfiguration,
@@ -1083,7 +1084,7 @@ async fn firehose_append_delimiter_to_record_processor() {
     .await
     .unwrap();
     put_batch(&[b"c", b"d"]).await.unwrap();
-    // Version 3: re-enabled alongside a Lambda processor -> only the delimiter.
+    // Version 3: enabled Lambda processing must not be silently skipped.
     update(
         ProcessingConfiguration::builder()
             .enabled(true)
@@ -1106,7 +1107,18 @@ async fn firehose_append_delimiter_to_record_processor() {
     )
     .await
     .unwrap();
-    put_batch(&[b"e"]).await.unwrap();
+    let error = put_batch(&[b"e"]).await.unwrap_err();
+    assert_eq!(error.raw_response().unwrap().status().as_u16(), 400);
+    assert_eq!(
+        error.as_service_error().unwrap().code(),
+        Some("InvalidArgumentException")
+    );
+    assert!(error
+        .as_service_error()
+        .unwrap()
+        .message()
+        .unwrap()
+        .contains("ProcessingConfiguration"));
 
     let s3 = server.s3_client().await;
     let listing = s3
@@ -1115,12 +1127,8 @@ async fn firehose_append_delimiter_to_record_processor() {
         .send()
         .await
         .unwrap();
-    assert_eq!(listing.contents().len(), 3);
-    for (version, expected) in [
-        ("1", &b"a\nb\n\n\x00\xff\n"[..]),
-        ("2", &b"cd"[..]),
-        ("3", &b"e\n"[..]),
-    ] {
+    assert_eq!(listing.contents().len(), 2);
+    for (version, expected) in [("1", &b"a\nb\n\n\x00\xff\n"[..]), ("2", &b"cd"[..])] {
         let key = listing
             .contents()
             .iter()
