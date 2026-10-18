@@ -4387,7 +4387,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -4524,7 +4524,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-account"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4544,7 +4544,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-acm"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4571,7 +4571,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-acmpca"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4599,7 +4599,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-amplify"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4620,7 +4620,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-apigateway"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4648,7 +4648,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-apigatewayv2"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -4676,7 +4676,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-appconfig"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4697,7 +4697,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-application-autoscaling"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4718,7 +4718,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-appsync"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4741,7 +4741,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-athena"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4767,7 +4767,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-autoscaling"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4787,7 +4787,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-aws"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -4805,7 +4805,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-backup"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4826,7 +4826,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-batch"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4846,7 +4846,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-bedrock"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -4870,7 +4870,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-bedrock-agent"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4890,7 +4890,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-bedrock-agent-runtime"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4914,7 +4914,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-ce"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4934,7 +4934,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-cloudcontrol"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4954,7 +4954,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-cloudformation"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5044,7 +5044,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-cloudfront"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -5073,7 +5073,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-cloudtrail"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5093,7 +5093,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-cloudwatch"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5116,7 +5116,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-codeartifact"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5140,7 +5140,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-codebuild"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5167,7 +5167,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-codecommit"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5191,7 +5191,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-codeconnections"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5211,7 +5211,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-codedeploy"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5231,7 +5231,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-codepipeline"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5251,7 +5251,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-cognito"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5281,7 +5281,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-comprehend"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5302,7 +5302,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-config"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5326,7 +5326,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-conformance"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "aws-config",
  "aws-credential-types",
@@ -5403,7 +5403,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-conformance-checksum"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "serde_json",
  "sha2 0.11.0",
@@ -5411,7 +5411,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-conformance-macros"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "fakecloud-conformance-checksum",
  "proc-macro2",
@@ -5422,7 +5422,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-core"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -5452,7 +5452,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-dms"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5474,7 +5474,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-docdb"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5495,7 +5495,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-dsql"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5514,7 +5514,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-dynamodb"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5541,7 +5541,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-e2e"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "aws-config",
  "aws-credential-types",
@@ -5664,7 +5664,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-ec2"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5690,7 +5690,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-ecr"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5718,7 +5718,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-ecs"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5751,7 +5751,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-efs"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5775,7 +5775,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-eks"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5798,7 +5798,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-elasticache"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5823,7 +5823,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-elasticbeanstalk"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5842,7 +5842,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-elbv2"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5870,7 +5870,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-emr"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5890,7 +5890,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-eventbridge"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5914,7 +5914,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-firehose"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5938,7 +5938,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-fis"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5960,7 +5960,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-glacier"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5982,7 +5982,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-glue"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6003,7 +6003,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-iam"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6028,7 +6028,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-identitystore"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6048,7 +6048,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-iot"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6069,7 +6069,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-iotdata"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6089,7 +6089,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-iotwireless"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6110,7 +6110,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-k8s"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -6127,7 +6127,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-kafka"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6150,7 +6150,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-kinesis"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6173,7 +6173,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-kinesisanalyticsv2"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6195,7 +6195,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-kms"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -6226,7 +6226,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-lakeformation"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6247,7 +6247,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-lambda"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6280,7 +6280,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-logs"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6304,7 +6304,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-managedblockchain"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6326,7 +6326,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-mediaconvert"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6347,7 +6347,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-memorydb"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6368,7 +6368,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-mq"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6392,7 +6392,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-mwaa"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6413,7 +6413,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-neptune"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6434,7 +6434,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-opensearch"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6456,7 +6456,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-organizations"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6476,7 +6476,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-parity"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "aws-config",
  "aws-credential-types",
@@ -6495,7 +6495,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-persistence"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -6513,7 +6513,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-pinpoint"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6535,7 +6535,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-pipes"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6552,7 +6552,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-ram"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6573,7 +6573,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-rds"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6602,7 +6602,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-rds-data"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6623,7 +6623,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-redshift"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6645,7 +6645,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-resource-groups"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6665,7 +6665,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-resource-groups-tagging"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6683,7 +6683,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-route53"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6711,7 +6711,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-route53resolver"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6732,7 +6732,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-s3"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "aws-smithy-eventstream",
@@ -6774,7 +6774,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-s3tables"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6795,7 +6795,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-sagemaker"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6815,7 +6815,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-scheduler"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6838,7 +6838,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-sdk"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "percent-encoding",
  "reqwest",
@@ -6849,7 +6849,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-secretsmanager"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6870,7 +6870,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-serverlessrepo"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6892,7 +6892,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-servicediscovery"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6912,7 +6912,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-servicequotas"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6935,7 +6935,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-ses"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6962,7 +6962,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-shield"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6982,7 +6982,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-sns"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -7009,7 +7009,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-sqs"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -7032,7 +7032,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-ssm"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -7057,7 +7057,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-ssoadmin"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -7077,7 +7077,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-stepfunctions"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -7103,7 +7103,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-support"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -7126,7 +7126,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-swf"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -7147,7 +7147,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-testkit"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "aws-config",
  "aws-credential-types",
@@ -7218,7 +7218,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-textract"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -7238,7 +7238,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-tfacc"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "fakecloud-testkit",
  "tokio",
@@ -7246,7 +7246,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-timestream"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -7268,7 +7268,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-transcribe"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -7289,7 +7289,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-transfer"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -7310,7 +7310,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-translate"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -7332,7 +7332,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-verifiedpermissions"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -7355,7 +7355,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-wafv2"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -7377,7 +7377,7 @@ dependencies = [
 
 [[package]]
 name = "fakecloud-xray"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "async-trait",
  "bytes",
