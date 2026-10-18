@@ -1,7 +1,7 @@
 use aws_sdk_firehose::primitives::Blob;
 use aws_sdk_firehose::types::{
-    CompressionFormat, ExtendedS3DestinationConfiguration, ProcessingConfiguration, Processor,
-    ProcessorType, Record,
+    CompressionFormat, ExtendedS3DestinationConfiguration, ExtendedS3DestinationUpdate,
+    ProcessingConfiguration, Processor, ProcessorType, Record,
 };
 use aws_sdk_s3::types::ChecksumMode;
 use fakecloud_testkit::TestServer;
@@ -158,7 +158,7 @@ async fn firehose_snappy_binary_multiblock_and_extension_overrides() {
 }
 
 /// `AppendDelimiterToRecord` adds `\n` after every record before compression.
-/// The delimiter is ordinary payload for Snappy's 32 KiB block window, so it
+/// The delimiter is ordinary payload in Snappy's 32 KiB input blocks, so it
 /// can close a block instead of starting a new one.
 #[tokio::test]
 async fn firehose_snappy_delimiters_share_block_windows() {
@@ -215,6 +215,65 @@ async fn firehose_snappy_delimiters_share_block_windows() {
     assert_eq!(blocks.iter().map(Vec::len).collect::<Vec<_>>(), [32768, 5]);
     assert_eq!(blocks[0][32767], b'\n');
     assert_eq!(blocks[1], b"y\n\x00\xff\n");
+}
+
+/// Delivery reads the stream's current destination, so switching an
+/// uncompressed stream to `Snappy` changes the next object's encoding.
+#[tokio::test]
+async fn firehose_update_destination_switches_delivery_to_snappy() {
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let firehose = server.firehose_client().await;
+    let bucket = "fh-snappy-updated";
+    s3.create_bucket().bucket(bucket).send().await.unwrap();
+    firehose
+        .create_delivery_stream()
+        .delivery_stream_name("snappy-updated")
+        .extended_s3_destination_configuration(
+            ExtendedS3DestinationConfiguration::builder()
+                .role_arn("arn:aws:iam::123456789012:role/firehose")
+                .bucket_arn(format!("arn:aws:s3:::{bucket}"))
+                .compression_format(CompressionFormat::Uncompressed)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let described = firehose
+        .describe_delivery_stream()
+        .delivery_stream_name("snappy-updated")
+        .send()
+        .await
+        .unwrap();
+    let description = described.delivery_stream_description().unwrap();
+    firehose
+        .update_destination()
+        .delivery_stream_name("snappy-updated")
+        .current_delivery_stream_version_id(description.version_id())
+        .destination_id(description.destinations()[0].destination_id())
+        .extended_s3_destination_update(
+            ExtendedS3DestinationUpdate::builder()
+                .compression_format(CompressionFormat::Snappy)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    firehose
+        .put_record()
+        .delivery_stream_name("snappy-updated")
+        .record(
+            Record::builder()
+                .data(Blob::new(b"after update"))
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let (_, _, decoded) = snappy_object(&s3, bucket, ".snappy").await;
+    assert_eq!(decoded, b"after update");
 }
 
 #[tokio::test]
