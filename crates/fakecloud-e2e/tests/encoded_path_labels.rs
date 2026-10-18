@@ -107,17 +107,28 @@ async fn lambda_tags_with_encoded_function_arn() {
 async fn batch_tags_with_encoded_arn() {
     let server = TestServer::start().await;
     let batch = aws_sdk_batch::Client::new(&server.aws_config().await);
-    let arn = "arn:aws:batch:us-east-1:123456789012:job-queue/encoded-q";
+    // Tags attach only to a resource that exists, so create one first; its
+    // ARN carries a `/` that the client percent-encodes into the label.
+    let arn = batch
+        .create_scheduling_policy()
+        .name("encoded-policy")
+        .send()
+        .await
+        .unwrap()
+        .arn()
+        .unwrap()
+        .to_string();
+    assert!(arn.contains('/'), "{arn}");
     batch
         .tag_resource()
-        .resource_arn(arn)
+        .resource_arn(&arn)
         .set_tags(Some(one_tag()))
         .send()
         .await
         .unwrap();
     let out = batch
         .list_tags_for_resource()
-        .resource_arn(arn)
+        .resource_arn(&arn)
         .send()
         .await
         .unwrap();
