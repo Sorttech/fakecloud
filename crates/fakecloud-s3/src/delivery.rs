@@ -190,13 +190,32 @@ pub struct DeliveryObjectRequest<'a> {
 }
 
 /// Metadata-aware form of [`put_object_via_store`], retaining the same
-/// versioning, Object Lock, and durable-write semantics. The single
-/// implementation behind every `put_object_via_store*` variant.
+/// versioning, Object Lock, and durable-write semantics: the unguarded
+/// [`put_object_via_store_guarded`], which every `put_object_via_store*`
+/// variant goes through.
 pub fn put_object_via_store_with_options(
     state: &SharedS3State,
     store: Option<&dyn S3Store>,
     request: DeliveryObjectRequest<'_>,
 ) -> Result<(), String> {
+    put_object_via_store_guarded(state, store, request, || Some(())).map(|_| ())
+}
+
+/// Metadata-aware delivery that stages outside the producer/S3 guards, then
+/// pins the producer's configuration through the versioned durable commit and
+/// in-memory publication, with the same versioning, Object Lock, encryption,
+/// and durable-write semantics as [`put_object_via_store`].
+///
+/// Lock order: `before_commit` runs, and its guard is taken, before the S3
+/// write lock; both are released before notifications are dispatched. Callers
+/// must never take the guard's lock while holding S3 state, and returning
+/// `None` cancels the write with nothing published.
+pub fn put_object_via_store_guarded<G>(
+    state: &SharedS3State,
+    store: Option<&dyn S3Store>,
+    request: DeliveryObjectRequest<'_>,
+    before_commit: impl FnOnce() -> Option<G>,
+) -> Result<DeliveryWriteOutcome, String> {
     let DeliveryObjectRequest {
         account,
         bucket,
@@ -214,7 +233,7 @@ pub fn put_object_via_store_with_options(
         size: body.len() as u64,
         ..Default::default()
     };
-    put_delivered_object_with_encryption(
+    put_delivered_object_guarded(
         state,
         store,
         account,
@@ -222,8 +241,9 @@ pub fn put_object_via_store_with_options(
         obj,
         body,
         options.encryption,
+        before_commit,
     )
-    .map(|_| ())
+    .map(|(outcome, _)| outcome)
 }
 
 /// [`put_delivered_object`] with the encryption the producer asked for. See
@@ -233,12 +253,65 @@ pub fn put_delivered_object_with_encryption(
     store: Option<&dyn S3Store>,
     account_id: &str,
     bucket: &str,
-    mut obj: S3Object,
+    obj: S3Object,
     body: Bytes,
     encryption: DeliveredEncryption,
 ) -> Result<Option<String>, String> {
+    put_delivered_object_guarded(
+        state,
+        store,
+        account_id,
+        bucket,
+        obj,
+        body,
+        encryption,
+        || Some(()),
+    )
+    .map(|(_, version)| version)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeliveryWriteOutcome {
+    Committed,
+    Cancelled,
+}
+
+fn missing_bucket(account_id: &str, bucket: &str) -> String {
+    format!("bucket {bucket} not found in account {account_id}")
+}
+
+/// Cheap destination existence check under a read guard. Producers can call it
+/// before expensive body encoding; the write path repeats it, and the commit
+/// re-resolves the bucket under the write guard.
+pub fn ensure_delivery_bucket(
+    state: &SharedS3State,
+    account_id: &str,
+    bucket: &str,
+) -> Result<(), String> {
+    let exists = state
+        .read()
+        .get(account_id)
+        .is_some_and(|s| s.buckets.contains_key(bucket));
+    if exists {
+        Ok(())
+    } else {
+        Err(missing_bucket(account_id, bucket))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn put_delivered_object_guarded<G>(
+    state: &SharedS3State,
+    store: Option<&dyn S3Store>,
+    account_id: &str,
+    bucket: &str,
+    mut obj: S3Object,
+    body: Bytes,
+    encryption: DeliveredEncryption,
+    before_commit: impl FnOnce() -> Option<G>,
+) -> Result<(DeliveryWriteOutcome, Option<String>), String> {
     let key = obj.key.clone();
-    let missing = || format!("bucket {bucket} not found in account {account_id}");
+    let missing = || missing_bucket(account_id, bucket);
 
     // Cheap existence check under a read guard, so a delivery to a missing
     // bucket never touches the disk; it also reads what the write needs from
@@ -343,6 +416,9 @@ pub fn put_delivered_object_with_encryption(
         crate::service::run_blocking_io(|| crate::body_io::SpooledBody::spool(store, body.clone()))
             .map_err(|e| format!("failed to stage object {key} for bucket {bucket}: {e}"))?;
 
+    let Some(commit_guard) = before_commit() else {
+        return Ok((DeliveryWriteOutcome::Cancelled, None));
+    };
     obj.body = memory_body(body);
     if obj.storage_class.is_empty() {
         obj.storage_class = "STANDARD".to_string();
@@ -354,7 +430,7 @@ pub fn put_delivered_object_with_encryption(
 
     let committed = {
         let mut accounts = state.write();
-        let acct = accounts.get_or_create(account_id);
+        let acct = accounts.get_mut(account_id).ok_or_else(missing)?;
         let bucket_ref = acct.buckets.get_mut(bucket).ok_or_else(missing)?;
         // The bucket owner owns a delivered object, with the default private ACL.
         if obj.acl_owner_id.is_none() {
@@ -389,6 +465,9 @@ pub fn put_delivered_object_with_encryption(
         .map_err(|e| format!("failed to persist object {key} to bucket {bucket}: {e}"))?
     };
 
+    // Notification fanout may re-enter the producer. Neither its configuration
+    // guard nor the S3 write lock may be held across those callbacks.
+    drop(commit_guard);
     // Notifications go out with the S3 lock released, as for PutObject.
     if let Some(effects) = &effects {
         committed.notify(
@@ -402,7 +481,7 @@ pub fn put_delivered_object_with_encryption(
             &etag,
         );
     }
-    Ok(committed.version_id)
+    Ok((DeliveryWriteOutcome::Committed, committed.version_id))
 }
 
 impl S3Delivery for S3DeliveryImpl {
@@ -469,6 +548,243 @@ mod tests {
             S3Bucket::new("logs-bucket", "us-east-1", "owner-id"),
         );
         Arc::new(RwLock::new(mas))
+    }
+
+    fn disk_store(tmp: &tempfile::TempDir) -> fakecloud_persistence::s3::DiskS3Store {
+        let disk = fakecloud_persistence::s3::DiskS3Store::new(
+            tmp.path().join("s3"),
+            Arc::new(fakecloud_persistence::cache::BodyCache::new(1024)),
+        );
+        disk.put_bucket_meta(
+            "logs-bucket",
+            &fakecloud_persistence::BucketMeta {
+                name: "logs-bucket".into(),
+                region: "us-east-1".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        disk
+    }
+
+    fn guarded_request() -> DeliveryObjectRequest<'static> {
+        DeliveryObjectRequest {
+            account: ACCOUNT,
+            bucket: "logs-bucket",
+            key: "events.gz",
+            body: Bytes::from_static(b"encoded payload"),
+            options: DeliveryObjectOptions {
+                content_type: Some("application/octet-stream".into()),
+                content_encoding: Some("gzip".into()),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn staged_path(disk: &dyn S3Store) -> std::path::PathBuf {
+        let paths: Vec<_> = std::fs::read_dir(disk.spool_dir().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(paths.len(), 1, "callback must run after real staging");
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), b"encoded payload");
+        paths[0].clone()
+    }
+
+    #[test]
+    fn guarded_write_carries_encoding_and_durability() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let disk = disk_store(&tmp);
+        let state = shared_state();
+        let outcome = put_object_via_store_guarded(&state, Some(&disk), guarded_request(), || {
+            assert!(state.try_write().is_some(), "staging holds no S3 guard");
+            staged_path(&disk);
+            Some(())
+        })
+        .unwrap();
+        assert_eq!(outcome, DeliveryWriteOutcome::Committed);
+        let accounts = state.read();
+        let object = &accounts.get(ACCOUNT).unwrap().buckets["logs-bucket"].objects["events.gz"];
+        assert!(matches!(
+            object.body,
+            fakecloud_persistence::BodyRef::Disk { .. }
+        ));
+        assert_eq!(object.content_encoding.as_deref(), Some("gzip"));
+        assert_eq!(object.size, 15);
+        assert_eq!(
+            disk.open_object_body(&object.body).unwrap(),
+            b"encoded payload"[..]
+        );
+        drop(accounts);
+        let reloaded = disk_store(&tmp).load().unwrap();
+        let object = &reloaded.buckets["logs-bucket"].objects["events.gz"];
+        assert_eq!(object.meta.content_encoding.as_deref(), Some("gzip"));
+        assert_eq!(object.meta.content_type, "application/octet-stream");
+        assert_eq!(object.meta.storage_class, "STANDARD");
+        assert_eq!(
+            disk.open_object_body(&object.body).unwrap(),
+            b"encoded payload"[..]
+        );
+    }
+
+    #[test]
+    fn cancelled_commit_publishes_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let disk = disk_store(&tmp);
+        let state = shared_state();
+        let sqs = Arc::new(SqsRecorder::default());
+        let _svc = with_s3_service(&state, sqs.clone(), None);
+        set_bucket(&state, |bucket| {
+            bucket.versioning = Some("Enabled".to_string());
+            bucket.notification_config = Some(
+                "<NotificationConfiguration><QueueConfiguration>\
+                 <Queue>arn:aws:sqs:us-east-1:123456789012:q</Queue>\
+                 <Event>s3:ObjectCreated:*</Event></QueueConfiguration>\
+                 </NotificationConfiguration>"
+                    .to_string(),
+            );
+            bucket.replication_config = Some(
+                "<ReplicationConfiguration><Rule><Priority>1</Priority><Status>Enabled</Status>\
+                 <Filter><Prefix></Prefix></Filter>\
+                 <Destination><Bucket>arn:aws:s3:::replica-bucket</Bucket></Destination>\
+                 </Rule></ReplicationConfiguration>"
+                    .to_string(),
+            );
+        });
+        let mut replica = S3Bucket::new("replica-bucket", "us-east-1", "owner-id");
+        replica.versioning = Some("Enabled".to_string());
+        state
+            .write()
+            .get_mut(ACCOUNT)
+            .unwrap()
+            .buckets
+            .insert("replica-bucket".to_string(), replica);
+        let mut staged = None;
+        let outcome = put_object_via_store_guarded(&state, Some(&disk), guarded_request(), || {
+            staged = Some(staged_path(&disk));
+            assert!(state.try_write().is_some());
+            None::<()>
+        })
+        .unwrap();
+        assert_eq!(outcome, DeliveryWriteOutcome::Cancelled);
+        assert!(!staged.unwrap().exists());
+        assert!(state.read().get(ACCOUNT).unwrap().buckets["logs-bucket"]
+            .objects
+            .is_empty());
+        assert!(disk.load().unwrap().buckets["logs-bucket"]
+            .objects
+            .is_empty());
+        let accounts = state.read();
+        for name in ["logs-bucket", "replica-bucket"] {
+            let bucket = &accounts.get(ACCOUNT).unwrap().buckets[name];
+            assert!(bucket.objects.is_empty());
+            assert!(bucket.object_versions.is_empty());
+        }
+        assert!(
+            sqs.0.lock().unwrap().is_empty(),
+            "cancelled writes emit no event"
+        );
+    }
+
+    #[test]
+    fn account_removed_after_staging_fails_without_recreating_it() {
+        const OTHER: &str = "210987654321";
+        let tmp = tempfile::TempDir::new().unwrap();
+        let disk = disk_store(&tmp);
+        let mut accounts: MultiAccountState<S3State> =
+            MultiAccountState::new(ACCOUNT, "us-east-1", "http://localhost");
+        accounts.get_or_create(OTHER).buckets.insert(
+            "logs-bucket".to_string(),
+            S3Bucket::new("logs-bucket", "us-east-1", "owner-id"),
+        );
+        let state: SharedS3State = Arc::new(RwLock::new(accounts));
+        let mut staged = None;
+        let request = DeliveryObjectRequest {
+            account: OTHER,
+            ..guarded_request()
+        };
+        let error = put_object_via_store_guarded(&state, Some(&disk), request, || {
+            staged = Some(staged_path(&disk));
+            // A reset between staging and commit drops every non-default account.
+            state.write().reset();
+            Some(())
+        })
+        .unwrap_err();
+        assert!(error.contains(OTHER), "{error}");
+        assert!(
+            state.read().get(OTHER).is_none(),
+            "the commit must not recreate a removed account"
+        );
+        assert!(!staged.unwrap().exists(), "staged body is cleaned up");
+    }
+
+    #[test]
+    fn failed_store_does_not_publish_memory_success() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let disk = disk_store(&tmp);
+        let state = shared_state();
+        let mut staged = None;
+        let result = put_object_via_store_guarded(&state, Some(&disk), guarded_request(), || {
+            staged = Some(staged_path(&disk));
+            // Staging succeeds; the actual disk commit cannot create its object directory.
+            std::fs::write(
+                tmp.path().join("s3/buckets/logs-bucket/objects"),
+                b"blocked",
+            )
+            .unwrap();
+            Some(())
+        });
+        assert!(result.unwrap_err().contains("failed to persist"));
+        assert!(!staged.unwrap().exists());
+        assert!(state.read().get(ACCOUNT).unwrap().buckets["logs-bucket"]
+            .objects
+            .is_empty());
+        std::fs::remove_file(tmp.path().join("s3/buckets/logs-bucket/objects")).unwrap();
+        assert!(disk.load().unwrap().buckets["logs-bucket"]
+            .objects
+            .is_empty());
+    }
+
+    #[test]
+    fn bucket_removed_after_staging_cleans_up_without_committing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let disk = disk_store(&tmp);
+        let state = shared_state();
+        let mut staged = None;
+        let result = put_object_via_store_guarded(&state, Some(&disk), guarded_request(), || {
+            staged = Some(staged_path(&disk));
+            state.write().get_or_create(ACCOUNT).buckets.clear();
+            Some(())
+        });
+        assert!(result.unwrap_err().contains("not found"));
+        assert!(!staged.unwrap().exists());
+        assert!(disk.load().unwrap().buckets["logs-bucket"]
+            .objects
+            .is_empty());
+    }
+
+    #[test]
+    fn returned_guard_lives_through_memory_publication() {
+        struct PublicationGuard(SharedS3State);
+        impl Drop for PublicationGuard {
+            fn drop(&mut self) {
+                let state = self
+                    .0
+                    .try_read()
+                    .expect("producer guard dropped before S3 publication finished");
+                assert!(state.get(ACCOUNT).unwrap().buckets["logs-bucket"]
+                    .objects
+                    .contains_key("events.gz"));
+            }
+        }
+        let state = shared_state();
+        assert_eq!(
+            put_object_via_store_guarded(&state, None, guarded_request(), || Some(
+                PublicationGuard(state.clone())
+            ),)
+            .unwrap(),
+            DeliveryWriteOutcome::Committed
+        );
     }
 
     #[test]
@@ -640,6 +956,32 @@ mod tests {
             .put_object(ACCOUNT, "ghost", "k", b"x".to_vec(), None)
             .expect_err("missing bucket");
         assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn ensure_delivery_bucket_matches_write_path_error() {
+        let state = shared_state();
+        assert_eq!(
+            ensure_delivery_bucket(&state, ACCOUNT, "logs-bucket"),
+            Ok(())
+        );
+        let expected = format!("bucket ghost not found in account {ACCOUNT}");
+        assert_eq!(
+            ensure_delivery_bucket(&state, ACCOUNT, "ghost"),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            ensure_delivery_bucket(&state, "999999999999", "logs-bucket"),
+            Err("bucket logs-bucket not found in account 999999999999".to_string())
+        );
+        let mut request = guarded_request();
+        request.bucket = "ghost";
+        assert_eq!(
+            put_object_via_store_guarded(&state, None, request, || -> Option<()> {
+                panic!("a missing bucket must fail before authorization")
+            }),
+            Err(expected)
+        );
     }
 
     /// Regression (bug-hunt Tier 0 side-channel-persistence): a delivered object
@@ -1317,6 +1659,70 @@ mod tests {
             Some(hook) => svc.with_kms_hook(hook),
             None => svc,
         }
+    }
+
+    /// Notification callbacks may reconfigure the producer or write to S3.
+    /// Neither guard may remain held when the callback runs.
+    #[test]
+    fn guarded_write_releases_producer_and_s3_locks_before_notification() {
+        struct NotificationLockProbe {
+            producer_configuration: Arc<RwLock<()>>,
+            state: SharedS3State,
+            fired: std::sync::atomic::AtomicBool,
+        }
+
+        impl fakecloud_core::delivery::SqsDelivery for NotificationLockProbe {
+            fn deliver_to_queue(
+                &self,
+                queue_arn: &str,
+                message_body: &str,
+                _attributes: &std::collections::HashMap<String, String>,
+            ) {
+                let producer_released = self.producer_configuration.try_write().is_some();
+                let s3_released = self.state.try_write().is_some();
+                assert!(s3_released, "notification holds the S3 state guard");
+                assert!(
+                    producer_released,
+                    "notification holds the producer configuration guard"
+                );
+                assert_eq!(queue_arn, "arn:aws:sqs:us-east-1:123456789012:q");
+                let event: serde_json::Value = serde_json::from_str(message_body).unwrap();
+                assert_eq!(event["Records"][0]["eventName"], "ObjectCreated:Put");
+                assert_eq!(event["Records"][0]["s3"]["object"]["key"], "events.gz");
+                assert!(
+                    self.state.read().get(ACCOUNT).unwrap().buckets["logs-bucket"]
+                        .objects
+                        .contains_key("events.gz")
+                );
+                self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let state = shared_state();
+        let producer_configuration = Arc::new(RwLock::new(()));
+        let probe = Arc::new(NotificationLockProbe {
+            producer_configuration: producer_configuration.clone(),
+            state: state.clone(),
+            fired: std::sync::atomic::AtomicBool::new(false),
+        });
+        let bus = Arc::new(fakecloud_core::delivery::DeliveryBus::new().with_sqs(probe.clone()));
+        let _svc = crate::service::S3Service::new(state.clone(), bus);
+        set_bucket(&state, |bucket| {
+            bucket.notification_config = Some(
+                "<NotificationConfiguration><QueueConfiguration>\
+                 <Queue>arn:aws:sqs:us-east-1:123456789012:q</Queue>\
+                 <Event>s3:ObjectCreated:*</Event></QueueConfiguration>\
+                 </NotificationConfiguration>"
+                    .to_string(),
+            );
+        });
+
+        let outcome = put_object_via_store_guarded(&state, None, guarded_request(), || {
+            Some(producer_configuration.read())
+        })
+        .unwrap();
+        assert_eq!(outcome, DeliveryWriteOutcome::Committed);
+        assert!(probe.fired.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// A delivered object fires the bucket's `s3:ObjectCreated:Put`
