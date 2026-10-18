@@ -10,7 +10,9 @@ use bytes::Bytes;
 
 /// Lets non-Firehose services route records into a delivery stream
 /// without taking a direct dep on the firehose crate. CloudWatch Logs
-/// subscription filters use this for `arn:aws:firehose:` destinations.
+/// subscription filters and SES event destinations use this for
+/// `arn:aws:firehose:` destinations; the server shares one engine between this
+/// adapter and the public Firehose API.
 pub struct FirehoseDeliveryImpl {
     engine: Arc<FirehoseEngine>,
 }
@@ -45,9 +47,9 @@ impl FirehoseDeliveryImpl {
     }
 
     /// Wire the durable S3 store after construction. The delivery hook is built
-    /// during startup before the S3 store exists, so the store is set later so
-    /// records delivered via the CloudWatch-Logs subscription path are written
-    /// through to disk and survive a restart.
+    /// during startup before the S3 store exists, so the store is set later and
+    /// records handed off by Logs or SES are written through to disk and
+    /// survive a restart.
     pub fn set_s3_store(&self, store: Arc<dyn S3Store>) {
         self.engine.set_s3_store(store);
     }

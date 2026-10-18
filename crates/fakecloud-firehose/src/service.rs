@@ -16,7 +16,7 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceErr
 use fakecloud_persistence::{S3Store, SnapshotStore};
 use fakecloud_s3::SharedS3State;
 
-use crate::config::{parse_buffering_hints, validate_file_extension};
+use crate::config::{parse_buffering_hints, validate_destination_strings, validate_file_extension};
 use crate::engine::FirehoseEngine;
 use crate::state::{
     DeliveryStream, EncryptionConfig, FirehoseAccounts, FirehoseSnapshot, S3Destination,
@@ -59,6 +59,11 @@ pub struct FirehoseService {
 }
 
 impl FirehoseService {
+    /// Construct a service with its own buffering engine. Construction never
+    /// starts a worker: records are acknowledged into memory and reach S3 only
+    /// after [`FirehoseEngine::start`] runs on [`Self::delivery_engine`] inside a
+    /// Tokio runtime, or when [`FirehoseEngine::shutdown`] performs the final
+    /// drain. The server shares one engine through [`Self::with_engine`].
     pub fn new(state: SharedFirehoseState) -> Self {
         Self {
             engine: Arc::new(FirehoseEngine::new(state.clone())),
@@ -80,6 +85,8 @@ impl FirehoseService {
         self.engine.clone()
     }
 
+    /// Give the engine its S3 destination. Delivery still needs a started
+    /// engine; see [`Self::new`].
     pub fn with_s3(self, s3: SharedS3State) -> Self {
         self.engine.set_s3(s3);
         self
@@ -92,9 +99,8 @@ impl FirehoseService {
         self
     }
 
-    /// Wire the durable S3 store after construction. Used by
-    /// `FirehoseDeliveryImpl`, whose delivery hook is built before the S3 store
-    /// is available during server startup.
+    /// Wire the durable S3 store into the shared engine after construction, so
+    /// delivered objects are written through to disk.
     pub fn set_s3_store(&self, store: Arc<dyn S3Store>) {
         self.engine.set_s3_store(store);
     }
@@ -345,6 +351,7 @@ pub(crate) fn parse_s3_destination(val: &Value) -> Result<Option<S3Destination>,
     };
     let (size, interval) = parse_buffering_hints(val)?;
     validate_file_extension(val)?;
+    validate_destination_strings(val)?;
     let buffering_size_mb = Some(size.unwrap_or(5));
     let buffering_interval_seconds = Some(interval.unwrap_or(300));
     Ok(Some(S3Destination {
@@ -395,6 +402,7 @@ fn apply_s3_update(dest: &mut S3Destination, val: &Value) -> Result<(), AwsServi
     // `validate_destination_compression` before the stream was touched.
     let (size, interval) = parse_buffering_hints(val)?;
     validate_file_extension(val)?;
+    validate_destination_strings(val)?;
 
     if let Some(v) = val["RoleARN"].as_str() {
         dest.role_arn = v.to_string();

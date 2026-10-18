@@ -103,6 +103,31 @@ pub(crate) fn validate_file_extension(value: &Value) -> Result<(), AwsServiceErr
     Ok(())
 }
 
+/// Enforce the Firehose model's length limits on S3 destination strings.
+/// Every buffered batch and object key copies these values, so unbounded input
+/// would multiply memory use across retained batches.
+pub(crate) fn validate_destination_strings(value: &Value) -> Result<(), AwsServiceError> {
+    for (field, min, max) in [
+        ("RoleARN", 1, 512),
+        ("BucketARN", 1, 2048),
+        ("Prefix", 0, 1024),
+        ("ErrorOutputPrefix", 0, 1024),
+        ("CustomTimeZone", 0, 50),
+    ] {
+        let Some(member) = value.get(field).and_then(Value::as_str) else {
+            continue;
+        };
+        // Smithy lengths count Unicode scalar values, not bytes.
+        let length = member.chars().count();
+        if !(min..=max).contains(&length) {
+            return Err(invalid_argument(format!(
+                "{field} must be between {min} and {max} characters, got {length}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Shared control-plane parser. Unsupported delivery features still round-trip;
 /// record admission uses `delivery_config` separately.
 pub fn parse_s3_destination(value: &Value) -> Result<Option<S3Destination>, AwsServiceError> {
@@ -195,6 +220,44 @@ mod tests {
             assert_eq!(error.status(), StatusCode::BAD_REQUEST);
             assert_eq!(error.code(), "InvalidArgumentException");
             assert!(error.message().contains(setting), "{}", error.message());
+        }
+    }
+
+    #[test]
+    fn destination_strings_follow_model_limits() {
+        let base = || json!({"RoleARN": "arn:aws:iam::123456789012:role/fh", "BucketARN": "arn:aws:s3:::bucket"});
+        // Limits count characters: 1,024 multi-byte characters still fit.
+        for (field, accepted) in [
+            ("Prefix", "é".repeat(1024)),
+            ("ErrorOutputPrefix", "e".repeat(1024)),
+            ("Prefix", String::new()),
+            (
+                "CustomTimeZone",
+                "America/Argentina/Buenos_Aires".to_owned(),
+            ),
+            ("CustomTimeZone", String::new()),
+            ("RoleARN", "r".repeat(512)),
+            ("BucketARN", format!("arn:aws:s3:::{}", "b".repeat(2035))),
+        ] {
+            let mut value = base();
+            value[field] = json!(accepted);
+            parse_s3_destination(&value).unwrap().unwrap();
+        }
+        for (field, rejected) in [
+            ("Prefix", "a".repeat(1025)),
+            ("ErrorOutputPrefix", "a".repeat(1025)),
+            ("CustomTimeZone", "Z".repeat(51)),
+            ("RoleARN", String::new()),
+            ("RoleARN", "r".repeat(513)),
+            ("BucketARN", String::new()),
+            ("BucketARN", format!("arn:aws:s3:::{}", "b".repeat(2036))),
+        ] {
+            let mut value = base();
+            value[field] = json!(rejected);
+            let error = parse_s3_destination(&value).unwrap_err();
+            assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(error.code(), "InvalidArgumentException");
+            assert!(error.message().contains(field), "{}", error.message());
         }
     }
 
