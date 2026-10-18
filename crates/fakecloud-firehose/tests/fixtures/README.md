@@ -4,7 +4,23 @@ These streams were generated independently with
 `org.xerial.snappy:snappy-java:1.1.10.8`. Inline Rust tests and SDK E2E tests
 validate a separate test decoder against them before decoding emulator output.
 Normal Cargo tests consume the checked-in files and need no Java installation.
-The emulator uses the existing pure-Rust `snap` crate for compression.
+The emulator compresses with the pure-Rust `snap` crate, a dependency added for
+this format.
+
+## Why the Xerial container
+
+Three incompatible Snappy containers exist: Google's framing format, the Xerial
+snappy-java stream, and Hadoop's block format. A published probe of real Amazon
+Data Firehose (eu-west-1, 2026-08-15,
+[floci-io/floci#2328](https://github.com/floci-io/floci/issues/2328)) found
+that `CompressionFormat: Snappy` writes a `.snappy` object with
+`Content-Type: application/octet-stream`, `Content-Encoding: snappy-java`, and
+the Xerial header `82 53 4e 41 50 50 59 00`. snappy-java 1.1.10.8's
+`SnappyOutputStream` reproduced that object byte for byte, while
+`HADOOP_SNAPPY` used Hadoop block framing with `Content-Encoding:
+hadoop-snappy`. The probe delivered one 690-byte payload, so it confirms the
+header, metadata, and records sharing a block; the 32,768-byte block size for
+larger payloads comes from snappy-java's default rather than from that probe.
 
 ## Inputs and checksums
 
@@ -61,7 +77,8 @@ The stream begins with the 16-byte Xerial header:
 
 Each block is a big-endian unsigned 32-bit compressed byte length followed by
 one raw Snappy block. The default uncompressed block size is 32,768 bytes;
-record boundaries do not reset that window. There is no separate framed-stream
+record boundaries do not end a block, so records and delimiters share blocks.
+Each block is compressed independently. There is no separate framed-stream
 identifier, CRC field, or end marker. The test decoder bounds expanded blocks
 to this default size before allocating their buffers.
 
