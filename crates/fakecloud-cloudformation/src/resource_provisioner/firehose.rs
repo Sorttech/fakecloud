@@ -339,8 +339,9 @@ mod tests {
         }
         for bad in [
             json!({"BufferingHints": {"SizeInMBs": 1}}),
-            json!({"BufferingHints": {"SizeInMBs": "5", "IntervalInSeconds": 300}}),
+            json!({"BufferingHints": {"SizeInMBs": "five", "IntervalInSeconds": 300}}),
             json!({"BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": 901}}),
+            json!({"BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": "901"}}),
             json!({"FileExtension": "invalid"}),
         ] {
             let mut value = config.clone();
@@ -354,6 +355,38 @@ mod tests {
             parse_firehose_s3_destination(&json!({"BucketARN": "arn:aws:s3:::bucket"})).is_err()
         );
         assert!(parse_firehose_s3_destination(&json!({"RoleARN": "role"})).is_err());
+    }
+
+    /// `Ref` parameters resolve to strings, and AWS's own templates quote
+    /// numbers and booleans, so modeled scalars are coerced before parsing.
+    #[test]
+    fn firehose_cfn_coerces_string_scalars_including_backup_configuration() {
+        let mut config = configuration();
+        config["BufferingHints"] = json!({"SizeInMBs": "50", "IntervalInSeconds": "60"});
+        config["DynamicPartitioningConfiguration"] =
+            json!({"Enabled": "false", "RetryOptions": {"DurationInSeconds": "300"}});
+        config["S3BackupConfiguration"] = json!({
+            "RoleARN": "backup-role",
+            "BucketARN": "arn:aws:s3:::backup",
+            "BufferingHints": {"SizeInMBs": "1", "IntervalInSeconds": "0"},
+            "CloudWatchLoggingOptions": {"Enabled": "TRUE", "LogGroupName": "backup"}
+        });
+        let dest = parse_firehose_s3_destination(&config).unwrap();
+        assert_eq!(dest.buffering_size_mb, Some(50));
+        assert_eq!(dest.buffering_interval_seconds, Some(60));
+        assert_eq!(
+            dest.dynamic_partitioning_configuration,
+            Some(json!({"Enabled": false, "RetryOptions": {"DurationInSeconds": 300}}))
+        );
+        assert_eq!(
+            dest.s3_backup_description,
+            Some(json!({
+                "RoleARN": "backup-role",
+                "BucketARN": "arn:aws:s3:::backup",
+                "BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": 0},
+                "CloudWatchLoggingOptions": {"Enabled": true, "LogGroupName": "backup"}
+            }))
+        );
     }
 
     #[test]
@@ -431,7 +464,7 @@ mod tests {
             json!({"FileExtension": 1}),
             json!({"BufferingHints": {"SizeInMBs": 1}}),
             json!({"BufferingHints": {"SizeInMBs": 0, "IntervalInSeconds": 300}}),
-            json!({"BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": "300"}}),
+            json!({"BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": "300s"}}),
         ] {
             let expected = if bad.get("FileExtension").is_some() {
                 "FileExtension"
