@@ -5,6 +5,7 @@ use aws_sdk_firehose::types::{
 };
 use aws_sdk_s3::types::ChecksumMode;
 use fakecloud_testkit::TestServer;
+use md5::{Digest, Md5};
 
 #[path = "../../fakecloud-firehose/tests/fixtures/xerial_decoder.rs"]
 mod xerial;
@@ -23,6 +24,7 @@ async fn snappy_object(
         Some("STANDARD")
     );
     let key = listing.contents()[0].key().unwrap().to_owned();
+    let listed_etag = listing.contents()[0].e_tag().map(str::to_owned);
     assert!(
         key.ends_with(extension),
         "key {key} must end with {extension}"
@@ -45,9 +47,14 @@ async fn snappy_object(
         object.checksum_type().map(|value| value.as_str()),
         Some("FULL_OBJECT")
     );
+    let etag = object.e_tag().map(str::to_owned);
     let content_length = object.content_length().unwrap();
     let raw = object.body.collect().await.unwrap().into_bytes().to_vec();
     assert_eq!(content_length, raw.len() as i64);
+    // The ETag is the MD5 of the stored (Snappy-encoded) bytes, as for GZIP.
+    let md5_etag = format!("\"{:x}\"", Md5::digest(&raw));
+    assert_eq!(etag.as_deref(), Some(md5_etag.as_str()));
+    assert_eq!(listed_etag.as_deref(), Some(md5_etag.as_str()));
     let decoded = xerial::decode(&raw).unwrap().concat();
     let head = s3
         .head_object()
@@ -57,6 +64,7 @@ async fn snappy_object(
         .send()
         .await
         .unwrap();
+    assert_eq!(head.e_tag(), Some(md5_etag.as_str()));
     assert_eq!(head.checksum_crc64_nvme(), Some(checksum.as_str()));
     assert_eq!(
         head.checksum_type().map(|value| value.as_str()),
