@@ -58,13 +58,102 @@ const FIREHOSE_FREE_FORM_MAPS: &[&str] = &["ColumnToJsonKeyMappings"];
 /// block their API types. CloudFormation passes template parameters (`Ref`)
 /// as strings, so `"false"` or `"60"` would otherwise be stored and echoed
 /// by `DescribeDeliveryStream` where SDKs expect a boolean or a number. A
-/// string that does not parse is left as is.
-pub(super) fn coerce_firehose_scalars(mut value: serde_json::Value) -> serde_json::Value {
-    coerce_firehose_scalars_in_place(&mut value);
-    value
+/// modeled member whose string does not parse exactly (no surrounding
+/// whitespace; integers within the model's 32-bit range), or whose JSON value
+/// has the wrong type, fails the resource, as CloudFormation's schema
+/// validation does, rather than being stored as a value no SDK can
+/// deserialize. `property` (the top-level property name) prefixes the
+/// member path in the error.
+pub(super) fn coerce_firehose_scalars(
+    mut value: serde_json::Value,
+    property: &str,
+) -> Result<serde_json::Value, String> {
+    coerce_firehose_scalars_in_place(&mut value, property)?;
+    Ok(value)
 }
 
-fn coerce_firehose_scalars_in_place(value: &mut serde_json::Value) {
+fn member_path(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}.{name}")
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ScalarType {
+    Boolean,
+    Integer,
+    Double,
+}
+
+impl ScalarType {
+    fn of(member: &str) -> Option<Self> {
+        if FIREHOSE_BOOLEAN_MEMBERS.contains(&member) {
+            Some(Self::Boolean)
+        } else if FIREHOSE_INTEGER_MEMBERS.contains(&member) {
+            Some(Self::Integer)
+        } else if FIREHOSE_DOUBLE_MEMBERS.contains(&member) {
+            Some(Self::Double)
+        } else {
+            None
+        }
+    }
+
+    fn expected(self) -> &'static str {
+        match self {
+            Self::Boolean => "a boolean",
+            Self::Integer => "a 32-bit integer",
+            Self::Double => "a number",
+        }
+    }
+
+    /// The value with its API type, or `None` if it is neither that type nor
+    /// a string that parses as it.
+    fn coerce(self, value: &serde_json::Value) -> Option<serde_json::Value> {
+        use serde_json::Value;
+        match (self, value) {
+            (Self::Boolean, Value::Bool(_)) => Some(value.clone()),
+            (Self::Boolean, Value::String(text)) => {
+                if text.eq_ignore_ascii_case("true") {
+                    Some(Value::Bool(true))
+                } else if text.eq_ignore_ascii_case("false") {
+                    Some(Value::Bool(false))
+                } else {
+                    None
+                }
+            }
+            (Self::Integer, Value::Number(number)) => {
+                let integer = match number.as_i64() {
+                    Some(integer) => integer,
+                    // An integral float (`60.0`) is still an integer.
+                    None => {
+                        let float = number.as_f64()?;
+                        if float.fract() != 0.0 {
+                            return None;
+                        }
+                        // Saturates out of range; the i32 check below rejects it.
+                        float as i64
+                    }
+                };
+                i32::try_from(integer).ok().map(Value::from)
+            }
+            (Self::Integer, Value::String(text)) => text.parse::<i32>().ok().map(Value::from),
+            (Self::Double, Value::Number(_)) => Some(value.clone()),
+            (Self::Double, Value::String(text)) => text
+                .parse::<f64>()
+                .ok()
+                .and_then(serde_json::Number::from_f64)
+                .map(Value::Number),
+            _ => None,
+        }
+    }
+}
+
+fn coerce_firehose_scalars_in_place(
+    value: &mut serde_json::Value,
+    path: &str,
+) -> Result<(), String> {
     match value {
         serde_json::Value::Object(members) => {
             for (name, member) in members.iter_mut() {
@@ -72,39 +161,31 @@ fn coerce_firehose_scalars_in_place(value: &mut serde_json::Value) {
                 if FIREHOSE_FREE_FORM_MAPS.contains(&name) {
                     continue;
                 }
-                if let Some(text) = member.as_str() {
-                    let text = text.trim();
-                    let coerced = if FIREHOSE_BOOLEAN_MEMBERS.contains(&name) {
-                        if text.eq_ignore_ascii_case("true") {
-                            Some(serde_json::Value::Bool(true))
-                        } else if text.eq_ignore_ascii_case("false") {
-                            Some(serde_json::Value::Bool(false))
-                        } else {
-                            None
+                match ScalarType::of(name) {
+                    // An explicit null is treated as an absent member.
+                    Some(_) if member.is_null() => {}
+                    Some(scalar) => match scalar.coerce(member) {
+                        Some(coerced) => *member = coerced,
+                        None => {
+                            return Err(format!(
+                                "{} must be {}, got {member}",
+                                member_path(path, name),
+                                scalar.expected()
+                            ))
                         }
-                    } else if FIREHOSE_INTEGER_MEMBERS.contains(&name) {
-                        text.parse::<i64>().ok().map(serde_json::Value::from)
-                    } else if FIREHOSE_DOUBLE_MEMBERS.contains(&name) {
-                        text.parse::<f64>()
-                            .ok()
-                            .and_then(serde_json::Number::from_f64)
-                            .map(serde_json::Value::Number)
-                    } else {
-                        None
-                    };
-                    if let Some(coerced) = coerced {
-                        *member = coerced;
-                    }
-                } else {
-                    coerce_firehose_scalars_in_place(member);
+                    },
+                    None => coerce_firehose_scalars_in_place(member, &member_path(path, name))?,
                 }
             }
         }
         serde_json::Value::Array(items) => {
-            items.iter_mut().for_each(coerce_firehose_scalars_in_place)
+            for (index, item) in items.iter_mut().enumerate() {
+                coerce_firehose_scalars_in_place(item, &format!("{path}[{index}]"))?;
+            }
         }
         _ => {}
     }
+    Ok(())
 }
 
 impl ResourceProvisioner {
@@ -136,9 +217,9 @@ impl ResourceProvisioner {
             return Err("Only one of S3DestinationConfiguration or ExtendedS3DestinationConfiguration may be set".to_string());
         }
         let destination = Some(if let Some(s3) = props.get("S3DestinationConfiguration") {
-            parse_firehose_s3_destination(s3)?
+            parse_firehose_s3_destination(s3, "S3DestinationConfiguration")?
         } else if let Some(s3) = props.get("ExtendedS3DestinationConfiguration") {
-            parse_firehose_s3_destination(s3)?
+            parse_firehose_s3_destination(s3, "ExtendedS3DestinationConfiguration")?
         } else {
             return Err("Delivery stream requires a destination configuration".to_string());
         });
@@ -207,9 +288,15 @@ impl ResourceProvisioner {
             return Err("Only one of S3DestinationConfiguration or ExtendedS3DestinationConfiguration may be set".to_string());
         }
         let new_destination = if let Some(s3) = props.get("S3DestinationConfiguration") {
-            Some(parse_firehose_s3_destination(s3)?)
+            Some(parse_firehose_s3_destination(
+                s3,
+                "S3DestinationConfiguration",
+            )?)
         } else if let Some(s3) = props.get("ExtendedS3DestinationConfiguration") {
-            Some(parse_firehose_s3_destination(s3)?)
+            Some(parse_firehose_s3_destination(
+                s3,
+                "ExtendedS3DestinationConfiguration",
+            )?)
         } else {
             None
         };
@@ -312,7 +399,8 @@ mod tests {
     #[test]
     fn firehose_shared_parser_retains_extended_fields_and_defaults() {
         let config = configuration();
-        let dest = parse_firehose_s3_destination(&config).unwrap();
+        let dest =
+            parse_firehose_s3_destination(&config, "ExtendedS3DestinationConfiguration").unwrap();
         assert_eq!(dest.buffering_size_mb, Some(5));
         assert_eq!(dest.buffering_interval_seconds, Some(300));
         assert_eq!(dest.prefix.as_deref(), Some("static/"));
@@ -349,44 +437,22 @@ mod tests {
                 .as_object_mut()
                 .unwrap()
                 .extend(bad.as_object().unwrap().clone());
-            assert!(parse_firehose_s3_destination(&value).is_err(), "{value}");
+            assert!(
+                parse_firehose_s3_destination(&value, "ExtendedS3DestinationConfiguration")
+                    .is_err(),
+                "{value}"
+            );
         }
-        assert!(
-            parse_firehose_s3_destination(&json!({"BucketARN": "arn:aws:s3:::bucket"})).is_err()
-        );
-        assert!(parse_firehose_s3_destination(&json!({"RoleARN": "role"})).is_err());
-    }
-
-    /// `Ref` parameters resolve to strings, and AWS's own templates quote
-    /// numbers and booleans, so modeled scalars are coerced before parsing.
-    #[test]
-    fn firehose_cfn_coerces_string_scalars_including_backup_configuration() {
-        let mut config = configuration();
-        config["BufferingHints"] = json!({"SizeInMBs": "50", "IntervalInSeconds": "60"});
-        config["DynamicPartitioningConfiguration"] =
-            json!({"Enabled": "false", "RetryOptions": {"DurationInSeconds": "300"}});
-        config["S3BackupConfiguration"] = json!({
-            "RoleARN": "backup-role",
-            "BucketARN": "arn:aws:s3:::backup",
-            "BufferingHints": {"SizeInMBs": "1", "IntervalInSeconds": "0"},
-            "CloudWatchLoggingOptions": {"Enabled": "TRUE", "LogGroupName": "backup"}
-        });
-        let dest = parse_firehose_s3_destination(&config).unwrap();
-        assert_eq!(dest.buffering_size_mb, Some(50));
-        assert_eq!(dest.buffering_interval_seconds, Some(60));
-        assert_eq!(
-            dest.dynamic_partitioning_configuration,
-            Some(json!({"Enabled": false, "RetryOptions": {"DurationInSeconds": 300}}))
-        );
-        assert_eq!(
-            dest.s3_backup_description,
-            Some(json!({
-                "RoleARN": "backup-role",
-                "BucketARN": "arn:aws:s3:::backup",
-                "BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": 0},
-                "CloudWatchLoggingOptions": {"Enabled": true, "LogGroupName": "backup"}
-            }))
-        );
+        assert!(parse_firehose_s3_destination(
+            &json!({"BucketARN": "arn:aws:s3:::bucket"}),
+            "ExtendedS3DestinationConfiguration"
+        )
+        .is_err());
+        assert!(parse_firehose_s3_destination(
+            &json!({"RoleARN": "role"}),
+            "ExtendedS3DestinationConfiguration"
+        )
+        .is_err());
     }
 
     #[test]
@@ -676,7 +742,8 @@ mod tests {
             "RoleARN": "arn:aws:iam::123456789012:role/fh",
             "BucketARN": "arn:aws:s3:::bucket", "FileExtension": ".json",
         });
-        let dest = parse_firehose_s3_destination(&base).unwrap();
+        let dest =
+            parse_firehose_s3_destination(&base, "ExtendedS3DestinationConfiguration").unwrap();
         assert!(dest.processing_configuration.is_none());
         assert!(dest.data_format_conversion_configuration.is_none());
         assert!(dest.dynamic_partitioning_configuration.is_none());
@@ -699,7 +766,8 @@ mod tests {
                     None => json!({}),
                 };
             }
-            let dest = parse_firehose_s3_destination(&config).unwrap();
+            let dest = parse_firehose_s3_destination(&config, "ExtendedS3DestinationConfiguration")
+                .unwrap();
             let expected = if enabled.is_some() {
                 json!({"Enabled": false})
             } else {
@@ -718,12 +786,13 @@ mod tests {
         }
     }
 
-    /// Template parameters arrive as strings; every nested modeled boolean
-    /// and number is stored with its API type (so DescribeDeliveryStream
-    /// echoes what SDKs deserialize), while string members, free-form map
-    /// values, and unparseable strings are left untouched.
+    /// `Ref` parameters resolve to strings, and AWS's own templates quote
+    /// numbers and booleans. Every nested modeled boolean and number,
+    /// including the backup configuration's, is stored with its API type (so
+    /// DescribeDeliveryStream echoes what SDKs deserialize), while string
+    /// members and free-form map values are left untouched.
     #[test]
-    fn firehose_cfn_coerces_nested_template_scalars() {
+    fn firehose_cfn_coerces_template_scalars() {
         let prov = make_provisioner();
         prov.create_resource(&delivery_stream(json!({
             "RoleARN": "arn:aws:iam::123456789012:role/fh",
@@ -763,8 +832,8 @@ mod tests {
             "S3BackupConfiguration": {
                 "RoleARN": "arn:aws:iam::123456789012:role/backup",
                 "BucketARN": "arn:aws:s3:::backup",
-                "BufferingHints": {"SizeInMBs": "5", "IntervalInSeconds": "not-a-number"},
-                "CloudWatchLoggingOptions": {"Enabled": "true"}
+                "BufferingHints": {"SizeInMBs": "1", "IntervalInSeconds": "0"},
+                "CloudWatchLoggingOptions": {"Enabled": "TRUE", "LogGroupName": "backup"}
             }
         })))
         .unwrap();
@@ -821,12 +890,130 @@ mod tests {
             dest.encryption_configuration,
             Some(json!({"NoEncryptionConfig": "NoEncryption"}))
         );
-        let backup = dest.s3_backup_description.unwrap();
         assert_eq!(
-            backup["BufferingHints"],
-            json!({"SizeInMBs": 5, "IntervalInSeconds": "not-a-number"})
+            dest.s3_backup_description,
+            Some(json!({
+                "RoleARN": "arn:aws:iam::123456789012:role/backup",
+                "BucketARN": "arn:aws:s3:::backup",
+                "BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": 0},
+                "CloudWatchLoggingOptions": {"Enabled": true, "LogGroupName": "backup"}
+            }))
         );
-        assert_eq!(backup["CloudWatchLoggingOptions"], json!({"Enabled": true}));
+    }
+
+    /// A modeled boolean or number whose template string does not parse
+    /// exactly, or whose JSON value has the wrong type, fails the resource
+    /// (as CloudFormation's schema validation does) instead of being stored
+    /// as a value DescribeDeliveryStream would echo where SDKs expect another
+    /// type, and leaves no stream behind. The error names the full member
+    /// path, starting at the top-level property.
+    #[test]
+    fn firehose_cfn_unparseable_template_scalar_fails_resource() {
+        const ROOT: &str = "ExtendedS3DestinationConfiguration";
+        const INTERVAL: &str = "/S3BackupConfiguration/BufferingHints/IntervalInSeconds";
+        const SIZE: &str = "/BufferingHints/SizeInMBs";
+        const LOGGING: &str = "/CloudWatchLoggingOptions/Enabled";
+        const PROCESSING: &str = "/ProcessingConfiguration/Enabled";
+        const PADDING: &str = "/DataFormatConversionConfiguration/OutputFormatConfiguration/Serializer/OrcSerDe/PaddingTolerance";
+        let integer = "must be a 32-bit integer";
+        let boolean = "must be a boolean";
+        let number = "must be a number";
+        for (pointer, bad, expected) in [
+            (INTERVAL, json!("not-a-number"), integer),
+            (SIZE, json!("5.5"), integer),
+            (SIZE, json!(" 1 "), integer),
+            (SIZE, json!("2147483648"), integer),
+            (SIZE, json!(2_147_483_648_i64), integer),
+            (SIZE, json!(5.5), integer),
+            (SIZE, json!(true), integer),
+            (SIZE, json!({"Value": 5}), integer),
+            (LOGGING, json!("yes"), boolean),
+            (LOGGING, json!("true "), boolean),
+            (LOGGING, json!(1), boolean),
+            (LOGGING, json!({"Value": true}), boolean),
+            (PROCESSING, json!("1"), boolean),
+            (PADDING, json!("lots"), number),
+            (PADDING, json!(" 0.05"), number),
+            (PADDING, json!(true), number),
+            (PADDING, json!({"Value": 0.05}), number),
+        ] {
+            let message = format!("{ROOT}{} {expected}, got {bad}", pointer.replace('/', "."));
+            let case = format!("{pointer} = {bad}");
+            let mut config = json!({
+                "RoleARN": "arn:aws:iam::123456789012:role/fh",
+                "BucketARN": "arn:aws:s3:::bucket",
+                "BufferingHints": {"SizeInMBs": 5, "IntervalInSeconds": 300},
+                "CloudWatchLoggingOptions": {"Enabled": true},
+                "ProcessingConfiguration": {"Enabled": false},
+                "DataFormatConversionConfiguration": {"OutputFormatConfiguration": {
+                    "Serializer": {"OrcSerDe": {"PaddingTolerance": 0.05}}
+                }},
+                "S3BackupConfiguration": {
+                    "RoleARN": "arn:aws:iam::123456789012:role/backup",
+                    "BucketARN": "arn:aws:s3:::backup",
+                    "BufferingHints": {"SizeInMBs": 5, "IntervalInSeconds": 300}
+                }
+            });
+            *config.pointer_mut(pointer).unwrap() = bad.clone();
+            let prov = make_provisioner();
+            let err = prov
+                .create_resource(&delivery_stream(config.clone()))
+                .expect_err("unparseable scalar must fail provisioning");
+            assert!(err.contains(&message), "{case}: {err}");
+            assert!(prov.firehose_state.read().accounts.is_empty(), "{case}");
+
+            // The same template on update leaves the original stream alone.
+            let prov = make_provisioner();
+            *config.pointer_mut(pointer).unwrap() = match pointer.rsplit('/').next() {
+                Some("Enabled") => json!(false),
+                Some("PaddingTolerance") => json!(0.05),
+                _ => json!(60),
+            };
+            let existing = prov
+                .create_resource(&delivery_stream(config.clone()))
+                .unwrap();
+            let before = firehose_state(&prov);
+            *config.pointer_mut(pointer).unwrap() = bad;
+            let err = prov
+                .update_resource(&existing, &delivery_stream(config))
+                .expect_err("unparseable scalar must fail the update");
+            assert!(err.contains(&message), "{case}: {err}");
+            assert_eq!(firehose_state(&prov), before, "{case}");
+        }
+    }
+
+    /// Values that already have their modeled JSON type pass through: any
+    /// integral number (within 32 bits) for an integer member, any number
+    /// for a double member. The error path starts at the property named by
+    /// the caller.
+    #[test]
+    fn firehose_cfn_accepts_typed_json_scalars() {
+        let coerced = coerce_firehose_scalars(
+            json!({
+                "BufferingHints": {"SizeInMBs": 2_147_483_647, "IntervalInSeconds": 60.0},
+                "CloudWatchLoggingOptions": {"Enabled": false},
+                "OrcSerDe": {"PaddingTolerance": 1, "DictionaryKeyThreshold": 0.5}
+            }),
+            "S3DestinationConfiguration",
+        )
+        .unwrap();
+        assert_eq!(
+            coerced,
+            json!({
+                "BufferingHints": {"SizeInMBs": 2_147_483_647, "IntervalInSeconds": 60},
+                "CloudWatchLoggingOptions": {"Enabled": false},
+                "OrcSerDe": {"PaddingTolerance": 1, "DictionaryKeyThreshold": 0.5}
+            })
+        );
+        assert_eq!(
+            coerce_firehose_scalars(
+                json!({"BufferingHints": {"SizeInMBs": -2_147_483_649_i64}}),
+                "S3DestinationConfiguration",
+            )
+            .unwrap_err(),
+            "S3DestinationConfiguration.BufferingHints.SizeInMBs must be a 32-bit integer, \
+             got -2147483649"
+        );
     }
 
     fn firehose_resource(base: &str) -> ResourceDefinition {

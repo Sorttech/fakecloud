@@ -559,6 +559,114 @@ mod tests {
         assert_eq!(std::fs::read_dir(spool).unwrap().count(), 0);
     }
 
+    const KEY_ARN: &str = "arn:aws:kms:us-east-1:123456789012:key/stream-key";
+
+    /// Records every SSE-KMS encryption S3 performs.
+    #[derive(Default)]
+    struct RecordingKms {
+        encrypted: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
+    }
+
+    impl fakecloud_core::delivery::KmsHook for RecordingKms {
+        fn encrypt(
+            &self,
+            _account_id: &str,
+            _region: &str,
+            key_id: &str,
+            plaintext: &[u8],
+            _service_principal: &str,
+            _encryption_context: std::collections::HashMap<String, String>,
+        ) -> Result<String, String> {
+            self.encrypted
+                .lock()
+                .unwrap()
+                .push((key_id.to_owned(), plaintext.to_vec()));
+            Ok(format!("envelope:{key_id}"))
+        }
+
+        fn decrypt(
+            &self,
+            _account_id: &str,
+            _ciphertext_b64: &str,
+            _service_principal: &str,
+            _encryption_context: std::collections::HashMap<String, String>,
+        ) -> Result<Vec<u8>, String> {
+            Err("not used".into())
+        }
+
+        fn resolve_key_arn(
+            &self,
+            _account_id: &str,
+            _region: &str,
+            key_id: &str,
+            _service_principal: &str,
+        ) -> Result<String, String> {
+            Ok(key_id.to_owned())
+        }
+    }
+
+    /// Wire `kms` into S3's write side effects, as the server does.
+    fn install_kms(s3: &SharedS3State, kms: Arc<RecordingKms>) {
+        s3.write().get_or_create(ACCOUNT).side_effects =
+            Some(Arc::new(fakecloud_s3::side_effects::S3SideEffects::new(
+                Arc::new(fakecloud_core::delivery::DeliveryBus::new()),
+                Some(kms),
+                fakecloud_core::auth::IamMode::Off,
+            )));
+    }
+
+    fn gunzip(body: &[u8]) -> Vec<u8> {
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(body)
+            .read_to_end(&mut decoded)
+            .unwrap();
+        decoded
+    }
+
+    #[test]
+    fn captured_kms_encryption_reaches_the_s3_write() {
+        let (state, s3, mut batch) = fixture();
+        let kms = Arc::new(RecordingKms::default());
+        install_kms(&s3, kms.clone());
+        batch.destination.encryption = DeliveredEncryption::SseKms {
+            key_id: Some(KEY_ARN.into()),
+        };
+        // The live stream has no encryption configured: only the batch's
+        // captured setting may decide how its object is encrypted.
+        assert_eq!(
+            writer(&state, &s3, None).write(&batch).unwrap(),
+            DeliveryWriteOutcome::Committed
+        );
+        let encrypted = kms.encrypted.lock().unwrap().clone();
+        assert_eq!(encrypted.len(), 1);
+        assert_eq!(encrypted[0].0, KEY_ARN);
+        assert_eq!(gunzip(&encrypted[0].1), b"first\nsecond\x00\xff");
+        let accounts = s3.read();
+        let object =
+            &accounts.get(ACCOUNT).unwrap().buckets["logs-bucket"].objects[&batch.object_key];
+        assert_eq!(object.sse_algorithm.as_deref(), Some("aws:kms"));
+        assert_eq!(object.sse_kms_key_id.as_deref(), Some(KEY_ARN));
+        assert_eq!(object.content_encoding.as_deref(), Some("gzip"));
+        assert!(
+            matches!(&object.body, BodyRef::Memory(body) if body.as_ref() == format!("envelope:{KEY_ARN}").as_bytes())
+        );
+
+        // A batch captured without encryption is not encrypted.
+        let (state, s3, batch) = fixture();
+        let kms = Arc::new(RecordingKms::default());
+        install_kms(&s3, kms.clone());
+        assert_eq!(
+            writer(&state, &s3, None).write(&batch).unwrap(),
+            DeliveryWriteOutcome::Committed
+        );
+        assert!(kms.encrypted.lock().unwrap().is_empty());
+        let accounts = s3.read();
+        let object =
+            &accounts.get(ACCOUNT).unwrap().buckets["logs-bucket"].objects[&batch.object_key];
+        assert_eq!(object.sse_algorithm, None);
+        assert_eq!(object.sse_kms_key_id, None);
+    }
+
     #[test]
     fn memory_writer_uses_raw_record_concatenation() {
         let (state, s3, mut batch) = fixture();

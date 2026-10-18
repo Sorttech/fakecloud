@@ -4213,11 +4213,16 @@ fn parse_cognito_account_recovery(
     })
 }
 
-fn parse_firehose_s3_destination(value: &serde_json::Value) -> Result<S3Destination, String> {
+/// `property` is the top-level property `value` came from
+/// (`S3DestinationConfiguration` or `ExtendedS3DestinationConfiguration`).
+fn parse_firehose_s3_destination(
+    value: &serde_json::Value,
+    property: &str,
+) -> Result<S3Destination, String> {
     // Template values (a `Ref` to a parameter, say) arrive as strings; give
     // every modeled boolean / number its API type before parsing, so nested
     // blocks echoed by DescribeDeliveryStream match the Firehose model.
-    let value = firehose::coerce_firehose_scalars(value.clone());
+    let value = firehose::coerce_firehose_scalars(value.clone(), property)?;
     let destination = fakecloud_firehose::config::parse_s3_destination(&value)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "S3 destination requires RoleARN and BucketARN".to_string())?;

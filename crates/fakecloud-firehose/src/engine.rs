@@ -1084,6 +1084,77 @@ mod tests {
         f.finish(&mut jobs).await;
     }
 
+    /// A detached batch keeps the SSE-KMS key captured when it detached
+    /// through every retry, even after UpdateDestination changes the key or
+    /// removes EncryptionConfiguration; only later batches use the new one.
+    #[tokio::test]
+    async fn detached_batch_keeps_captured_kms_key_across_updates() {
+        use fakecloud_s3::delivery::DeliveredEncryption;
+        const CAPTURED: &str = "arn:aws:kms:us-east-1:111111111111:key/captured";
+        const REPLACED: &str = "arn:aws:kms:us-east-1:111111111111:key/replaced";
+        let kms = |arn: &str| json!({"KMSEncryptionConfig": {"AWSKMSKeyARN": arn}});
+        for (replacement, successor_encryption) in [
+            (
+                Some(kms(REPLACED)),
+                DeliveredEncryption::SseKms {
+                    key_id: Some(REPLACED.into()),
+                },
+            ),
+            (None, DeliveredEncryption::AsDelivered),
+            (
+                Some(json!({"NoEncryptionConfig": "NoEncryption"})),
+                DeliveredEncryption::AsDelivered,
+            ),
+        ] {
+            let f = Fixture::new(0);
+            f.update(NAME, |s| {
+                s.destination.as_mut().unwrap().encryption_configuration = Some(kms(CAPTURED));
+            });
+            let mut entered = f.controlled();
+            f.enqueue(vec![Bytes::from_static(b"head")]);
+            let mut jobs = Writes::default();
+            f.schedule(&mut jobs, false);
+            let first = next_attempt(&mut entered).await;
+            let captured = DeliveredEncryption::SseKms {
+                key_id: Some(CAPTURED.into()),
+            };
+            assert_eq!(first.batch.destination.encryption, captured);
+            first.reply.send(Action::Fail).unwrap();
+            f.finish(&mut jobs).await;
+
+            f.update(NAME, |s| {
+                s.version_id = "2".into();
+                s.destination.as_mut().unwrap().encryption_configuration = replacement.clone();
+            });
+            f.enqueue(vec![Bytes::from_static(b"successor")]);
+            for _ in 0..2 {
+                f.advance(RETRY_INTERVAL.as_secs());
+                f.schedule(&mut jobs, true);
+                let retry = next_attempt(&mut entered).await;
+                assert_eq!(retry.batch.object_key, first.batch.object_key);
+                assert_eq!(
+                    retry.batch.destination.encryption, captured,
+                    "{replacement:?}"
+                );
+                retry.reply.send(Action::Fail).unwrap();
+                f.finish(&mut jobs).await;
+            }
+            f.advance(RETRY_INTERVAL.as_secs());
+            f.schedule(&mut jobs, true);
+            let retry = next_attempt(&mut entered).await;
+            assert_eq!(retry.batch.destination.encryption, captured);
+            retry.reply.send(Action::Commit).unwrap();
+            f.finish(&mut jobs).await;
+
+            f.schedule(&mut jobs, false);
+            let next = next_attempt(&mut entered).await;
+            assert_eq!(next.batch.records, vec![Bytes::from_static(b"successor")]);
+            assert_eq!(next.batch.destination.encryption, successor_encryption);
+            next.reply.send(Action::Commit).unwrap();
+            f.finish(&mut jobs).await;
+        }
+    }
+
     #[tokio::test]
     async fn ingestion_during_write_is_preserved() {
         let f = Fixture::new(0);
