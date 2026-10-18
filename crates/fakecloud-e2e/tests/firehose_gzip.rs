@@ -308,6 +308,14 @@ async fn firehose_gzip_stream_kms_encryption_config_writes_sse_kms() {
             ExtendedS3DestinationConfiguration::builder()
                 .role_arn("arn:aws:iam::123456789012:role/firehose")
                 .bucket_arn(format!("arn:aws:s3:::{bucket}"))
+                // Zero interval delivers promptly instead of after the
+                // 300-second default window.
+                .buffering_hints(
+                    BufferingHints::builder()
+                        .size_in_mbs(5)
+                        .interval_in_seconds(0)
+                        .build(),
+                )
                 .compression_format(CompressionFormat::Gzip)
                 .encryption_configuration(
                     EncryptionConfiguration::builder()

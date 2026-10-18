@@ -70,7 +70,7 @@ impl BatchWriter for S3BatchWriter {
                 options: DeliveryObjectOptions {
                     content_type: Some("application/octet-stream".into()),
                     content_encoding: compression.content_encoding().map(str::to_owned),
-                    ..Default::default()
+                    encryption: batch.destination.encryption.clone(),
                 },
             },
             || {
@@ -104,6 +104,7 @@ mod tests {
     use fakecloud_persistence::{
         BodyRef, BodySource, BucketMeta, BucketSubresource, MpuInit, ObjectMeta,
     };
+    use fakecloud_s3::delivery::DeliveredEncryption;
     use fakecloud_s3::{S3Bucket, S3State};
     use uuid::Uuid;
 
@@ -201,6 +202,7 @@ mod tests {
                     size_bytes: 1024,
                     interval: Duration::from_secs(60),
                 },
+                encryption: DeliveredEncryption::AsDelivered,
             },
             records: vec![
                 Bytes::from_static(b"first\n"),

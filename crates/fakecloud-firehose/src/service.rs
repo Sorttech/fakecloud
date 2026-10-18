@@ -3300,7 +3300,7 @@ mod tests {
         ))
         .unwrap();
 
-        // Empty arrays fail the request-wide 1–500 entry check; malformed or
+        // Empty arrays fail the request-wide 1-500 entry check; malformed or
         // empty blobs in a nonempty array must still run source admission.
         let err = svc
             .put_record_batch(&request(

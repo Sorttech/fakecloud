@@ -1,10 +1,11 @@
 use std::time::Duration;
 
 use fakecloud_core::service::AwsServiceError;
+use fakecloud_s3::delivery::DeliveredEncryption;
 use http::StatusCode;
 use serde_json::Value;
 
-use crate::output::{append_delimiter_enabled, OutputConfig};
+use crate::output::{append_delimiter_enabled, delivery_encryption, OutputConfig};
 use crate::state::S3Destination;
 
 #[derive(Clone, Debug)]
@@ -18,6 +19,11 @@ pub struct DeliveryConfig {
     pub bucket: String,
     pub output: OutputConfig,
     pub buffering: BufferingPolicy,
+    /// Server-side encryption of every delivered object: SSE-KMS under the
+    /// destination's `KMSEncryptionConfig` key, otherwise the bucket default.
+    /// Captured with the rest of the configuration, so a batch keeps the key
+    /// it was admitted under through retries.
+    pub encryption: DeliveredEncryption,
 }
 
 fn invalid_argument(message: impl Into<String>) -> AwsServiceError {
@@ -157,6 +163,7 @@ pub fn delivery_config(dest: &S3Destination) -> Result<DeliveryConfig, AwsServic
             append_delimiter: append_delimiter_enabled(dest.processing_configuration.as_ref()),
         },
         buffering,
+        encryption: delivery_encryption(dest.encryption_configuration.as_ref()),
     })
 }
 
@@ -187,10 +194,6 @@ mod tests {
     fn unsupported_admission_names_setting_with_invalid_argument() {
         for (extra, setting) in [
             (json!({"S3BackupMode": "Enabled"}), "S3BackupMode"),
-            (
-                json!({"EncryptionConfiguration": {"KMSEncryptionConfig": {"AWSKMSKeyARN": "arn:aws:kms:us-east-1:123456789012:key/example"}}}),
-                "EncryptionConfiguration",
-            ),
             (json!({"CompressionFormat": "ZIP"}), "CompressionFormat"),
             (
                 json!({"CompressionFormat": "HADOOP_SNAPPY"}),
@@ -258,6 +261,32 @@ mod tests {
             assert_eq!(error.status(), StatusCode::BAD_REQUEST);
             assert_eq!(error.code(), "InvalidArgumentException");
             assert!(error.message().contains(field), "{}", error.message());
+        }
+    }
+
+    /// Destination KMS is delivered (as SSE-KMS), not rejected at admission,
+    /// and the key is captured with the rest of the delivery configuration.
+    #[test]
+    fn kms_encryption_is_captured_not_rejected() {
+        let arn = "arn:aws:kms:us-east-1:123456789012:key/example";
+        let dest = destination(json!({
+            "EncryptionConfiguration": {"KMSEncryptionConfig": {"AWSKMSKeyARN": arn}}
+        }));
+        let config = delivery_config(&dest).unwrap();
+        assert_eq!(
+            config.encryption,
+            DeliveredEncryption::SseKms {
+                key_id: Some(arn.to_owned())
+            }
+        );
+        for extra in [
+            json!({}),
+            json!({"EncryptionConfiguration": {"NoEncryptionConfig": "NoEncryption"}}),
+        ] {
+            assert_eq!(
+                delivery_config(&destination(extra)).unwrap().encryption,
+                DeliveredEncryption::AsDelivered
+            );
         }
     }
 

@@ -34,14 +34,10 @@ pub struct WorkerAlreadyStarted;
 /// data arrives, then discards it.
 const MAX_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Runtime retry delay after `failures` consecutive failed attempts of one head:
-/// 1 s doubling to a 30 s cap. Retries still start only on worker ticks. The cap
-/// keeps a recovered destination (such as a bucket created late) responsive
-/// while bounding re-encoding work and warnings for a persistently failing stream.
-fn retry_delay(failures: u32) -> Duration {
-    const CAP: Duration = Duration::from_secs(30);
-    Duration::from_secs(1u64 << failures.saturating_sub(1).min(5)).min(CAP)
-}
+/// Delay before retrying a failed S3 delivery. AWS documents that Firehose
+/// retries delivery to S3 every 5 seconds until the 24-hour retention ends
+/// ([`MAX_RETENTION`]). Retries still start only on worker ticks.
+const RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 struct TimePoint {
@@ -97,7 +93,7 @@ struct StreamBuffer {
     queue: VecDeque<Arc<DetachedBatch>>,
     in_flight: bool,
     retry_not_before: Option<Instant>,
-    // Consecutive failed attempts of the current head; drives the retry backoff.
+    // Consecutive failed attempts of the current head, reported in warnings.
     failures: u32,
     // Runtime-only diagnostic latch: the stream version whose unsupported
     // configuration was last reported, so each update warns once rather than
@@ -632,7 +628,7 @@ impl EngineCore {
                         "Firehose batch discarded after failing delivery for 24 hours");
                     return true;
                 } else {
-                    let delay = retry_delay(buffer.failures);
+                    let delay = RETRY_INTERVAL;
                     buffer.retry_not_before = Some(now.monotonic + delay);
                     tracing::warn!(stream = ?key.name, account = %key.account_id, region = %key.region,
                         ?object_key, attempt = buffer.failures, retry_in_secs = delay.as_secs(), ?error,
@@ -830,7 +826,7 @@ mod tests {
             "bucket".into(),
             fakecloud_s3::S3Bucket::new("bucket", REGION, "owner"),
         );
-        f.advance(2);
+        f.advance(RETRY_INTERVAL.as_secs());
         f.turn().await;
         {
             let state = s3.read();
@@ -1064,7 +1060,7 @@ mod tests {
         f.enqueue(vec![Bytes::from_static(b"successor")]);
         f.schedule(&mut jobs, true);
         assert!(jobs.is_empty());
-        f.advance(1);
+        f.advance(RETRY_INTERVAL.as_secs());
         // Clock movement plus admission notification alone cannot retry a head.
         f.schedule(&mut jobs, false);
         assert!(jobs.is_empty());
@@ -1231,7 +1227,7 @@ mod tests {
                 },
             });
         }
-        f.advance(1);
+        f.advance(RETRY_INTERVAL.as_secs());
         let ready = f.engine.core.prepare(4, false, false, &BTreeSet::new());
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].batch.batch.stream.name, "e");
@@ -1318,7 +1314,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consecutive_failures_back_off_to_cap_and_success_resets() {
+    async fn failed_head_retries_every_five_seconds_and_success_resets() {
         let f = Fixture::new(0);
         let fail = |job: WriteJob| {
             assert!(!f.engine.core.complete(Completion {
@@ -1358,7 +1354,8 @@ mod tests {
             }
             job
         });
-        assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30]);
+        // AWS retries S3 delivery every 5 seconds, with no backoff.
+        assert_eq!(delays, [5; 7]);
         let warnings = capture.0.lock().clone();
         assert_eq!(
             warnings
@@ -1366,17 +1363,18 @@ mod tests {
                 .map(|w| (w["attempt"].as_str(), w["retry_in_secs"].as_str()))
                 .collect::<Vec<_>>(),
             [
-                ("1", "1"),
-                ("2", "2"),
-                ("3", "4"),
-                ("4", "8"),
-                ("5", "16"),
-                ("6", "30"),
-                ("7", "30")
+                ("1", "5"),
+                ("2", "5"),
+                ("3", "5"),
+                ("4", "5"),
+                ("5", "5"),
+                ("6", "5"),
+                ("7", "5")
             ]
         );
         assert!(warnings.iter().all(|w| w["level"] == "WARN"));
-        // A delivered head resets the schedule for its successor.
+        // A delivered head resets the attempt count; its successor retries
+        // on the same 5-second cadence.
         assert!(f.engine.core.complete(Completion {
             batch: job.batch,
             result: Ok(DeliveryWriteOutcome::Committed),
@@ -1391,7 +1389,7 @@ mod tests {
         assert_eq!(next.batch.batch.records, vec![Bytes::from_static(b"next")]);
         fail(next);
         let (waited, retry) = eligible_after();
-        assert_eq!(waited, 1);
+        assert_eq!(waited, 5);
         assert!(f.engine.core.complete(Completion {
             batch: retry.batch,
             result: Ok(DeliveryWriteOutcome::Committed),
@@ -1470,7 +1468,7 @@ mod tests {
         f.turn().await;
         assert_eq!(queued(&f), 1);
         // The next failed retry is past 24 hours from arrival: discarded.
-        f.advance(2);
+        f.advance(RETRY_INTERVAL.as_secs());
         let capture = CapturedEvents::default();
         {
             let _default = tracing::subscriber::set_default(capture.clone());
@@ -1489,7 +1487,7 @@ mod tests {
         f.turn().await;
         assert_eq!(queued(&f), 1);
         *f.engine.core.writer.write() = Some(f.writer.clone());
-        f.advance(1);
+        f.advance(RETRY_INTERVAL.as_secs());
         f.turn().await;
         assert_eq!(queued(&f), 0);
         assert_eq!(
@@ -2481,7 +2479,7 @@ mod tests {
         let first = next_attempt(&mut entered).await;
         first.reply.send(Action::Panic).unwrap();
         f.finish(&mut jobs).await;
-        f.advance(1);
+        f.advance(RETRY_INTERVAL.as_secs());
         f.schedule(&mut jobs, true);
         assert!(Arc::ptr_eq(
             jobs.batches.values().next().unwrap(),
