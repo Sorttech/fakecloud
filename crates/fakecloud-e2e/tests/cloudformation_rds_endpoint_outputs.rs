@@ -8,9 +8,8 @@
 //! placeholder and another stack's `Fn::ImportValue` dialled a host that does
 //! not resolve.
 //!
-//! Covers CreateStack and the change-set path `cdk deploy` uses (the latter
-//! ignored until ExecuteChangeSet waits too). With no
-//! container runtime the instance is `available` at insert and the endpoint
+//! Covers CreateStack, the change-set path `cdk deploy` uses, and an
+//! UpdateStack that adds the instance. With no container runtime the instance is `available` at insert and the endpoint
 //! never moves, so the assertions hold trivially there.
 
 mod helpers;
@@ -80,9 +79,10 @@ fn output<'a>(stack: &'a Stack, key: &str) -> &'a str {
         .unwrap_or_else(|| panic!("output {key} present"))
 }
 
-/// Once the stack is CREATE_COMPLETE, the instance is available and every
-/// value derived from its endpoint matches DescribeDBInstances.
-async fn assert_real_endpoint(server: &TestServer, stack_name: &str, id: &str) {
+/// Once the stack is `complete` (CREATE_COMPLETE or UPDATE_COMPLETE), the
+/// instance is available and every value derived from its endpoint matches
+/// DescribeDBInstances.
+async fn assert_real_endpoint(server: &TestServer, stack_name: &str, id: &str, complete: &str) {
     let cfn = server.cloudformation_client().await;
     let rds = server.rds_client().await;
     let ssm = server.ssm_client().await;
@@ -90,7 +90,7 @@ async fn assert_real_endpoint(server: &TestServer, stack_name: &str, id: &str) {
     let stack = wait_stack_terminal(&cfn, stack_name).await;
     assert_eq!(
         stack.stack_status().map(|s| s.as_str()),
-        Some("CREATE_COMPLETE"),
+        Some(complete),
         "reason: {:?}",
         stack.stack_status_reason()
     );
@@ -151,14 +151,16 @@ async fn create_stack_outputs_carry_real_rds_endpoint() {
         .send()
         .await
         .expect("create_stack");
-    assert_real_endpoint(&server, "rds-endpoint-create", "rds-endpoint-create").await;
+    assert_real_endpoint(
+        &server,
+        "rds-endpoint-create",
+        "rds-endpoint-create",
+        "CREATE_COMPLETE",
+    )
+    .await;
 }
 
-// ExecuteChangeSet still provisions inside the request under the state write
-// lock, so it cannot wait for the container there; it needs moving to a
-// detached task first, as CreateStack does.
 #[tokio::test]
-#[ignore = "ExecuteChangeSet does not yet wait for the RDS container"]
 async fn execute_change_set_outputs_carry_real_rds_endpoint() {
     let server = TestServer::start().await;
     let cfn = server.cloudformation_client().await;
@@ -171,12 +173,128 @@ async fn execute_change_set_outputs_carry_real_rds_endpoint() {
         .send()
         .await
         .expect("create_change_set");
+    let cs_id = cs.id().expect("change set id");
     cfn.execute_change_set()
-        .change_set_name(cs.id().expect("change set id"))
+        .change_set_name(cs_id)
         .send()
         .await
         .expect("execute_change_set");
-    assert_real_endpoint(&server, "rds-endpoint-cs", "rds-endpoint-cs").await;
+    if !helpers::container_cli().is_empty() {
+        // ExecuteChangeSet returns while the container is still booting.
+        let stack = cfn
+            .describe_stacks()
+            .stack_name("rds-endpoint-cs")
+            .send()
+            .await
+            .expect("describe_stacks");
+        assert_eq!(
+            stack.stacks()[0].stack_status().map(|s| s.as_str()),
+            Some("CREATE_IN_PROGRESS")
+        );
+        assert_eq!(execution_status(&cfn, cs_id).await, "EXECUTE_IN_PROGRESS");
+    }
+    wait_stack_terminal(&cfn, "rds-endpoint-cs").await;
+    assert_eq!(execution_status(&cfn, cs_id).await, "EXECUTE_COMPLETE");
+    assert_real_endpoint(
+        &server,
+        "rds-endpoint-cs",
+        "rds-endpoint-cs",
+        "CREATE_COMPLETE",
+    )
+    .await;
+}
+
+async fn execution_status(cfn: &aws_sdk_cloudformation::Client, cs_id: &str) -> String {
+    cfn.describe_change_set()
+        .change_set_name(cs_id)
+        .send()
+        .await
+        .expect("describe_change_set")
+        .execution_status()
+        .expect("execution status")
+        .as_str()
+        .to_string()
+}
+
+/// A change set whose DB instance never starts fails the execution and rolls
+/// the stack back, as CreateStack does (see
+/// `create_stack_fails_when_rds_container_fails`).
+#[tokio::test]
+async fn execute_change_set_fails_when_rds_container_fails() {
+    if helpers::container_cli().is_empty() {
+        return;
+    }
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let rds = server.rds_client().await;
+    let id = "rds-endpoint-cs-broken";
+    let cs = cfn
+        .create_change_set()
+        .stack_name(id)
+        .change_set_name("create")
+        .change_set_type(ChangeSetType::Create)
+        .template_body(template_with_version(id, "99.1"))
+        .send()
+        .await
+        .expect("create_change_set");
+    let cs_id = cs.id().expect("change set id");
+    cfn.execute_change_set()
+        .change_set_name(cs_id)
+        .send()
+        .await
+        .expect("execute_change_set");
+
+    let stack = wait_stack_terminal(&cfn, id).await;
+    assert_eq!(
+        stack.stack_status().map(|s| s.as_str()),
+        Some("ROLLBACK_COMPLETE")
+    );
+    let reason = stack.stack_status_reason().unwrap_or_default();
+    assert!(
+        reason.contains("Db") && reason.contains("DB Instance is in state: failed"),
+        "reason: {reason}"
+    );
+    assert_eq!(execution_status(&cfn, cs_id).await, "EXECUTE_FAILED");
+    let described = rds
+        .describe_db_instances()
+        .db_instance_identifier(id)
+        .send()
+        .await;
+    assert!(
+        described.is_err(),
+        "rolled-back instance is gone: {described:?}"
+    );
+}
+
+/// An UpdateStack that adds the instance to a running stack must not reach
+/// UPDATE_COMPLETE, or export the endpoint, before the instance is available.
+#[tokio::test]
+async fn update_stack_adding_instance_outputs_carry_real_rds_endpoint() {
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let id = "rds-endpoint-update";
+    cfn.create_stack()
+        .stack_name(id)
+        .template_body(
+            r#"{"Resources": {"Seed": {"Type": "AWS::SSM::Parameter",
+                "Properties": {"Name": "/rds-endpoint-update/seed", "Type": "String", "Value": "x"}}}}"#,
+        )
+        .send()
+        .await
+        .expect("create_stack");
+    let created = wait_stack_terminal(&cfn, id).await;
+    assert_eq!(
+        created.stack_status().map(|s| s.as_str()),
+        Some("CREATE_COMPLETE")
+    );
+
+    cfn.update_stack()
+        .stack_name(id)
+        .template_body(template(id))
+        .send()
+        .await
+        .expect("update_stack");
+    assert_real_endpoint(&server, id, id, "UPDATE_COMPLETE").await;
 }
 
 /// A DB instance whose container never starts fails the resource and rolls the

@@ -1078,12 +1078,14 @@ pub struct ResourceProvisioner {
     /// in a detached task, so its synchronous invoke never blocks the client or
     /// the state lock).
     pub defer_custom_invokes: bool,
-    /// When `true`, `provision_stack_resources` waits after creating a
-    /// container-backed resource until its container is up (see
-    /// `stabilize_resource`), so dependents, Outputs and Exports read the real
-    /// endpoint. Only set by a `CreateStack` running in its detached task: the
-    /// wait can last minutes, which must never happen on a request path or
-    /// under the state write lock (the #1539/#1730 timeout lesson).
+    /// When `true`, `provision_stack_resources` and `apply_resource_updates`
+    /// wait after creating a container-backed resource until its container is
+    /// up (see `stabilize_resource`), so dependents, Outputs and Exports read
+    /// the real endpoint. Only set by a `CreateStack`, `ExecuteChangeSet` or
+    /// `UpdateStack` provisioning in a detached task (see
+    /// `waits_for_containers`): the wait can last minutes, which must never
+    /// happen on a request path or under the state write lock (the #1539/#1730
+    /// timeout lesson).
     pub wait_for_container_backing: bool,
     /// Fine-grained S3 disk store. Bucket create/delete (and bucket-policy
     /// updates) write through this so a CFN-provisioned bucket lands on disk,

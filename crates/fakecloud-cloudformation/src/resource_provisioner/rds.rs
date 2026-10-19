@@ -5,7 +5,7 @@
 
 use super::*;
 
-/// How long CreateStack waits for a DB instance's backing container. AWS's
+/// How long a stack op waits for a DB instance's backing container. AWS's
 /// handler allows 2160 minutes ("timeoutInMinutes": 2160 in
 /// aws-rds-dbinstance.json at the same commit as below), which means nothing
 /// for a local container. 15 minutes covers a cold image pull; raise it here
