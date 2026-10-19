@@ -145,6 +145,7 @@ impl ResourceProvisioner {
             pending_container_teardowns: self.pending_container_teardowns.clone(),
             pending_custom_invokes: self.pending_custom_invokes.clone(),
             defer_custom_invokes: self.defer_custom_invokes,
+            wait_for_container_backing: self.wait_for_container_backing,
             s3_store: self.s3_store.clone(),
             kms_hook: self.kms_hook.clone(),
             quota_provider: self.quota_provider.clone(),

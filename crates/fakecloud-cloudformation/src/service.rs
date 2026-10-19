@@ -477,6 +477,23 @@ pub(crate) fn provision_stack_resources(
 
             match provisioner.create_resource(&resolved_def) {
                 Ok(mut stack_resource) => {
+                    // The resource exists, so a failure to stabilize is
+                    // final, not a dependency to retry: roll it back with
+                    // everything created before it.
+                    if let Err(err) = provisioner.stabilize_resource(&mut stack_resource) {
+                        resources.push(stack_resource);
+                        for r in &resources {
+                            let _ = provisioner.delete_resource(r);
+                        }
+                        return Err(AwsServiceError::aws_error(
+                            StatusCode::BAD_REQUEST,
+                            "ValidationError",
+                            format!(
+                                "Failed to create resource {}: {err}",
+                                resource_def.logical_id
+                            ),
+                        ));
+                    }
                     physical_ids.insert(
                         stack_resource.logical_id.clone(),
                         stack_resource.physical_id.clone(),
@@ -1416,6 +1433,8 @@ impl CloudFormationService {
             // flip this on (see `provisioner_deferred`) to queue the invoke and
             // drain it off the request path instead.
             defer_custom_invokes: false,
+            // Only CreateStack's detached task turns this on.
+            wait_for_container_backing: false,
             s3_store: self.s3_store.clone(),
             kms_hook: self.kms_hook.clone(),
             quota_provider: self.quota_provider.clone(),
@@ -2155,7 +2174,7 @@ impl CloudFormationService {
             );
         }
 
-        let ctx = CreateStackContext {
+        let mut ctx = CreateStackContext {
             state: self.state.clone(),
             delivery: self.deps.delivery.clone(),
             snapshot_store: self.snapshot_store.clone(),
@@ -2196,7 +2215,17 @@ impl CloudFormationService {
             tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
             Ok(tokio::runtime::RuntimeFlavor::MultiThread)
         );
-        if has_custom_resource && multi_thread {
+        // A container-backed DB instance is only created once its container is
+        // up (see `stabilize_rds_db_instance`), which can take minutes, so it
+        // takes the detached path too.
+        let backs_rds_container = self.deps.rds_runtime.is_some()
+            && ctx
+                .resource_defs
+                .iter()
+                .any(|r| r.resource_type == "AWS::RDS::DBInstance");
+        if (has_custom_resource || backs_rds_container) && multi_thread {
+            // Off the request path, so provisioning may wait for containers.
+            ctx.provisioner.wait_for_container_backing = true;
             // Emit the IN_PROGRESS lifecycle notification only on the async
             // path — AWS sends it before the terminal CREATE_COMPLETE. The
             // inline path provisions instantly and sends only CREATE_COMPLETE,
@@ -2249,6 +2278,7 @@ impl CloudFormationService {
         // into spawn_blocking, so the post-provision drain (below) can back
         // freshly-inserted container resources with REAL containers.
         let container_spawns = provisioner.pending_container_spawns.clone();
+        let container_teardowns = provisioner.pending_container_teardowns.clone();
         let backing_handles = ContainerBackingHandles::from_provisioner(&provisioner)
             .with_snapshot_hooks(&snapshot_hooks);
 
@@ -2286,6 +2316,11 @@ impl CloudFormationService {
         let resources = match provisioned {
             Ok(resources) => resources,
             Err(reason) => {
+                // The rollback removed the records; reap any containers that
+                // were already started for them (a DB instance that failed to
+                // stabilize, or one created before the failing resource).
+                backing_handles
+                    .spawn_teardown_intents(std::mem::take(&mut *container_teardowns.lock()));
                 Self::mark_create_failed(
                     &state,
                     &delivery,
