@@ -923,3 +923,78 @@ async fn s3_bucket_endpoint_attributes_follow_region() {
         assert_eq!(outputs.get("Website").copied(), Some(website), "{region}");
     }
 }
+
+/// UpdateStack that adds a nested `AWS::CloudFormation::Stack` must complete.
+/// The nested-stack provisioner records the child stack in the
+/// CloudFormation state, so provisioning must not run while UpdateStack holds
+/// that state's write lock, or the request never returns.
+#[tokio::test]
+async fn update_stack_adds_nested_stack() {
+    let server = TestServer::start().await;
+    let cf = server.cloudformation_client().await;
+    let s3 = server.s3_client().await;
+
+    let child = r#"{
+        "Resources": {
+            "ChildTopic": {
+                "Type": "AWS::SNS::Topic",
+                "Properties": {"TopicName": "update-nested-child-topic"}
+            }
+        }
+    }"#;
+    s3.create_bucket()
+        .bucket("cfn-update-nested")
+        .send()
+        .await
+        .unwrap();
+    s3.put_object()
+        .bucket("cfn-update-nested")
+        .key("child.json")
+        .body(aws_sdk_s3::primitives::ByteStream::from(
+            child.as_bytes().to_vec(),
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    cf.create_stack()
+        .stack_name("update-nested-parent")
+        .template_body(
+            r#"{"Resources": {"Seed": {"Type": "AWS::SNS::Topic", "Properties": {"TopicName": "update-nested-seed"}}}}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    let parent = r#"{
+        "Resources": {
+            "Seed": {"Type": "AWS::SNS::Topic", "Properties": {"TopicName": "update-nested-seed"}},
+            "Child": {
+                "Type": "AWS::CloudFormation::Stack",
+                "Properties": {"TemplateURL": "https://s3.amazonaws.com/cfn-update-nested/child.json"}
+            }
+        }
+    }"#;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        cf.update_stack()
+            .stack_name("update-nested-parent")
+            .template_body(parent)
+            .send(),
+    )
+    .await
+    .expect("UpdateStack returned")
+    .unwrap();
+
+    let status = helpers::wait_until(std::time::Duration::from_secs(60), || async {
+        let out = cf
+            .describe_stacks()
+            .stack_name("update-nested-parent")
+            .send()
+            .await
+            .ok()?;
+        let s = out.stacks().first()?.stack_status()?.as_str().to_string();
+        (!s.ends_with("IN_PROGRESS")).then_some(s)
+    })
+    .await;
+    assert_eq!(status.as_deref(), Some("UPDATE_COMPLETE"));
+}

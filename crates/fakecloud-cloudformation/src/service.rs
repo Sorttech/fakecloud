@@ -3554,12 +3554,10 @@ impl CloudFormationService {
             )?;
         }
 
-        // `provisioner_deferred`: apply_resource_updates runs inside the state
-        // write lock (inline) or on a blocking thread (detached); a synchronous
-        // custom-resource Lambda invoke there would stall every other CFN op
-        // behind the lock and could block the client past its read timeout.
-        // Queue those invokes and drain them off the request path after the
-        // lock is dropped.
+        // `provisioner_deferred`: an inline update provisions inside the
+        // request, where a synchronous custom-resource Lambda invoke could block
+        // the client past its read timeout. Queue those invokes and settle them
+        // off the request path.
         let mut provisioner =
             self.provisioner_deferred(&found_stack_id, &req.account_id, &req.region);
         let detached = self.waits_for_containers(&parsed.resources);
@@ -3576,33 +3574,31 @@ impl CloudFormationService {
         );
 
         let stack_name = input.stack_name.clone();
+        let parsed_resources = parsed.resources;
         let run = UpdateStackRun {
             account_id: req.account_id.clone(),
             region: req.region.clone(),
             request_id: req.request_id.clone(),
             input,
-            resources: parsed.resources,
             description: parsed.description,
             provisioner: Arc::new(provisioner),
-            imports,
             found_stack_id,
             export_owner_name,
             previous_template,
             previous_parameters,
             imported_names,
         };
-        if !detached {
-            return self.finish_update_stack(run, None).await;
-        }
-
         // Real CloudFormation returns at once and updates in the background:
         // "After the call completes successfully, the stack update starts. You
         // can check the status of the stack through the DescribeStacks action."
         // (UpdateStack, CloudFormation API Reference,
         // https://docs.aws.amazon.com/AWSCloudFormation/latest/APIReference/API_UpdateStack.html,
         // checked 2026-10-19). A DB instance's container can take minutes, so
-        // hold the stack at UPDATE_IN_PROGRESS and provision in a detached task
-        // without the state lock.
+        // hold the stack at UPDATE_IN_PROGRESS and provision in a detached task.
+        //
+        // Inline or detached, provisioning runs on a copy of the stack without
+        // the state lock: the nested-stack provisioner takes that lock to
+        // record its child stack, so provisioning under it never returned.
         let held = self
             .state
             .write()
@@ -3621,11 +3617,30 @@ impl CloudFormationService {
                 );
                 Some(stack)
             });
-        // Gone since the checks above: the inline path answers that case (see
-        // the synthetic-success note there).
+        // Gone since the checks above: answer as for a stack that was never
+        // there (see the synthetic-success note in `finish_update_stack`).
         let Some(stack) = held else {
-            return self.finish_update_stack(run, None).await;
+            return Ok(missing_stack_update_response(
+                &run.found_stack_id,
+                &run.account_id,
+                &run.region,
+                &run.input.stack_name,
+                &run.request_id,
+            ));
         };
+        let resource_defs = parsed_resources;
+        if !detached {
+            let applied = apply_resource_updates_unlocked(
+                stack,
+                run.provisioner.clone(),
+                resource_defs,
+                run.input.template_body.clone(),
+                run.input.parameters.clone(),
+                imports,
+            )
+            .await;
+            return self.finish_update_stack(run, applied).await;
+        }
         Self::send_stack_notification(
             &self.deps.delivery,
             &stack.notification_arns,
@@ -3636,19 +3651,16 @@ impl CloudFormationService {
         let stack_id = stack.stack_id.clone();
         let svc = self.clone();
         tokio::spawn(async move {
-            let mut run = run;
-            // The inline arm of `finish_update_stack` is the only other reader
-            // of the definitions and imports.
             let applied = apply_resource_updates_unlocked(
                 stack,
                 run.provisioner.clone(),
-                std::mem::take(&mut run.resources),
+                resource_defs,
                 run.input.template_body.clone(),
                 run.input.parameters.clone(),
-                std::mem::take(&mut run.imports),
+                imports,
             )
             .await;
-            if let Err(err) = svc.finish_update_stack(run, Some(applied)).await {
+            if let Err(err) = svc.finish_update_stack(run, applied).await {
                 tracing::warn!(%stack_name, "UpdateStack failed: {}", err.message());
             }
             // What the request handler persists after an inline update (see
@@ -3665,30 +3677,26 @@ impl CloudFormationService {
     /// terminal status, events, container backing, Outputs and Exports, and
     /// the notification.
     ///
-    /// `unlocked` is `None` to provision here, under the state lock, or the
-    /// result of `apply_resource_updates_unlocked` for a detached update that
-    /// already did, with the stack held at UPDATE_IN_PROGRESS.
+    /// `applied` is the result of `apply_resource_updates_unlocked`, run with
+    /// the stack held at UPDATE_IN_PROGRESS.
     async fn finish_update_stack(
         &self,
         run: UpdateStackRun,
-        unlocked: Option<UnlockedUpdate>,
+        applied: UnlockedUpdate,
     ) -> Result<AwsResponse, AwsServiceError> {
         let UpdateStackRun {
             account_id,
             region,
             request_id,
             input,
-            resources,
             description,
             provisioner,
-            imports,
             found_stack_id,
             export_owner_name,
             previous_template,
             previous_parameters,
             imported_names,
         } = run;
-        let detached = unlocked.is_some();
         let resources_before_update: Vec<StackResource>;
 
         // All `RwLockWriteGuard` work happens inside this block so the (non-Send)
@@ -3717,21 +3725,12 @@ impl CloudFormationService {
                 .as_ref()
                 .is_some_and(|state| state.live_stack(&input.stack_name).is_some());
             let Some(state) = state.filter(|_| stack_exists) else {
-                let stack_id = if found_stack_id.is_empty() {
-                    format!(
-                        "arn:{}:cloudformation:{}:{}:stack/{}/{}",
-                        partition_for(&region),
-                        region,
-                        account_id,
-                        input.stack_name,
-                        uuid::Uuid::new_v4()
-                    )
-                } else {
-                    found_stack_id.clone()
-                };
-                return Ok(AwsResponse::xml(
-                    StatusCode::OK,
-                    xml_responses::update_stack_response(&stack_id, &request_id),
+                return Ok(missing_stack_update_response(
+                    &found_stack_id,
+                    &account_id,
+                    &region,
+                    &input.stack_name,
+                    &request_id,
                 ));
             };
             let (
@@ -3750,35 +3749,17 @@ impl CloudFormationService {
                 // export-collision rollback below can put back a resource list
                 // that matches the template it restores.
                 resources_before_update = stack.resources.clone();
-                let update_result = match unlocked {
-                    None => {
-                        stack.status = "UPDATE_IN_PROGRESS".to_string();
-                        apply_resource_updates(
-                            stack,
-                            &resources,
-                            &input.template_body,
-                            &input.parameters,
-                            &provisioner,
-                            &imports,
-                        )
-                    }
-                    Some(applied) => {
-                        // Only a stack still held at the status the request
-                        // set is this update's to finish; anything else moved
-                        // it on (a delete, say) while the resources provisioned.
-                        if stack.status != "UPDATE_IN_PROGRESS" {
-                            return Err(AwsServiceError::aws_error(
-                                StatusCode::BAD_REQUEST,
-                                "ValidationError",
-                                format!("Stack [{}] moved on during the update", input.stack_name),
-                            ));
-                        }
-                        if let Some(resources) = applied.resources {
-                            stack.resources = resources;
-                        }
-                        applied.result
-                    }
-                };
+                // Only a stack still held at the status the request set is
+                // this update's to finish; anything else moved it on (a
+                // delete, say) while the resources provisioned.
+                if stack.status != "UPDATE_IN_PROGRESS" {
+                    return Err(AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "ValidationError",
+                        format!("Stack [{}] moved on during the update", input.stack_name),
+                    ));
+                }
+                let update_result = applied.write_back(stack);
 
                 let stack_id = stack.stack_id.clone();
                 let stack_name_owned = stack.name.clone();
@@ -3826,17 +3807,7 @@ impl CloudFormationService {
             };
 
             // Emit lifecycle events (now that the &mut Stack borrow is dropped).
-            // A detached update recorded UPDATE_IN_PROGRESS when the request
-            // returned.
-            if !detached {
-                record_stack_status_event(
-                    state,
-                    &stack_id,
-                    &stack_name_owned,
-                    "AWS::CloudFormation::Stack",
-                    "UPDATE_IN_PROGRESS",
-                );
-            }
+            // UPDATE_IN_PROGRESS was recorded when the request held the stack.
             let update_result = match update_result {
                 Ok(changes) => {
                     // Capture every service touched by the update (created,
@@ -4284,15 +4255,42 @@ struct UpdateStackRun {
     region: String,
     request_id: String,
     input: UpdateStackInput,
-    resources: Vec<template::ResourceDefinition>,
     description: Option<String>,
     provisioner: Arc<ResourceProvisioner>,
-    imports: BTreeMap<String, String>,
     found_stack_id: String,
     export_owner_name: String,
     previous_template: String,
     previous_parameters: BTreeMap<String, String>,
     imported_names: Vec<String>,
+}
+
+/// UpdateStack's reply for a stack that does not exist. UpdateStack declares
+/// only `InsufficientCapabilitiesException` and `TokenAlreadyExistsException`
+/// (see `finish_update_stack`), so this echoes the stack id, or a generated
+/// one, as a success.
+fn missing_stack_update_response(
+    found_stack_id: &str,
+    account_id: &str,
+    region: &str,
+    stack_name: &str,
+    request_id: &str,
+) -> AwsResponse {
+    let stack_id = if found_stack_id.is_empty() {
+        format!(
+            "arn:{}:cloudformation:{}:{}:stack/{}/{}",
+            partition_for(region),
+            region,
+            account_id,
+            stack_name,
+            uuid::Uuid::new_v4()
+        )
+    } else {
+        found_stack_id.to_string()
+    };
+    AwsResponse::xml(
+        StatusCode::OK,
+        xml_responses::update_stack_response(&stack_id, request_id),
+    )
 }
 
 /// Parsed + validated inputs for `UpdateStack`.
@@ -4669,21 +4667,71 @@ fn apply_resource_changes(
     Ok(())
 }
 
-/// The outcome of `apply_resource_updates_unlocked`: the stack's resources
-/// after the update (`None` if the provisioning task panicked, leaving the
-/// stack's own list as it was), and the update's result.
+/// The outcome of `apply_resource_updates_unlocked`: the parts of the stack
+/// the update changed on its copy (`None` if the provisioning task panicked,
+/// leaving the stack as it was), and the update's result.
 pub(crate) struct UnlockedUpdate {
-    pub resources: Option<Vec<StackResource>>,
+    pub changed: Option<UpdatedStackParts>,
     pub result: Result<Vec<ResourceChange>, String>,
 }
 
-/// Run `apply_resource_updates` on a copy of a stack, on a blocking thread and
-/// without the state lock, so a provisioner with `wait_for_container_backing`
-/// may wait minutes for a container (the #1539/#1730 timeout lesson). The
-/// caller has already moved the stack to `*_IN_PROGRESS`; it writes the
-/// returned resources back, the only part of the stack the update changes.
-pub(crate) async fn apply_resource_updates_unlocked(
+/// Everything `apply_resource_updates` changes on a stack: its resources, and
+/// the logical ids a failed run leaves to be re-applied by the next update.
+pub(crate) struct UpdatedStackParts {
+    resources: Vec<StackResource>,
+    reapply_logical_ids: BTreeSet<String>,
+}
+
+impl UnlockedUpdate {
+    /// Write the copy's changes back onto the stored stack and return the
+    /// update's result.
+    pub(crate) fn write_back(
+        self,
+        stack: &mut crate::state::Stack,
+    ) -> Result<Vec<ResourceChange>, String> {
+        if let Some(changed) = self.changed {
+            stack.resources = changed.resources;
+            stack.reapply_logical_ids = changed.reapply_logical_ids;
+        }
+        self.result
+    }
+}
+
+/// Run `apply_resource_updates` on a copy of a stack, without the state lock.
+/// The caller has already moved the stack to `*_IN_PROGRESS`; it writes the
+/// returned parts back with `UnlockedUpdate::write_back`. Provisioning must
+/// never hold the lock: the nested-stack provisioner takes it to record its
+/// child stack.
+pub(crate) fn apply_resource_updates_to_copy(
     mut stack: crate::state::Stack,
+    provisioner: &ResourceProvisioner,
+    resource_defs: &[template::ResourceDefinition],
+    template_body: &str,
+    parameters: &BTreeMap<String, String>,
+    imports: &BTreeMap<String, String>,
+) -> UnlockedUpdate {
+    let result = apply_resource_updates(
+        &mut stack,
+        resource_defs,
+        template_body,
+        parameters,
+        provisioner,
+        imports,
+    );
+    UnlockedUpdate {
+        changed: Some(UpdatedStackParts {
+            resources: stack.resources,
+            reapply_logical_ids: stack.reapply_logical_ids,
+        }),
+        result,
+    }
+}
+
+/// `apply_resource_updates_to_copy` on a blocking thread, so a provisioner
+/// with `wait_for_container_backing` may wait minutes for a container (the
+/// #1539/#1730 timeout lesson).
+pub(crate) async fn apply_resource_updates_unlocked(
+    stack: crate::state::Stack,
     provisioner: Arc<ResourceProvisioner>,
     resource_defs: Vec<template::ResourceDefinition>,
     template_body: String,
@@ -4691,22 +4739,18 @@ pub(crate) async fn apply_resource_updates_unlocked(
     imports: BTreeMap<String, String>,
 ) -> UnlockedUpdate {
     tokio::task::spawn_blocking(move || {
-        let result = apply_resource_updates(
-            &mut stack,
+        apply_resource_updates_to_copy(
+            stack,
+            &provisioner,
             &resource_defs,
             &template_body,
             &parameters,
-            &provisioner,
             &imports,
-        );
-        UnlockedUpdate {
-            resources: Some(stack.resources),
-            result,
-        }
+        )
     })
     .await
     .unwrap_or_else(|join_err| UnlockedUpdate {
-        resources: None,
+        changed: None,
         result: Err(format!("provisioning task failed: {join_err}")),
     })
 }
