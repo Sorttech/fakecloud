@@ -998,3 +998,59 @@ async fn update_stack_adds_nested_stack() {
     .await;
     assert_eq!(status.as_deref(), Some("UPDATE_COMPLETE"));
 }
+
+/// An update whose resource fails to provision is still accepted: the call
+/// only starts the update ("You can check the status of the stack through the
+/// DescribeStacks action.", UpdateStack API Reference). The failure is
+/// reported on the stack, which rolls back.
+#[tokio::test]
+async fn update_stack_reports_a_failed_resource_on_the_stack() {
+    let server = TestServer::start().await;
+    let cf = server.cloudformation_client().await;
+    cf.create_stack()
+        .stack_name("update-failing-stack")
+        .template_body(
+            r#"{"Resources": {"Seed": {"Type": "AWS::SNS::Topic", "Properties": {"TopicName": "update-failing-seed"}}}}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    cf.update_stack()
+        .stack_name("update-failing-stack")
+        .template_body(
+            r#"{"Resources": {
+                "Seed": {"Type": "AWS::SNS::Topic", "Properties": {"TopicName": "update-failing-seed"}},
+                "BadSub": {"Type": "AWS::SNS::Subscription", "Properties": {
+                    "TopicArn": "arn:aws:sns:us-east-1:123456789012:no-such-topic",
+                    "Protocol": "sqs",
+                    "Endpoint": "arn:aws:sqs:us-east-1:123456789012:q1"}}
+            }}"#,
+        )
+        .send()
+        .await
+        .expect("UpdateStack accepts the update");
+
+    let stack = helpers::wait_until(std::time::Duration::from_secs(60), || async {
+        let out = cf
+            .describe_stacks()
+            .stack_name("update-failing-stack")
+            .send()
+            .await
+            .ok()?;
+        let s = out.stacks().first()?.clone();
+        (!s.stack_status()?.as_str().ends_with("IN_PROGRESS")).then_some(s)
+    })
+    .await
+    .expect("stack reached a terminal status");
+    assert_eq!(
+        stack.stack_status().map(|s| s.as_str()),
+        Some("UPDATE_ROLLBACK_COMPLETE")
+    );
+    assert!(
+        stack
+            .stack_status_reason()
+            .is_some_and(|r| r.contains("BadSub")),
+        "reason names the failed resource: {:?}",
+        stack.stack_status_reason()
+    );
+}

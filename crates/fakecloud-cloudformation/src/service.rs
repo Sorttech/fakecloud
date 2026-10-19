@@ -3880,10 +3880,15 @@ impl CloudFormationService {
                         &stack_id,
                         "UPDATE_FAILED",
                     );
-                    return Err(AwsServiceError::aws_error(
-                        StatusCode::BAD_REQUEST,
-                        "InsufficientCapabilitiesException",
-                        error_msg,
+                    // The failure is the stack's to report, as
+                    // UPDATE_ROLLBACK_COMPLETE with the reason recorded above:
+                    // the call only starts the update ("You can check the
+                    // status of the stack through the DescribeStacks action.",
+                    // UpdateStack API Reference).
+                    tracing::warn!(stack = %stack_name_for_notif, "UpdateStack failed: {error_msg}");
+                    return Ok(AwsResponse::xml(
+                        StatusCode::OK,
+                        xml_responses::update_stack_response(&stack_id, &request_id),
                     ));
                 }
             };
@@ -5537,8 +5542,10 @@ mod tests {
         let req = make_request("UpdateStack", update_params);
         let result = svc.update_stack(&req).await;
 
-        // Should return an error
-        assert!(result.is_err());
+        // The call only starts the update, so it succeeds; the failure is
+        // reported on the stack ("You can check the status of the stack
+        // through the DescribeStacks action.", UpdateStack API Reference).
+        assert!(result.is_ok());
 
         // Stack status should be UPDATE_ROLLBACK_COMPLETE — matches the
         // terminal status real CloudFormation lands on after a failed
@@ -5583,16 +5590,22 @@ mod tests {
             .clone()
     }
 
+    /// Apply an update and return its outcome. The call itself only starts
+    /// the update and succeeds ("You can check the status of the stack
+    /// through the DescribeStacks action.", UpdateStack API Reference); a
+    /// failure is the stack's rollback status, returned here as its reason.
     async fn firehose_retry_apply(
         svc: &CloudFormationService,
         mut params: HashMap<String, String>,
         change_set: bool,
         name: &str,
-    ) -> Result<AwsResponse, AwsServiceError> {
+    ) -> Result<(), String> {
         if change_set {
             params.insert("ChangeSetName".to_string(), name.to_string());
             params.insert("ChangeSetType".to_string(), "UPDATE".to_string());
-            svc.handle(make_request("CreateChangeSet", params)).await?;
+            svc.handle(make_request("CreateChangeSet", params))
+                .await
+                .expect("CreateChangeSet");
             svc.handle(make_request(
                 "ExecuteChangeSet",
                 HashMap::from([
@@ -5601,9 +5614,17 @@ mod tests {
                 ]),
             ))
             .await
+            .expect("ExecuteChangeSet only starts the execution");
         } else {
-            svc.handle(make_request("UpdateStack", params)).await
+            svc.handle(make_request("UpdateStack", params))
+                .await
+                .expect("UpdateStack only starts the update");
         }
+        let stack = firehose_retry_stack(svc);
+        if stack.status.ends_with("ROLLBACK_COMPLETE") {
+            return Err(stack.status_reason.unwrap_or_default());
+        }
+        Ok(())
     }
 
     async fn firehose_retry_preserves_applied_metadata(change_set: bool) {
@@ -5678,7 +5699,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         for (err, stack, firehose) in attempts {
-            assert!(err.unwrap().message().contains("CompressionFormat"));
+            assert!(err.unwrap().contains("CompressionFormat"));
             assert_eq!(stack.status, "UPDATE_ROLLBACK_COMPLETE");
             assert_eq!(stack.template, before.template);
             assert_eq!(stack.parameters, before.parameters);
@@ -5805,9 +5826,8 @@ mod tests {
         let bad = firehose_drift_template("a2/", "BROTLI");
         let err = firehose_retry_apply(&svc, params(&bad), change_set, "bad-1")
             .await
-            .err()
-            .expect("invalid CompressionFormat must fail");
-        assert!(err.message().contains("CompressionFormat"));
+            .expect_err("invalid CompressionFormat must fail");
+        assert!(err.contains("CompressionFormat"));
         let stack = firehose_retry_stack(&svc);
         assert_eq!(stack.status, "UPDATE_ROLLBACK_COMPLETE");
         assert_eq!(stack.template, original);
@@ -5818,9 +5838,8 @@ mod tests {
         // The identical bad retry still reaches validation.
         let err = firehose_retry_apply(&svc, params(&bad), change_set, "bad-2")
             .await
-            .err()
-            .expect("identical invalid retry must fail");
-        assert!(err.message().contains("CompressionFormat"));
+            .expect_err("identical invalid retry must fail");
+        assert!(err.contains("CompressionFormat"));
 
         // Redeploying the OLD template re-applies A instead of skipping it as
         // unchanged against the stored template.
