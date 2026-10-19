@@ -72,13 +72,20 @@ async fn cfn_provisions_secret_target_attachment_with_generated_string() {
         .await
         .expect("create_stack");
 
-    let described = cfn
-        .describe_stacks()
-        .stack_name("sm-target-stack")
-        .send()
-        .await
-        .expect("describe_stacks");
-    let stack = described.stacks().first().expect("stack present");
+    // CreateStack provisions a container-backed DB instance in the
+    // background, as AWS does, so wait for the stack to settle.
+    let stack = helpers::wait_until(std::time::Duration::from_secs(300), || async {
+        let out = cfn
+            .describe_stacks()
+            .stack_name("sm-target-stack")
+            .send()
+            .await
+            .ok()?;
+        let s = out.stacks().first()?.clone();
+        (!s.stack_status()?.as_str().ends_with("IN_PROGRESS")).then_some(s)
+    })
+    .await
+    .expect("stack reached a terminal status");
     assert_eq!(
         stack.stack_status().unwrap().as_str(),
         "CREATE_COMPLETE",
