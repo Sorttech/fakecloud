@@ -383,9 +383,7 @@ pub(crate) struct ChangeSetExecution {
     stack_name: String,
     found_stack_id: String,
     template_body: String,
-    resources: Vec<template::ResourceDefinition>,
     cs_params: BTreeMap<String, String>,
-    cs_imports: BTreeMap<String, String>,
     cs_tags: BTreeMap<String, String>,
     cs_notif: Vec<String>,
     cs_hooks: Vec<Value>,
@@ -744,13 +742,13 @@ impl CloudFormationService {
     /// outcome: the stack's terminal status and events, the change set's
     /// `ExecutionStatus`, hook results, container backing and Outputs.
     ///
-    /// `unlocked` is `None` to provision here, under the state lock, or the
-    /// result of `apply_resource_updates_unlocked` for a detached execution
-    /// that already did, with the stack held at `*_IN_PROGRESS`.
+    /// `applied` is the result of provisioning a copy of the stack
+    /// (`apply_resource_updates_to_copy`), run with the stack held at
+    /// `*_IN_PROGRESS`.
     fn finish_change_set_execution(
         &self,
         exec: ChangeSetExecution,
-        unlocked: Option<crate::service::UnlockedUpdate>,
+        applied: crate::service::UnlockedUpdate,
     ) -> Result<(), AwsServiceError> {
         let ChangeSetExecution {
             aid,
@@ -759,15 +757,12 @@ impl CloudFormationService {
             stack_name,
             found_stack_id,
             template_body,
-            resources,
             cs_params,
-            cs_imports,
             cs_tags,
             cs_notif,
             cs_hooks,
             provisioner,
         } = exec;
-        let detached = unlocked.is_some();
 
         let stack_missing = || {
             AwsServiceError::aws_error(
@@ -793,41 +788,19 @@ impl CloudFormationService {
                 .values_mut()
                 .find(|st| st.stack_id == found_stack_id && st.status != "DELETE_COMPLETE")
                 .ok_or_else(stack_missing)?;
-            let (was_review, result) = match unlocked {
-                None => {
-                    let was_review = stack.status == "REVIEW_IN_PROGRESS";
-                    stack.status = if was_review {
-                        "CREATE_IN_PROGRESS"
-                    } else {
-                        "UPDATE_IN_PROGRESS"
-                    }
-                    .to_string();
-                    let result = crate::service::apply_resource_updates(
-                        stack,
-                        &resources,
-                        &template_body,
-                        &cs_params,
-                        &provisioner,
-                        &cs_imports,
-                    );
-                    (was_review, result)
-                }
-                Some(applied) => {
-                    // Only a stack still held at the status the request set
-                    // is this execution's to finish; anything else moved it
-                    // on (a delete, say) while the resources provisioned.
-                    if !matches!(
-                        stack.status.as_str(),
-                        "CREATE_IN_PROGRESS" | "UPDATE_IN_PROGRESS"
-                    ) {
-                        return Err(stack_missing());
-                    }
-                    if let Some(resources) = applied.resources {
-                        stack.resources = resources;
-                    }
-                    (stack.status == "CREATE_IN_PROGRESS", applied.result)
-                }
-            };
+            // Only a stack still held at the status the request set is this
+            // execution's to finish; anything else moved it on (a delete,
+            // say) while the resources provisioned.
+            if !matches!(
+                stack.status.as_str(),
+                "CREATE_IN_PROGRESS" | "UPDATE_IN_PROGRESS"
+            ) {
+                return Err(stack_missing());
+            }
+            if let Some(resources) = applied.resources {
+                stack.resources = resources;
+            }
+            let (was_review, result) = (stack.status == "CREATE_IN_PROGRESS", applied.result);
             let sid = stack.stack_id.clone();
             let sname = stack.name.clone();
             stack.template = template_body.clone();
@@ -867,16 +840,7 @@ impl CloudFormationService {
                 "UPDATE_ROLLBACK_COMPLETE",
             )
         };
-        // A detached execution recorded this when the request returned.
-        if !detached {
-            crate::service::record_stack_status_event(
-                state,
-                &sid,
-                &stack_name_owned,
-                "AWS::CloudFormation::Stack",
-                in_progress,
-            );
-        }
+        // `in_progress` was recorded when the request held the stack.
         let final_status = match &update_result {
             Ok(changes) => {
                 crate::service::record_stack_events(state, &sid, &stack_name_owned, changes);
@@ -965,11 +929,12 @@ impl CloudFormationService {
             handles.spawn_teardown_intents(std::mem::take(
                 &mut *provisioner.pending_container_teardowns.lock(),
             ));
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "ValidationError",
-                msg,
-            ));
+            // The failure is the stack's and the change set's to report, as
+            // recorded above: the call only starts the execution ("After the
+            // call successfully completes, CloudFormation starts updating the
+            // stack.", ExecuteChangeSet API Reference).
+            tracing::warn!(%stack_name_owned, "ExecuteChangeSet failed: {msg}");
+            return Ok(());
         }
 
         // The change set executed successfully. Back any newly-added
@@ -1759,13 +1724,11 @@ impl CloudFormationService {
                     })?
                 };
 
-                // `provisioner_deferred`: apply_resource_updates runs inside the
-                // state write lock (inline) or on a blocking thread (detached);
-                // a synchronous custom-resource Lambda invoke there would stall
-                // every other CFN op behind the lock and could block the client
-                // (cdk/sam/`aws cloudformation deploy`) past its read timeout.
-                // Queue those invokes and drain them off the request path after
-                // the lock is dropped (bug-audit 0.2).
+                // `provisioner_deferred`: an inline execution provisions inside
+                // the request, where a synchronous custom-resource Lambda invoke
+                // could block the client (cdk/sam/`aws cloudformation deploy`)
+                // past its read timeout. Queue those invokes and settle them off
+                // the request path (bug-audit 0.2).
                 let mut provisioner = self.provisioner_deferred(&found_stack_id, &aid, &req.region);
                 let detached = self.waits_for_containers(&parsed.resources);
                 provisioner.wait_for_container_backing = detached;
@@ -1786,18 +1749,12 @@ impl CloudFormationService {
                     stack_name,
                     found_stack_id,
                     template_body,
-                    resources: parsed.resources,
                     cs_params,
-                    cs_imports,
                     cs_tags,
                     cs_notif,
                     cs_hooks,
                     provisioner: std::sync::Arc::new(provisioner),
                 };
-                if !detached {
-                    self.finish_change_set_execution(exec, None)?;
-                    return Ok(xml_response("ExecuteChangeSet", String::new(), &rid));
-                }
 
                 // Real CloudFormation returns at once and provisions in the
                 // background: "After the call successfully completes,
@@ -1807,8 +1764,12 @@ impl CloudFormationService {
                 // https://docs.aws.amazon.com/AWSCloudFormation/latest/APIReference/API_ExecuteChangeSet.html,
                 // checked 2026-10-19). A DB instance's container can take
                 // minutes, so hold the stack at *_IN_PROGRESS and the change
-                // set at EXECUTE_IN_PROGRESS, and provision in a detached task
-                // without the state lock.
+                // set at EXECUTE_IN_PROGRESS, and provision in a detached task.
+                //
+                // Inline or detached, provisioning runs on a copy of the stack
+                // without the state lock: the nested-stack provisioner takes
+                // that lock to record its child stack, so provisioning under
+                // it never returned.
                 let stack = {
                     let mut accounts = self.state.write();
                     let state = accounts
@@ -1827,6 +1788,27 @@ impl CloudFormationService {
                                 format!("Stack [{}] does not exist", exec.stack_name),
                             )
                         })?;
+                    // A stack still being created or updated takes no other
+                    // change set. AWS, checked 2026-10-19,
+                    // https://docs.aws.amazon.com/AWSCloudFormation/latest/APIReference/API_ExecuteChangeSet.html
+                    // InvalidChangeSetStatus: "The specified change set can't
+                    // be used to update the stack. For example, the change set
+                    // status might be CREATE_IN_PROGRESS, or the stack status
+                    // might be UPDATE_IN_PROGRESS." The message wording is
+                    // fakecloud's own.
+                    if stack.status.ends_with("_IN_PROGRESS")
+                        && stack.status != "REVIEW_IN_PROGRESS"
+                    {
+                        return Err(AwsServiceError::aws_error(
+                            StatusCode::BAD_REQUEST,
+                            "InvalidChangeSetStatus",
+                            format!(
+                                "ChangeSet [{cs}] cannot be executed while stack [{}] is in {} \
+                                 state",
+                                exec.stack_name, stack.status
+                            ),
+                        ));
+                    }
                     let in_progress = if stack.status == "REVIEW_IN_PROGRESS" {
                         "CREATE_IN_PROGRESS"
                     } else {
@@ -1851,22 +1833,31 @@ impl CloudFormationService {
                     }
                     stack
                 };
+                if !detached {
+                    let applied = crate::service::apply_resource_updates_to_copy(
+                        stack,
+                        &exec.provisioner,
+                        &parsed.resources,
+                        &exec.template_body,
+                        &exec.cs_params,
+                        &cs_imports,
+                    );
+                    self.finish_change_set_execution(exec, applied)?;
+                    return Ok(xml_response("ExecuteChangeSet", String::new(), &rid));
+                }
                 let svc = self.clone();
                 tokio::spawn(async move {
-                    let mut exec = exec;
-                    // The inline arm of `finish_change_set_execution` is the
-                    // only other reader of the definitions and imports.
                     let applied = crate::service::apply_resource_updates_unlocked(
                         stack,
                         exec.provisioner.clone(),
-                        std::mem::take(&mut exec.resources),
+                        parsed.resources,
                         exec.template_body.clone(),
                         exec.cs_params.clone(),
-                        std::mem::take(&mut exec.cs_imports),
+                        cs_imports,
                     )
                     .await;
                     let stack_name = exec.stack_name.clone();
-                    if let Err(err) = svc.finish_change_set_execution(exec, Some(applied)) {
+                    if let Err(err) = svc.finish_change_set_execution(exec, applied) {
                         tracing::warn!(%stack_name, "ExecuteChangeSet failed: {}", err.message());
                     }
                     // What the request handler persists after an inline
