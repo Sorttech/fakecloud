@@ -862,6 +862,257 @@ async fn cfn_delete_fails_when_a_custom_resource_delete_fails() {
     );
 }
 
+/// Regression: a custom resource's response `Data` was never stored, so
+/// `Fn::GetAtt [Custom, Key]` resolved to the placeholder "Custom.Key". CDK's
+/// cross-region references depend on it: `Custom::CrossRegionExportReader`
+/// returns the values in `Data` and the consumer reads them with
+/// `Fn::GetAtt [ExportsReader, "/cdk/exports/<stack>/<name>"]`, so a
+/// CloudFront distribution got the placeholder as its certificate ARN.
+///
+/// Real CloudFormation waits for the handler's response before provisioning a
+/// dependent, and serves its `Data` through `Fn::GetAtt` -- to resources and
+/// Outputs alike, and again after an Update.
+#[tokio::test]
+async fn cfn_create_and_update_stack_resolve_getatt_from_custom_resource_data() {
+    if !docker_available() {
+        eprintln!("docker required for Lambda execution; skipping");
+        return;
+    }
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let stack = "cfn-custom-data";
+    let bucket = "cfn-custom-data-code";
+    upload_data_handler(&server, bucket).await;
+
+    cfn.create_stack()
+        .stack_name(stack)
+        .template_body(custom_data_template(bucket, "cr-data", "put", "1"))
+        .send()
+        .await
+        .expect("create_stack");
+    let (status, reason) = await_terminal_status(&cfn, stack).await;
+    assert_eq!(status, "CREATE_COMPLETE", "reason: {reason}");
+    assert_custom_data_resolved(&server, stack, "cr-data", "1").await;
+
+    cfn.update_stack()
+        .stack_name(stack)
+        .template_body(custom_data_template(bucket, "cr-data", "put", "2"))
+        .send()
+        .await
+        .expect("update_stack");
+    let (status, reason) = await_terminal_status(&cfn, stack).await;
+    assert_eq!(status, "UPDATE_COMPLETE", "reason: {reason}");
+    assert_custom_data_resolved(&server, stack, "cr-data", "2").await;
+}
+
+/// The same as above through `CreateChangeSet` + `ExecuteChangeSet`, the path
+/// `cdk deploy` takes. That path queued custom-resource invokes to run after
+/// every resource was provisioned, so a dependent could never see the `Data`.
+#[tokio::test]
+async fn cfn_changeset_resolves_getatt_from_custom_resource_data() {
+    if !docker_available() {
+        eprintln!("docker required for Lambda execution; skipping");
+        return;
+    }
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let stack = "cfn-cs-custom-data";
+    let bucket = "cfn-cs-custom-data-code";
+    upload_data_handler(&server, bucket).await;
+
+    for (change_set_type, version) in [(ChangeSetType::Create, "1"), (ChangeSetType::Update, "2")] {
+        let cs = cfn
+            .create_change_set()
+            .stack_name(stack)
+            .change_set_name(format!("cs{version}"))
+            .change_set_type(change_set_type)
+            .template_body(custom_data_template(bucket, "cs-cr-data", "put", version))
+            .send()
+            .await
+            .expect("create_change_set");
+        let cs_id = cs.id().expect("change set id");
+        cfn.execute_change_set()
+            .change_set_name(cs_id)
+            .send()
+            .await
+            .expect("execute_change_set");
+        let (status, reason) = await_terminal_status(&cfn, stack).await;
+        assert!(status.ends_with("_COMPLETE"), "{status}: {reason}");
+        assert!(!status.contains("ROLLBACK"), "{status}: {reason}");
+        assert_eq!(
+            change_set_execution_status(&cfn, cs_id).await,
+            "EXECUTE_COMPLETE"
+        );
+        assert_custom_data_resolved(&server, stack, "cs-cr-data", version).await;
+    }
+}
+
+/// A handler that returns the response body instead of PUTting it to the
+/// `ResponseURL`. fakecloud already honours a returned `{"Status":"FAILED"}`;
+/// a returned `Data` is honoured the same way.
+#[tokio::test]
+async fn cfn_changeset_resolves_getatt_from_a_returned_custom_resource_body() {
+    if !docker_available() {
+        eprintln!("docker required for Lambda execution; skipping");
+        return;
+    }
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let stack = "cfn-cs-custom-data-return";
+    let bucket = "cfn-cs-custom-data-return-code";
+    upload_data_handler(&server, bucket).await;
+
+    let cs = cfn
+        .create_change_set()
+        .stack_name(stack)
+        .change_set_name("cs1")
+        .change_set_type(ChangeSetType::Create)
+        .template_body(custom_data_template(
+            bucket,
+            "cs-cr-data-return",
+            "return",
+            "1",
+        ))
+        .send()
+        .await
+        .expect("create_change_set");
+    cfn.execute_change_set()
+        .change_set_name(cs.id().expect("change set id"))
+        .send()
+        .await
+        .expect("execute_change_set");
+    let (status, reason) = await_terminal_status(&cfn, stack).await;
+    assert_eq!(status, "CREATE_COMPLETE", "reason: {reason}");
+    assert_custom_data_resolved(&server, stack, "cs-cr-data-return", "1").await;
+}
+
+/// Upload a handler that answers every event with `Data` derived from its
+/// `Version` property: PUT to the `ResponseURL` as `cfn-response` does, or
+/// returned as the invoke result when its `Mode` property is `return`.
+async fn upload_data_handler(server: &TestServer, bucket: &str) {
+    let s3 = server.s3_client().await;
+    s3.create_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("create_bucket");
+    s3.put_object()
+        .bucket(bucket)
+        .key("cr.zip")
+        .body(ByteStream::from(build_python_handler_zip(
+            r#"import json
+import urllib.request
+
+
+def handler(event, context):
+    props = event['ResourceProperties']
+    version = props.get('Version', '')
+    response = {
+        'Status': 'SUCCESS',
+        'RequestId': event['RequestId'],
+        'StackId': event['StackId'],
+        'LogicalResourceId': event['LogicalResourceId'],
+        'PhysicalResourceId': event.get('PhysicalResourceId', 'custom-data'),
+        'Data': {
+            'Value': 'value-' + version,
+            '/cdk/exports/consumer/cert': 'arn:aws:acm:us-east-1:123456789012:certificate/v' + version,
+        },
+    }
+    if props.get('Mode') == 'return':
+        return response
+    request = urllib.request.Request(
+        event['ResponseURL'],
+        data=json.dumps(response).encode(),
+        method='PUT',
+        headers={'Content-Type': ''},
+    )
+    urllib.request.urlopen(request)
+    return {}
+"#,
+        )))
+        .send()
+        .await
+        .expect("put_object");
+}
+
+/// A custom resource answered by `upload_data_handler`'s handler, an SSM
+/// parameter whose value is its `Data.Value`, and Outputs reading `Data` by a
+/// plain and a slash-containing key, the shape CDK's cross-region reader uses.
+fn custom_data_template(bucket: &str, function_name: &str, mode: &str, version: &str) -> String {
+    format!(
+        r#"{{
+  "Resources": {{
+    "Handler": {{
+      "Type": "AWS::Lambda::Function",
+      "Properties": {{
+        "FunctionName": "{function_name}",
+        "Runtime": "python3.12",
+        "Handler": "index.handler",
+        "Timeout": 30,
+        "Role": "arn:aws:iam::123456789012:role/cr-role",
+        "Code": {{"S3Bucket": "{bucket}", "S3Key": "cr.zip"}}
+      }}
+    }},
+    "Custom": {{
+      "Type": "Custom::CrossRegionExportReader",
+      "Properties": {{
+        "ServiceToken": {{"Fn::GetAtt": ["Handler", "Arn"]}},
+        "Mode": "{mode}",
+        "Version": "{version}"
+      }}
+    }},
+    "Param": {{
+      "Type": "AWS::SSM::Parameter",
+      "Properties": {{
+        "Name": "/{function_name}/value",
+        "Type": "String",
+        "Value": {{"Fn::GetAtt": ["Custom", "Value"]}}
+      }}
+    }}
+  }},
+  "Outputs": {{
+    "Value": {{"Value": {{"Fn::GetAtt": ["Custom", "Value"]}}}},
+    "Cert": {{"Value": {{"Fn::GetAtt": ["Custom", "/cdk/exports/consumer/cert"]}}}}
+  }}
+}}"#
+    )
+}
+
+/// The dependent SSM parameter and both Outputs hold the `Data` the handler
+/// answered `version` with.
+async fn assert_custom_data_resolved(
+    server: &TestServer,
+    stack: &str,
+    function_name: &str,
+    version: &str,
+) {
+    let ssm = server.ssm_client().await;
+    let param = ssm
+        .get_parameter()
+        .name(format!("/{function_name}/value"))
+        .send()
+        .await
+        .expect("get_parameter");
+    assert_eq!(
+        param.parameter().and_then(|p| p.value()),
+        Some(format!("value-{version}").as_str()),
+        "the dependent resource reads the handler's Data"
+    );
+    let cfn = server.cloudformation_client().await;
+    let mut outputs = stack_outputs(&cfn, stack).await;
+    outputs.sort_unstable();
+    assert_eq!(
+        outputs,
+        [
+            (
+                "Cert".to_string(),
+                format!("arn:aws:acm:us-east-1:123456789012:certificate/v{version}")
+            ),
+            ("Value".to_string(), format!("value-{version}")),
+        ]
+    );
+}
+
 /// Upload a handler to `s3://{bucket}/cr.zip` that succeeds, or raises
 /// "<RequestType> handler blew up" for the request type `fail_on`.
 async fn upload_custom_resource_handler(server: &TestServer, bucket: &str, fail_on: Option<&str>) {

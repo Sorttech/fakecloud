@@ -1082,14 +1082,17 @@ pub struct ResourceProvisioner {
     /// synchronously. Set on the changeset/update/delete provisioners; left
     /// `false` for `CreateStack` (which already provisions off the request path
     /// in a detached task, so its synchronous invoke never blocks the client or
-    /// the state lock).
+    /// the state lock). A detached changeset/update provisioner
+    /// (`wait_for_container_backing`) still queues Deletes, which run as
+    /// cleanup after the update, but runs Create/Update inline so their `Data`
+    /// reaches dependents (see `send_custom_resource_event`).
     pub defer_custom_invokes: bool,
     /// When `true`, `provision_stack_resources` and `apply_resource_updates`
     /// wait after creating a container-backed resource until its container is
     /// up (see `stabilize_resource`), so dependents, Outputs and Exports read
     /// the real endpoint. Only set by a `CreateStack`, `ExecuteChangeSet` or
     /// `UpdateStack` provisioning in a detached task (see
-    /// `waits_for_containers`): the wait can last minutes, which must never
+    /// `provisions_detached`): the wait can last minutes, which must never
     /// happen on a request path or under the state write lock (the #1539/#1730
     /// timeout lesson).
     pub wait_for_container_backing: bool,
@@ -1213,7 +1216,7 @@ pub enum ContainerTeardownIntent {
 
 /// Whether `resource_type` is a custom resource, whose lifecycle a handler
 /// behind its `ServiceToken` owns.
-fn is_custom_resource_type(resource_type: &str) -> bool {
+pub(crate) fn is_custom_resource_type(resource_type: &str) -> bool {
     resource_type.starts_with("Custom::") || resource_type == "AWS::CloudFormation::CustomResource"
 }
 
@@ -1748,9 +1751,7 @@ impl ResourceProvisioner {
             "AWS::AppConfig::ConfigurationProfile" => {
                 self.create_appconfig_configuration_profile(resource)
             }
-            t if is_custom_resource_type(t) => self
-                .create_custom_resource(resource)
-                .map(ProvisionResult::new),
+            t if is_custom_resource_type(t) => self.create_custom_resource(resource),
             other if self.strict_unknown_types => {
                 // Cloud Control API path: reject a resource type fakecloud has
                 // no provisioner for instead of recording a phantom resource.
@@ -3540,9 +3541,12 @@ impl ResourceProvisioner {
     /// No signal is not a failure: handlers predating `cfn-response`, and any
     /// handler invoked without a reachable `ResponseURL`, never send one, and
     /// failing those would break stacks that work today.
-    fn await_custom_resource_signal(&self, request_id: &str) -> Result<(), String> {
+    fn await_custom_resource_signal(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<crate::custom_resource_response::CustomResourceSignal>, String> {
         if self.custom_resource_response_base.is_none() {
-            return Ok(());
+            return Ok(None);
         }
         match self
             .custom_resource_responses
@@ -3552,7 +3556,7 @@ impl ResourceProvisioner {
                 "Custom resource failed: {}",
                 signal.failure_reason()
             )),
-            _ => Ok(()),
+            signal => Ok(signal),
         }
     }
 
@@ -3591,7 +3595,9 @@ impl ResourceProvisioner {
         None
     }
 
-    fn invoke_lambda_sync(&self, function_arn: &str, payload: &str) -> Result<(), String> {
+    /// Invoke `function_arn` and return its response body (empty when no
+    /// Lambda delivery is configured).
+    fn invoke_lambda_sync(&self, function_arn: &str, payload: &str) -> Result<Vec<u8>, String> {
         let delivery = self.delivery.clone();
         let function_arn = function_arn.to_string();
         let payload = payload.to_string();
@@ -3619,7 +3625,7 @@ impl ResourceProvisioner {
                                 "Custom resource Lambda {} invoked successfully",
                                 function_arn
                             );
-                            Ok(())
+                            Ok(response)
                         }
                         Some(Err(e)) => {
                             tracing::warn!(
@@ -3633,7 +3639,7 @@ impl ResourceProvisioner {
                                 "No Lambda delivery configured; skipping custom resource invocation for {}",
                                 function_arn
                             );
-                            Ok(())
+                            Ok(Vec::new())
                         }
                     }
                 })
@@ -3643,7 +3649,10 @@ impl ResourceProvisioner {
         })
     }
 
-    fn create_custom_resource(&self, resource: &ResourceDefinition) -> Result<String, String> {
+    fn create_custom_resource(
+        &self,
+        resource: &ResourceDefinition,
+    ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
         let service_token = props
             .get("ServiceToken")
@@ -3662,7 +3671,7 @@ impl ResourceProvisioner {
             "LogicalResourceId": resource.logical_id,
             "ResourceProperties": props,
         });
-        self.send_custom_resource_event(
+        let data = self.send_custom_resource_event(
             service_token,
             &resource.logical_id,
             "Create",
@@ -3673,7 +3682,7 @@ impl ResourceProvisioner {
         // Physical resource ID: use a generated ID (the Lambda could return one,
         // but for simplicity we generate one here).
         let physical_id = format!("{}-{}", resource.logical_id, &request_id[..8]);
-        Ok(physical_id)
+        Ok(ProvisionResult::new(physical_id).merge_attributes(data))
     }
 
     /// Send the handler an Update for a property change, keeping the physical
@@ -3728,18 +3737,32 @@ impl ResourceProvisioner {
                 .as_ref()
                 .unwrap_or(&serde_json::json!({})),
         });
-        self.send_custom_resource_event(
+        let data = self.send_custom_resource_event(
             service_token,
             &new_def.logical_id,
             "Update",
             event,
             &request_id,
         )?;
-        Ok(ProvisionResult::new(existing.physical_id.clone()))
+        Ok(ProvisionResult::new(existing.physical_id.clone()).merge_attributes(data))
     }
 
-    /// Invoke a Create or Update handler, or queue it under
-    /// `defer_custom_invokes`, and turn a failure into a resource failure.
+    /// Invoke a Create or Update handler and return its response `Data`, or
+    /// queue it under `defer_custom_invokes`, and turn a failure into a
+    /// resource failure.
+    ///
+    /// CloudFormation "sends a request to the specified service token, and then
+    /// waits for a response before proceeding with the stack operation", and
+    /// "The template developer can retrieve that data by using the Fn::GetAtt
+    /// function" (User Guide, "Create custom provisioning logic with custom
+    /// resources", https://docs.aws.amazon.com/AWSCloudFormation/latest/
+    /// UserGuide/template-custom-resources.html, checked 2026-10-19). So the
+    /// invoke has to finish before a dependent resolves its `Fn::GetAtt`, which
+    /// is why a detached provisioner invokes here rather than queueing.
+    ///
+    /// The `Data` comes from the `ResponseURL` signal, or, for a handler that
+    /// returns its response instead of PUTting it, from the invoke result, as
+    /// `custom_resource_failure` already reads a returned FAILED.
     fn send_custom_resource_event(
         &self,
         service_token: &str,
@@ -3747,14 +3770,18 @@ impl ResourceProvisioner {
         request_type: &'static str,
         mut event: serde_json::Value,
         request_id: &str,
-    ) -> Result<(), String> {
+    ) -> Result<BTreeMap<String, String>, String> {
         self.attach_response_url(&mut event, request_id);
         let payload = serde_json::to_string(&event).map_err(|e| e.to_string())?;
-        if self.defer_custom_invokes {
-            // Changeset/update path: queue the invoke so the caller runs it off
-            // the request path after the state write lock is dropped. The Lambda
-            // response is not consumed for `GetAtt` (the physical id is generated
-            // or kept regardless), so deferring loses nothing.
+        // A detached provisioner (`wait_for_container_backing`) runs on a
+        // blocking thread without the state lock, like CreateStack's, so it can
+        // wait for the handler. Only an inline one, under the lock, queues.
+        if self.defer_custom_invokes && !self.wait_for_container_backing {
+            // Queue the invoke so the caller runs it off the request path after
+            // the state write lock is dropped. Its `Data` arrives too late for
+            // any `Fn::GetAtt`; a template holding a custom resource provisions
+            // detached on the server (`provisions_detached`), so only a
+            // current-thread runtime (unit tests) gets here for a Create/Update.
             self.pending_custom_invokes.lock().push(CustomInvokeIntent {
                 service_token: service_token.to_string(),
                 logical_id: logical_id.to_string(),
@@ -3762,10 +3789,15 @@ impl ResourceProvisioner {
                 payload,
                 signal_request_id: self.signal_request_id(request_id),
             });
-            return Ok(());
+            return Ok(BTreeMap::new());
         }
-        self.invoke_lambda_sync(service_token, &payload)?;
-        self.await_custom_resource_signal(request_id)
+        let returned = self.invoke_lambda_sync(service_token, &payload)?;
+        Ok(match self.await_custom_resource_signal(request_id)? {
+            Some(signal) => signal.data,
+            None => serde_json::from_slice(&returned)
+                .map(|body| crate::custom_resource_response::response_data(&body))
+                .unwrap_or_default(),
+        })
     }
 
     fn delete_custom_resource(&self, resource: &StackResource) -> Result<(), String> {
@@ -7157,6 +7189,29 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, "Modifying service token is not allowed.");
         assert!(take_custom_events(&prov).is_empty());
+    }
+
+    /// A detached changeset/update provisioner runs a Create inline, so its
+    /// `Data` exists before a dependent resolves `Fn::GetAtt`, but still queues
+    /// a Delete, which is cleanup after the update succeeded.
+    #[test]
+    fn a_detached_deferred_provisioner_invokes_create_inline_and_queues_delete() {
+        let mut prov = make_provisioner();
+        prov.defer_custom_invokes = true;
+        prov.wait_for_container_backing = true;
+        let created = prov
+            .create_resource(&make_resource(
+                "Custom::Thing",
+                "C",
+                serde_json::json!({"ServiceToken": "arn:aws:lambda:us-east-1:123456789012:function:a"}),
+            ))
+            .unwrap();
+        assert!(take_custom_events(&prov).is_empty());
+
+        prov.delete_resource(&created).unwrap();
+        let events = take_custom_events(&prov);
+        assert_eq!(events.len(), 1, "{events:#?}");
+        assert_eq!(events[0]["RequestType"], "Delete");
     }
 
     fn take_custom_events(prov: &ResourceProvisioner) -> Vec<serde_json::Value> {

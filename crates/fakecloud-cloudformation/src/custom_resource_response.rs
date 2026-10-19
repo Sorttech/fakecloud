@@ -10,7 +10,7 @@
 //! the resource complete regardless. This is the receiving end: an in-process
 //! registry the internal HTTP route writes and the provisioner reads.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,8 @@ pub struct CustomResourceSignal {
     pub status: String,
     pub reason: Option<String>,
     pub physical_resource_id: Option<String>,
+    /// The response's `Data`, served through `Fn::GetAtt` (see `response_data`).
+    pub data: BTreeMap<String, String>,
 }
 
 impl CustomResourceSignal {
@@ -68,6 +70,7 @@ impl CustomResourceResponses {
                     .get("PhysicalResourceId")
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
+                data: response_data(body),
             },
         );
         true
@@ -99,6 +102,33 @@ impl CustomResourceResponses {
     pub fn forget(&self, request_id: &str) {
         self.signals.write().remove(request_id);
     }
+}
+
+/// A custom resource's response `Data`, as the attributes `Fn::GetAtt` reads.
+///
+/// AWS CloudFormation User Guide, "CloudFormation custom resource request and
+/// response reference" (https://docs.aws.amazon.com/AWSCloudFormation/latest/
+/// UserGuide/crpg-ref.html, checked 2026-10-19), response field `Data`: "The
+/// custom resource provider-defined name-value pairs to send with the
+/// response. You can access the values provided here by name in the template
+/// with Fn::GetAtt. Available for Create and Update responses only."
+///
+/// Names are kept verbatim: CDK's cross-region reader returns keys such as
+/// `/cdk/exports/<stack>/<name>`. A non-string value is kept as its JSON text,
+/// since an attribute is a string.
+pub fn response_data(body: &serde_json::Value) -> BTreeMap<String, String> {
+    let Some(data) = body.get("Data").and_then(|v| v.as_object()) else {
+        return BTreeMap::new();
+    };
+    data.iter()
+        .map(|(k, v)| {
+            let value = match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            (k.clone(), value)
+        })
+        .collect()
 }
 
 /// The `ResponseURL` for one invocation, given the base fakecloud is reachable
@@ -171,6 +201,33 @@ mod tests {
         assert!(responses
             .wait_for("never", Duration::from_millis(30))
             .is_none());
+    }
+
+    #[test]
+    fn a_signal_keeps_its_data_for_getatt() {
+        let responses = CustomResourceResponses::new();
+        responses.record(
+            "req-5",
+            &serde_json::json!({
+                "Status": "SUCCESS",
+                "Data": {"Value": "v", "/cdk/exports/s/n": "arn:x", "Port": 5432}
+            }),
+        );
+        let signal = responses.wait_for("req-5", Duration::ZERO).expect("signal");
+        assert_eq!(
+            signal.data,
+            BTreeMap::from([
+                ("/cdk/exports/s/n".to_string(), "arn:x".to_string()),
+                ("Port".to_string(), "5432".to_string()),
+                ("Value".to_string(), "v".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_response_without_data_has_no_attributes() {
+        assert!(response_data(&serde_json::json!({"Status": "SUCCESS"})).is_empty());
+        assert!(response_data(&serde_json::json!({"Data": "not an object"})).is_empty());
     }
 
     #[test]
