@@ -3877,10 +3877,15 @@ impl CloudFormationService {
                         &stack_id,
                         "UPDATE_FAILED",
                     );
-                    return Err(AwsServiceError::aws_error(
-                        StatusCode::BAD_REQUEST,
-                        "InsufficientCapabilitiesException",
-                        error_msg,
+                    // The failure is the stack's to report, as
+                    // UPDATE_ROLLBACK_COMPLETE with the reason recorded above:
+                    // the call only starts the update ("You can check the
+                    // status of the stack through the DescribeStacks action.",
+                    // UpdateStack API Reference).
+                    tracing::warn!(stack = %stack_name_for_notif, "UpdateStack failed: {error_msg}");
+                    return Ok(AwsResponse::xml(
+                        StatusCode::OK,
+                        xml_responses::update_stack_response(&stack_id, &request_id),
                     ));
                 }
             };
@@ -5462,8 +5467,10 @@ mod tests {
         let req = make_request("UpdateStack", update_params);
         let result = svc.update_stack(&req).await;
 
-        // Should return an error
-        assert!(result.is_err());
+        // The call only starts the update, so it succeeds; the failure is
+        // reported on the stack ("You can check the status of the stack
+        // through the DescribeStacks action.", UpdateStack API Reference).
+        assert!(result.is_ok());
 
         // Stack status should be UPDATE_ROLLBACK_COMPLETE — matches the
         // terminal status real CloudFormation lands on after a failed

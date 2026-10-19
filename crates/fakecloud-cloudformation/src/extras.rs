@@ -910,11 +910,12 @@ impl CloudFormationService {
             handles.spawn_teardown_intents(std::mem::take(
                 &mut *provisioner.pending_container_teardowns.lock(),
             ));
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "ValidationError",
-                msg,
-            ));
+            // The failure is the stack's and the change set's to report, as
+            // recorded above: the call only starts the execution ("After the
+            // call successfully completes, CloudFormation starts updating the
+            // stack.", ExecuteChangeSet API Reference).
+            tracing::warn!(%stack_name_owned, "ExecuteChangeSet failed: {msg}");
+            return Ok(());
         }
 
         // The change set executed successfully. Back any newly-added
