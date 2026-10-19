@@ -1768,6 +1768,27 @@ impl CloudFormationService {
                                 format!("Stack [{}] does not exist", exec.stack_name),
                             )
                         })?;
+                    // A stack still being created or updated takes no other
+                    // change set. AWS, checked 2026-10-19,
+                    // https://docs.aws.amazon.com/AWSCloudFormation/latest/APIReference/API_ExecuteChangeSet.html
+                    // InvalidChangeSetStatus: "The specified change set can't
+                    // be used to update the stack. For example, the change set
+                    // status might be CREATE_IN_PROGRESS, or the stack status
+                    // might be UPDATE_IN_PROGRESS." The message wording is
+                    // fakecloud's own.
+                    if stack.status.ends_with("_IN_PROGRESS")
+                        && stack.status != "REVIEW_IN_PROGRESS"
+                    {
+                        return Err(AwsServiceError::aws_error(
+                            StatusCode::BAD_REQUEST,
+                            "InvalidChangeSetStatus",
+                            format!(
+                                "ChangeSet [{cs}] cannot be executed while stack [{}] is in {} \
+                                 state",
+                                exec.stack_name, stack.status
+                            ),
+                        ));
+                    }
                     let in_progress = if stack.status == "REVIEW_IN_PROGRESS" {
                         "CREATE_IN_PROGRESS"
                     } else {
