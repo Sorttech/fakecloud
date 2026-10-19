@@ -8,8 +8,7 @@
 //! placeholder and another stack's `Fn::ImportValue` dialled a host that does
 //! not resolve.
 //!
-//! Covers CreateStack and the change-set path `cdk deploy` uses (the latter
-//! ignored until ExecuteChangeSet waits too). With no
+//! Covers both CreateStack and the change-set path `cdk deploy` uses. With no
 //! container runtime the instance is `available` at insert and the endpoint
 //! never moves, so the assertions hold trivially there.
 
@@ -154,11 +153,7 @@ async fn create_stack_outputs_carry_real_rds_endpoint() {
     assert_real_endpoint(&server, "rds-endpoint-create", "rds-endpoint-create").await;
 }
 
-// ExecuteChangeSet still provisions inside the request under the state write
-// lock, so it cannot wait for the container there; it needs moving to a
-// detached task first, as CreateStack does.
 #[tokio::test]
-#[ignore = "ExecuteChangeSet does not yet wait for the RDS container"]
 async fn execute_change_set_outputs_carry_real_rds_endpoint() {
     let server = TestServer::start().await;
     let cfn = server.cloudformation_client().await;
@@ -220,4 +215,49 @@ async fn create_stack_fails_when_rds_container_fails() {
         described.is_err(),
         "rolled-back instance is gone: {described:?}"
     );
+}
+
+/// While a change set is still executing, another one on the same stack is
+/// refused, as AWS documents for ExecuteChangeSet's InvalidChangeSetStatus
+/// ("the stack status might be UPDATE_IN_PROGRESS"). The DB instance's
+/// container keeps the first execution in progress long enough to try.
+#[tokio::test]
+async fn execute_change_set_refuses_a_stack_in_progress() {
+    if helpers::container_cli().is_empty() {
+        return;
+    }
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let id = "rds-endpoint-busy";
+    let mut ids = Vec::new();
+    for name in ["first", "second"] {
+        let cs = cfn
+            .create_change_set()
+            .stack_name(id)
+            .change_set_name(name)
+            .change_set_type(ChangeSetType::Create)
+            .template_body(template(id))
+            .send()
+            .await
+            .expect("create_change_set");
+        ids.push(cs.id().expect("change set id").to_string());
+    }
+    cfn.execute_change_set()
+        .change_set_name(&ids[0])
+        .send()
+        .await
+        .expect("execute first change set");
+
+    let err = cfn
+        .execute_change_set()
+        .change_set_name(&ids[1])
+        .send()
+        .await
+        .expect_err("a stack in progress takes no second change set");
+    assert_eq!(
+        err.as_service_error().and_then(|e| e.meta().code()),
+        Some("InvalidChangeSetStatus")
+    );
+
+    assert_real_endpoint(&server, id, id).await;
 }

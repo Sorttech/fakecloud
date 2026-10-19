@@ -18,7 +18,6 @@ use fakecloud_sqs::SharedSqsState;
 use fakecloud_ssm::SharedSsmState;
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::custom_resource_response::SharedCustomResourceResponses;
 use crate::resource_provisioner::{CustomInvokeIntent, ResourceProvisioner};
 use crate::state;
 use crate::state::{
@@ -430,6 +429,31 @@ fn collect_nested_touched_types(
 /// any resource whose `Ref` targets are still unknown just stays pending
 /// for the next pass. When no pass makes progress we report the first
 /// pending failure and rollback.
+/// Whether a stack operation may block for minutes while provisioning, so it
+/// must run in a detached task rather than inside the request (the
+/// #1539/#1730 timeout lesson): a custom resource's handler runs on create,
+/// update and delete, so one in the new template or still in the stack counts;
+/// a DB instance waits for its container when a container runtime is wired.
+pub(crate) fn stack_op_may_block(
+    new_defs: &[template::ResourceDefinition],
+    existing: &[StackResource],
+    rds_runtime: bool,
+) -> bool {
+    let custom = |t: &str| t.starts_with("Custom::") || t == "AWS::CloudFormation::CustomResource";
+    new_defs.iter().any(|r| {
+        custom(&r.resource_type) || (rds_runtime && r.resource_type == "AWS::RDS::DBInstance")
+    }) || existing.iter().any(|r| custom(&r.resource_type))
+}
+
+/// Whether this runtime can run a stack operation in a detached task. Unit
+/// tests run current-thread and provision inline.
+pub(crate) fn on_multi_thread_runtime() -> bool {
+    matches!(
+        tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+    )
+}
+
 pub(crate) fn provision_stack_resources(
     provisioner: &ResourceProvisioner,
     resource_defs: &[template::ResourceDefinition],
@@ -1232,9 +1256,8 @@ impl ContainerBackingHandles {
 /// update/delete paths (where `defer_custom_invokes` is set).
 ///
 /// Fire-and-forget: the outcome is logged and discarded. Only for callers whose
-/// stack status does not depend on it. A caller that must report the outcome
-/// (`ExecuteChangeSet`) drains the queue itself and awaits
-/// [`run_custom_invokes`] instead.
+/// stack status does not depend on it. `ExecuteChangeSet` runs its invokes
+/// synchronously in its own provisioning task instead.
 pub(crate) fn spawn_custom_invokes(provisioner: &ResourceProvisioner) {
     let intents = std::mem::take(&mut *provisioner.pending_custom_invokes.lock());
     for intent in intents {
@@ -1243,157 +1266,6 @@ pub(crate) fn spawn_custom_invokes(provisioner: &ResourceProvisioner) {
             let _ = invoke_custom_resource(&delivery, &intent).await;
         });
     }
-}
-
-/// Run a drained batch of custom-resource invokes to completion, reporting the
-/// first failure.
-///
-/// The synchronous arm of `create_custom_resource` checks two things the
-/// deferred arm used to skip entirely: the invoke response, because a handler
-/// that raises still returns 200 with the error in its body, and the
-/// `ResponseURL` signal, because `cfn-response` reports FAILED out of band.
-/// Skipping both is how a changeset-provisioned custom resource that failed
-/// still produced a CREATE_COMPLETE stack.
-pub(crate) async fn run_custom_invokes(
-    delivery: &Arc<DeliveryBus>,
-    responses: &SharedCustomResourceResponses,
-    intents: Vec<CustomInvokeIntent>,
-) -> Result<(), String> {
-    for intent in intents {
-        invoke_custom_resource(delivery, &intent).await?;
-
-        // The handler PUTs its signal before returning, but the PUT can still
-        // be in flight as the invoke response comes back; wait the same 5s the
-        // synchronous arm does. `wait_for` parks the thread, so it goes to a
-        // blocking pool rather than a tokio worker.
-        let Some(request_id) = intent.signal_request_id else {
-            continue;
-        };
-        let responses = responses.clone();
-        let signal = tokio::task::spawn_blocking(move || {
-            responses.wait_for(&request_id, std::time::Duration::from_secs(5))
-        })
-        .await
-        .map_err(|e| format!("custom resource signal wait failed: {e}"))?;
-        // No signal is not a failure: a handler that never uses `cfn-response`
-        // never sends one (`await_custom_resource_signal`).
-        if let Some(signal) = signal {
-            if signal.failed() {
-                return Err(format!(
-                    "Custom resource failed: {}",
-                    signal.failure_reason()
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Everything the changeset settle task needs, as an owned struct so it can
-/// move into a detached `tokio::spawn`. Mirrors `CreateStackContext`.
-pub(crate) struct ChangeSetSettleContext {
-    pub state: SharedCloudFormationState,
-    pub snapshot_store: Option<Arc<dyn SnapshotStore>>,
-    pub snapshot_lock: Arc<AsyncMutex<()>>,
-    pub delivery: Arc<DeliveryBus>,
-    pub responses: SharedCustomResourceResponses,
-    pub intents: Vec<CustomInvokeIntent>,
-    pub account_id: String,
-    /// The region the change set (and so its stack) lives in.
-    pub region: String,
-    pub stack_id: String,
-    pub stack_name: String,
-    pub change_set_id: String,
-    /// The status `ExecuteChangeSet` left the stack at. The settle task only
-    /// flips a stack still there, so it cannot clobber a delete or a newer
-    /// execution that moved the stack on while the handlers ran.
-    pub in_progress: &'static str,
-    pub complete: &'static str,
-    pub failed: &'static str,
-}
-
-/// Run a changeset's deferred custom-resource invokes, then flip the stack to
-/// its terminal status.
-///
-/// `ExecuteChangeSet` holds the stack at `*_IN_PROGRESS` while these are
-/// outstanding, because a custom resource's outcome is part of whether the
-/// stack succeeded -- real CloudFormation keeps the stack `CREATE_IN_PROGRESS`
-/// until every custom resource signals, and fails it when one signals FAILED.
-pub(crate) async fn settle_changeset_custom_resources(ctx: ChangeSetSettleContext) {
-    let ChangeSetSettleContext {
-        state,
-        snapshot_store,
-        snapshot_lock,
-        delivery,
-        responses,
-        intents,
-        account_id,
-        region,
-        stack_id,
-        stack_name,
-        change_set_id,
-        in_progress,
-        complete,
-        failed,
-    } = ctx;
-
-    let outcome = run_custom_invokes(&delivery, &responses, intents).await;
-    let (status, reason) = match &outcome {
-        Ok(()) => (complete, None),
-        Err(msg) => (failed, Some(msg.as_str())),
-    };
-
-    {
-        let mut accounts = state.write();
-        let Some(st) = accounts.regional_get_mut(&account_id, &region) else {
-            tracing::warn!(
-                "stack {stack_name}'s region {region} is gone before its custom \
-                 resources settled; not recording their outcome ({status})"
-            );
-            return;
-        };
-        let Some(stack) = st
-            .stacks
-            .values_mut()
-            .find(|s| s.stack_id == stack_id && s.status == in_progress)
-        else {
-            tracing::warn!(
-                "stack {stack_name} moved on before its custom resources settled; \
-                 not recording their outcome ({status})"
-            );
-            return;
-        };
-        stack.status = status.to_string();
-        stack.status_reason = reason.map(str::to_string);
-        stack.updated_at = Some(Utc::now());
-        if reason.is_some() {
-            // A rolled-back stack publishes no outputs, so it must not keep
-            // exporting the ones `ExecuteChangeSet` registered from them.
-            stack.outputs.clear();
-            CloudFormationService::sync_exports_imports(st, &stack_id, &stack_name, &[], &[]);
-        }
-        record_stack_status_event_with_reason(
-            st,
-            &stack_id,
-            &stack_name,
-            "AWS::CloudFormation::Stack",
-            status,
-            reason,
-        );
-        if let Some(e) = st
-            .extras
-            .get_mut("change_sets")
-            .and_then(|m| m.get_mut(&change_set_id))
-        {
-            e["ExecutionStatus"] = serde_json::json!(if reason.is_some() {
-                "EXECUTE_FAILED"
-            } else {
-                "EXECUTE_COMPLETE"
-            });
-        }
-    }
-
-    save_snapshot_static(state, snapshot_store, snapshot_lock).await;
 }
 
 /// Invoke one queued handler and turn its response into a resource outcome.
@@ -2386,23 +2258,12 @@ impl CloudFormationService {
         // expectations that the stack's resources/outputs are queryable as
         // soon as CreateStack returns. The async branch only triggers on a
         // multi-thread runtime (the server); unit tests run current-thread.
-        let has_custom_resource = ctx.resource_defs.iter().any(|r| {
-            r.resource_type.starts_with("Custom::")
-                || r.resource_type == "AWS::CloudFormation::CustomResource"
-        });
-        let multi_thread = matches!(
-            tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
-            Ok(tokio::runtime::RuntimeFlavor::MultiThread)
-        );
         // A container-backed DB instance is only created once its container is
-        // up (see `stabilize_rds_db_instance`), which can take minutes, so it
-        // takes the detached path too.
-        let backs_rds_container = self.deps.rds_runtime.is_some()
-            && ctx
-                .resource_defs
-                .iter()
-                .any(|r| r.resource_type == "AWS::RDS::DBInstance");
-        if (has_custom_resource || backs_rds_container) && multi_thread {
+        // up (see `stabilize_rds_db_instance`), so it takes the detached path
+        // too.
+        if stack_op_may_block(&ctx.resource_defs, &[], self.deps.rds_runtime.is_some())
+            && on_multi_thread_runtime()
+        {
             // Off the request path, so provisioning may wait for containers.
             ctx.provisioner.wait_for_container_backing = true;
             // Emit the IN_PROGRESS lifecycle notification only on the async
@@ -4065,7 +3926,16 @@ pub(crate) fn apply_resource_updates(
 
         if !old_logical_ids.contains(&resource_def.logical_id) {
             match provisioner.create_resource(&resolved_def) {
-                Ok(stack_resource) => {
+                Ok(mut stack_resource) => {
+                    // As in `provision_stack_resources`: a resource that fails
+                    // to stabilize exists, so remove it before failing.
+                    if let Err(err) = provisioner.stabilize_resource(&mut stack_resource) {
+                        let _ = provisioner.delete_resource(&stack_resource);
+                        return Err(format!(
+                            "Failed to create resource {}: {err}",
+                            resource_def.logical_id
+                        ));
+                    }
                     changes.push(ResourceChange {
                         action: ResourceChangeAction::Create,
                         logical_id: stack_resource.logical_id.clone(),
@@ -4367,6 +4237,43 @@ mod tests {
     use parking_lot::RwLock;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    /// A custom resource blocks on its handler whether the operation creates,
+    /// updates or deletes it, so one removed by the new template still makes
+    /// the operation run detached. A DB instance only blocks when a container
+    /// runtime backs it.
+    #[test]
+    fn stack_op_may_block_on_custom_resources_and_backed_db_instances() {
+        let def = |resource_type: &str| template::ResourceDefinition {
+            logical_id: "R".to_string(),
+            resource_type: resource_type.to_string(),
+            properties: serde_json::json!({}),
+            deletion_policy: None,
+            update_replace_policy: None,
+        };
+        let existing_custom =
+            reconstruct_stack_resource("Custom::Seed", "seed-1", &BTreeMap::new());
+        let topic = [def("AWS::SNS::Topic")];
+
+        assert!(!stack_op_may_block(&topic, &[], true));
+        assert!(stack_op_may_block(&[def("Custom::Seed")], &[], false));
+        assert!(stack_op_may_block(
+            &[def("AWS::CloudFormation::CustomResource")],
+            &[],
+            false
+        ));
+        assert!(stack_op_may_block(&topic, &[existing_custom], false));
+        assert!(stack_op_may_block(
+            &[def("AWS::RDS::DBInstance")],
+            &[],
+            true
+        ));
+        assert!(!stack_op_may_block(
+            &[def("AWS::RDS::DBInstance")],
+            &[],
+            false
+        ));
+    }
 
     /// `DescribeStackEvents` is what `sam deploy`, CDK and the CLI poll to
     /// explain a failure, so a terminal failure event has to carry

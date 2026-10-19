@@ -787,3 +787,75 @@ async fn change_sets_sharing_a_name_stay_scoped_to_their_stack() {
         .expect_err("a deleted stack's change set must be gone");
     assert!(err.into_service_error().is_change_set_not_found_exception());
 }
+
+/// A change set whose template holds a nested `AWS::CloudFormation::Stack`
+/// must execute. The nested-stack provisioner records the child stack in the
+/// CloudFormation state, so provisioning must not run while ExecuteChangeSet
+/// holds that state's write lock, or the request never returns.
+#[tokio::test]
+async fn execute_change_set_provisions_nested_stack() {
+    let server = TestServer::start().await;
+    let cf = server.cloudformation_client().await;
+    let s3 = server.s3_client().await;
+
+    let child = r#"{
+        "Resources": {
+            "ChildTopic": {
+                "Type": "AWS::SNS::Topic",
+                "Properties": {"TopicName": "cs-nested-child-topic"}
+            }
+        }
+    }"#;
+    s3.create_bucket()
+        .bucket("cfn-nested")
+        .send()
+        .await
+        .unwrap();
+    s3.put_object()
+        .bucket("cfn-nested")
+        .key("child.json")
+        .body(ByteStream::from(child.as_bytes().to_vec()))
+        .send()
+        .await
+        .unwrap();
+    let parent = r#"{
+        "Resources": {
+            "Child": {
+                "Type": "AWS::CloudFormation::Stack",
+                "Properties": {"TemplateURL": "https://s3.amazonaws.com/cfn-nested/child.json"}
+            }
+        }
+    }"#;
+
+    cf.create_change_set()
+        .stack_name("cs-nested-parent")
+        .change_set_name("nested-cs")
+        .change_set_type(ChangeSetType::Create)
+        .template_body(parent)
+        .send()
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        cf.execute_change_set()
+            .stack_name("cs-nested-parent")
+            .change_set_name("nested-cs")
+            .send(),
+    )
+    .await
+    .expect("ExecuteChangeSet returned")
+    .unwrap();
+
+    let status = helpers::wait_until(std::time::Duration::from_secs(60), || async {
+        let out = cf
+            .describe_stacks()
+            .stack_name("cs-nested-parent")
+            .send()
+            .await
+            .ok()?;
+        let s = out.stacks().first()?.stack_status()?.as_str().to_string();
+        (!s.ends_with("IN_PROGRESS")).then_some(s)
+    })
+    .await;
+    assert_eq!(status.as_deref(), Some("CREATE_COMPLETE"));
+}
