@@ -296,6 +296,20 @@ fn rds_cluster_defaults_port_per_engine_stores_password_and_lists_members() {
 }
 
 #[test]
+fn rds_mysql_instance_without_port_uses_engine_default() {
+    let prov = make_provisioner();
+    let inst = create(
+        &prov,
+        "AWS::RDS::DBInstance",
+        "D",
+        json!({"DBInstanceIdentifier": "my1", "Engine": "mysql", "MasterUserPassword": "pw123456"}),
+    );
+    assert_eq!(inst.attributes["Endpoint.Port"], "3306");
+    let rds = prov.rds_state.read();
+    assert_eq!(rds.get(ACCT).unwrap().instances["my1"].port, 3306);
+}
+
+#[test]
 fn rds_instance_endpoint_get_att_is_live() {
     let prov = make_provisioner();
     let inst = create(
