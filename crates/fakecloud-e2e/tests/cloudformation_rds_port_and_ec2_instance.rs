@@ -68,17 +68,21 @@ async fn cfn_rds_engine_port_and_real_ec2_instance() {
         .await
         .expect("create_stack");
 
-    let described = cfn
-        .describe_stacks()
-        .stack_name("port-ec2-stack")
-        .send()
-        .await
-        .expect("describe_stacks");
-    let stack = described.stacks().first().expect("stack present");
+    // CreateStack provisions a container-backed DB instance in the
+    // background, as AWS does, so wait for the stack to settle.
+    let stack = &helpers::wait_until(std::time::Duration::from_secs(300), || async {
+        let out = cfn
+            .describe_stacks()
+            .stack_name("port-ec2-stack")
+            .send()
+            .await
+            .ok()?;
+        let s = out.stacks().first()?.clone();
+        (!s.stack_status()?.as_str().ends_with("IN_PROGRESS")).then_some(s)
+    })
+    .await
+    .expect("stack reached a terminal status");
     assert_eq!(stack.stack_status().unwrap().as_str(), "CREATE_COMPLETE");
-
-    // MySQL with no Port -> 3306, not 5432.
-    assert_eq!(output(stack, "DbPort"), "3306");
 
     // DbiResourceId GetAtt matches DescribeDBInstances.
     let getatt_resource_id = output(stack, "DbResourceId");
@@ -94,8 +98,12 @@ async fn cfn_rds_engine_port_and_real_ec2_instance() {
         getatt_resource_id.starts_with("db-"),
         "resource id should be db-<uuid>: {getatt_resource_id}"
     );
-    // Stored DescribeDBInstances port also reflects the engine default.
-    assert_eq!(db.endpoint().and_then(|e| e.port()), Some(3306));
+    // The Endpoint.Port output is the port DescribeDBInstances reports: the
+    // MySQL default (3306, not 5432) without a container runtime, the
+    // container's published port with one. The default itself is pinned by
+    // the provisioner unit test `rds_mysql_instance_without_port_uses_engine_default`.
+    let port = db.endpoint().and_then(|e| e.port()).expect("port");
+    assert_eq!(output(stack, "DbPort"), port.to_string());
 
     // EC2::Instance Ref resolves to a real i- id and DescribeInstances finds it.
     let instance_ref = output(stack, "InstanceRef");

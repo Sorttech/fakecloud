@@ -1099,6 +1099,13 @@ pub struct ResourceProvisioner {
     /// in a detached task, so its synchronous invoke never blocks the client or
     /// the state lock).
     pub defer_custom_invokes: bool,
+    /// When `true`, `provision_stack_resources` waits after creating a
+    /// container-backed resource until its container is up (see
+    /// `stabilize_resource`), so dependents, Outputs and Exports read the real
+    /// endpoint. Only set by a `CreateStack` running in its detached task: the
+    /// wait can last minutes, which must never happen on a request path or
+    /// under the state write lock (the #1539/#1730 timeout lesson).
+    pub wait_for_container_backing: bool,
     /// Fine-grained S3 disk store. Bucket create/delete (and bucket-policy
     /// updates) write through this so a CFN-provisioned bucket lands on disk,
     /// matching the real `CreateBucket`/`DeleteBucket` handlers. A
@@ -1347,6 +1354,22 @@ impl ResourceProvisioner {
             &self.region,
             service,
         )
+    }
+
+    /// Wait for a just-created resource to stabilize, as a CloudFormation
+    /// resource handler does after its create call returns. A no-op unless
+    /// `wait_for_container_backing` is set; then a container-backed resource
+    /// is only complete once its container is up, and its attributes are read
+    /// back afterwards. `Err` carries the reason the resource failed to
+    /// stabilize.
+    pub(crate) fn stabilize_resource(&self, resource: &mut StackResource) -> Result<(), String> {
+        if !self.wait_for_container_backing {
+            return Ok(());
+        }
+        match resource.resource_type.as_str() {
+            "AWS::RDS::DBInstance" => self.stabilize_rds_db_instance(resource),
+            _ => Ok(()),
+        }
     }
 
     /// Create a resource and return the StackResource with physical ID.
@@ -4520,6 +4543,7 @@ mod tests {
             pending_container_teardowns: Arc::new(parking_lot::Mutex::new(Vec::new())),
             pending_custom_invokes: Arc::new(parking_lot::Mutex::new(Vec::new())),
             defer_custom_invokes: false,
+            wait_for_container_backing: false,
             s3_store: Arc::new(fakecloud_persistence::s3::MemoryS3Store::new()),
             kms_hook: None,
             quota_provider: None,
