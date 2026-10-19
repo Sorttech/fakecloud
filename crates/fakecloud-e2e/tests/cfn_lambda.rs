@@ -816,6 +816,117 @@ async fn cfn_changeset_holds_the_stack_in_progress_until_custom_resources_finish
     );
 }
 
+/// A change set holding both a container-backed DB instance and a custom
+/// resource fed its endpoint, the shape of a CDK database-provisioning stack.
+/// The execution waits for the container, so the handler gets the endpoint
+/// DescribeDBInstances reports rather than the pre-container placeholder, and
+/// the stack only completes once the handler has run.
+#[tokio::test]
+async fn cfn_changeset_custom_resource_receives_the_real_rds_endpoint() {
+    if !docker_available() {
+        eprintln!("docker required for Lambda execution; skipping");
+        return;
+    }
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let rds = server.rds_client().await;
+
+    let bucket = "cfn-cs-rds-custom-code";
+    upload_custom_resource_handler(&server, bucket, None).await;
+    let template = format!(
+        r#"{{
+  "Resources": {{
+    "Db": {{
+      "Type": "AWS::RDS::DBInstance",
+      "Properties": {{
+        "DBInstanceIdentifier": "cs-rds-custom",
+        "DBInstanceClass": "db.t4g.micro",
+        "Engine": "postgres",
+        "EngineVersion": "16.3",
+        "MasterUsername": "admin",
+        "MasterUserPassword": "hunter2-secret",
+        "AllocatedStorage": "20"
+      }}
+    }},
+    "Handler": {{
+      "Type": "AWS::Lambda::Function",
+      "Properties": {{
+        "FunctionName": "cs-rds-provisioner",
+        "Runtime": "python3.12",
+        "Handler": "index.handler",
+        "Timeout": 30,
+        "Role": "arn:aws:iam::123456789012:role/cr-role",
+        "Code": {{"S3Bucket": "{bucket}", "S3Key": "cr.zip"}}
+      }}
+    }},
+    "Custom": {{
+      "Type": "Custom::Database",
+      "Properties": {{
+        "ServiceToken": {{"Fn::GetAtt": ["Handler", "Arn"]}},
+        "Host": {{"Fn::GetAtt": ["Db", "Endpoint.Address"]}},
+        "Port": {{"Fn::GetAtt": ["Db", "Endpoint.Port"]}}
+      }}
+    }}
+  }}
+}}"#
+    );
+
+    let cs = cfn
+        .create_change_set()
+        .stack_name("cfn-cs-rds-custom")
+        .change_set_name("cs1")
+        .change_set_type(ChangeSetType::Create)
+        .template_body(template)
+        .send()
+        .await
+        .expect("create_change_set");
+    let cs_id = cs.id().expect("change set id");
+    cfn.execute_change_set()
+        .change_set_name(cs_id)
+        .send()
+        .await
+        .expect("execute_change_set");
+
+    let (status, reason) = await_terminal_status(&cfn, "cfn-cs-rds-custom").await;
+    assert_eq!(status, "CREATE_COMPLETE", "reason: {reason}");
+    assert_eq!(
+        change_set_execution_status(&cfn, cs_id).await,
+        "EXECUTE_COMPLETE"
+    );
+
+    let described = rds
+        .describe_db_instances()
+        .db_instance_identifier("cs-rds-custom")
+        .send()
+        .await
+        .expect("describe_db_instances");
+    let endpoint = described
+        .db_instances()
+        .first()
+        .and_then(|i| i.endpoint())
+        .expect("endpoint");
+
+    let events = custom_resource_events(&server, "cs-rds-provisioner", 1).await;
+    let create = &events[0];
+    assert_eq!(create["RequestType"], "Create");
+    assert_eq!(
+        create["ResourceProperties"]["Host"],
+        endpoint.address().expect("address"),
+        "create event: {create:#}"
+    );
+    assert_eq!(
+        create["ResourceProperties"]["Port"],
+        endpoint.port().expect("port").to_string(),
+        "create event: {create:#}"
+    );
+
+    cfn.delete_stack()
+        .stack_name("cfn-cs-rds-custom")
+        .send()
+        .await
+        .expect("delete_stack");
+}
+
 /// Regression: changing a custom resource's properties sent the handler a
 /// Delete and then a Create, never an Update. The Delete also carried no
 /// `ResourceProperties`, so CDK's `BucketDeployment` handler failed with

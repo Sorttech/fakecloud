@@ -103,6 +103,20 @@ async fn execute_change_set_provisions_and_deletes_rds_instance() {
         Some(true),
         "changeset-provisioned RDS instance must reach available"
     );
+    // With a container runtime the execution finishes in the background once
+    // the instance is available; delete only after it has.
+    let settled = helpers::wait_until(std::time::Duration::from_secs(120), || async {
+        let out = cfn
+            .describe_stacks()
+            .stack_name("cs-rds-stack")
+            .send()
+            .await
+            .ok()?;
+        let status = out.stacks().first()?.stack_status()?.as_str().to_string();
+        (!status.ends_with("IN_PROGRESS")).then_some(status)
+    })
+    .await;
+    assert_eq!(settled.as_deref(), Some("UPDATE_COMPLETE"));
 
     // Stack delete must remove the instance (and, with a runtime, stop its
     // container instead of leaking it).
