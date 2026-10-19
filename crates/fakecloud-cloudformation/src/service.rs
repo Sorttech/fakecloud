@@ -3300,29 +3300,29 @@ impl CloudFormationService {
         // flipping it to UPDATE_COMPLETE would make a stack that was never
         // created look updated, and the later ExecuteChangeSet would then
         // report UPDATE_* where it owes CREATE_*.
-        let in_review = !found_stack_id.is_empty() && {
+        //
+        // The same goes for a stack still being created or updated: an update
+        // applied on top of one in progress would race it. The hold below
+        // checks again under the write lock.
+        let in_progress = if found_stack_id.is_empty() {
+            None
+        } else {
             let accounts = self.state.read();
             accounts
                 .regional(&req.account_id, &req.region)
-                .is_some_and(|s| {
-                    s.stacks.values().any(|st| {
-                        st.stack_id == found_stack_id && st.status == "REVIEW_IN_PROGRESS"
+                .and_then(|s| {
+                    s.stacks.values().find(|st| {
+                        st.stack_id == found_stack_id && st.status.ends_with("_IN_PROGRESS")
                     })
                 })
+                .map(|st| st.status.clone())
         };
-        if in_review {
+        if let Some(status) = in_progress {
             // Skipping the metadata branch is not enough: the normal path
             // would also land on UPDATE_COMPLETE, since the shell has no
             // resources to diff. A stack that only ever existed as a change-set
             // shell has not been created, so an update on it is invalid.
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "ValidationError",
-                format!(
-                    "Stack [{}] is in REVIEW_IN_PROGRESS state and can not be updated.",
-                    input.stack_name
-                ),
-            ));
+            return Err(stack_in_progress_error(&input.stack_name, &status));
         }
         // Only for a stack that actually reached a successful state. A stack
         // left in a failure state would otherwise report UPDATE_COMPLETE and
@@ -3605,6 +3605,11 @@ impl CloudFormationService {
             .regional_get_mut(&req.account_id, &req.region)
             .and_then(|state| {
                 let stack = state.live_stack_mut(&stack_name)?;
+                // Another update or change set took the stack since the check
+                // above.
+                if stack.status.ends_with("_IN_PROGRESS") {
+                    return Some(Err(stack_in_progress_error(&stack_name, &stack.status)));
+                }
                 stack.status = "UPDATE_IN_PROGRESS".to_string();
                 stack.status_reason = None;
                 let stack = stack.clone();
@@ -3615,8 +3620,9 @@ impl CloudFormationService {
                     "AWS::CloudFormation::Stack",
                     "UPDATE_IN_PROGRESS",
                 );
-                Some(stack)
-            });
+                Some(Ok(stack))
+            })
+            .transpose()?;
         // Gone since the checks above: answer as for a stack that was never
         // there (see the synthetic-success note in `finish_update_stack`).
         let Some(stack) = held else {
@@ -4262,6 +4268,17 @@ struct UpdateStackRun {
     previous_template: String,
     previous_parameters: BTreeMap<String, String>,
     imported_names: Vec<String>,
+}
+
+/// UpdateStack's refusal of a stack still being created, updated or reviewed.
+/// The wording is the REVIEW_IN_PROGRESS refusal this path already used; it
+/// has not been checked against AWS.
+fn stack_in_progress_error(stack_name: &str, status: &str) -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "ValidationError",
+        format!("Stack [{stack_name}] is in {status} state and can not be updated."),
+    )
 }
 
 /// UpdateStack's reply for a stack that does not exist. UpdateStack declares

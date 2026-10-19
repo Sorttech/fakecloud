@@ -339,3 +339,90 @@ async fn create_stack_fails_when_rds_container_fails() {
         "rolled-back instance is gone: {described:?}"
     );
 }
+
+/// While a change set is still executing, another one on the same stack is
+/// refused, as AWS documents for ExecuteChangeSet's InvalidChangeSetStatus
+/// ("the stack status might be UPDATE_IN_PROGRESS"). The DB instance's
+/// container keeps the first execution in progress long enough to try.
+#[tokio::test]
+async fn execute_change_set_refuses_a_stack_in_progress() {
+    if helpers::container_cli().is_empty() {
+        return;
+    }
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let id = "rds-endpoint-busy";
+    let mut ids = Vec::new();
+    for name in ["first", "second"] {
+        let cs = cfn
+            .create_change_set()
+            .stack_name(id)
+            .change_set_name(name)
+            .change_set_type(ChangeSetType::Create)
+            .template_body(template(id))
+            .send()
+            .await
+            .expect("create_change_set");
+        ids.push(cs.id().expect("change set id").to_string());
+    }
+    cfn.execute_change_set()
+        .change_set_name(&ids[0])
+        .send()
+        .await
+        .expect("execute first change set");
+
+    let err = cfn
+        .execute_change_set()
+        .change_set_name(&ids[1])
+        .send()
+        .await
+        .expect_err("a stack in progress takes no second change set");
+    assert_eq!(
+        err.as_service_error().and_then(|e| e.meta().code()),
+        Some("InvalidChangeSetStatus")
+    );
+
+    assert_real_endpoint(&server, id, id, "CREATE_COMPLETE").await;
+}
+
+/// While an update is still in progress, another UpdateStack is refused
+/// rather than applied on top of it. The DB instance's container keeps the
+/// first update in progress long enough to try.
+#[tokio::test]
+async fn update_stack_refuses_a_stack_in_progress() {
+    if helpers::container_cli().is_empty() {
+        return;
+    }
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let id = "rds-endpoint-update-busy";
+    let seed = r#"{"Resources": {"Seed": {"Type": "AWS::SSM::Parameter",
+        "Properties": {"Name": "/rds-endpoint-update-busy/seed", "Type": "String", "Value": "x"}}}}"#;
+    cfn.create_stack()
+        .stack_name(id)
+        .template_body(seed)
+        .send()
+        .await
+        .expect("create_stack");
+    wait_stack_terminal(&cfn, id).await;
+    cfn.update_stack()
+        .stack_name(id)
+        .template_body(template(id))
+        .send()
+        .await
+        .expect("first update_stack");
+
+    let err = cfn
+        .update_stack()
+        .stack_name(id)
+        .template_body(seed)
+        .send()
+        .await
+        .expect_err("a stack in progress takes no second update");
+    assert_eq!(
+        err.as_service_error().and_then(|e| e.meta().code()),
+        Some("ValidationError")
+    );
+
+    assert_real_endpoint(&server, id, id, "UPDATE_COMPLETE").await;
+}
