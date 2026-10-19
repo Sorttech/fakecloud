@@ -79,9 +79,14 @@ fn output<'a>(stack: &'a Stack, key: &str) -> &'a str {
         .unwrap_or_else(|| panic!("output {key} present"))
 }
 
-/// Once the stack is CREATE_COMPLETE, the instance is available and every
-/// value derived from its endpoint matches DescribeDBInstances.
-async fn assert_real_endpoint(server: &TestServer, stack_name: &str, id: &str) {
+/// Once the stack reaches `expected_status`, the instance is available and
+/// every value derived from its endpoint matches DescribeDBInstances.
+async fn assert_real_endpoint_after(
+    server: &TestServer,
+    stack_name: &str,
+    id: &str,
+    expected_status: &str,
+) {
     let cfn = server.cloudformation_client().await;
     let rds = server.rds_client().await;
     let ssm = server.ssm_client().await;
@@ -89,7 +94,7 @@ async fn assert_real_endpoint(server: &TestServer, stack_name: &str, id: &str) {
     let stack = wait_stack_terminal(&cfn, stack_name).await;
     assert_eq!(
         stack.stack_status().map(|s| s.as_str()),
-        Some("CREATE_COMPLETE"),
+        Some(expected_status),
         "reason: {:?}",
         stack.stack_status_reason()
     );
@@ -138,6 +143,31 @@ async fn assert_real_endpoint(server: &TestServer, stack_name: &str, id: &str) {
         .send()
         .await
         .expect("delete_stack");
+}
+
+async fn assert_real_endpoint(server: &TestServer, stack_name: &str, id: &str) {
+    assert_real_endpoint_after(server, stack_name, id, "CREATE_COMPLETE").await;
+}
+
+/// A stack with nothing container-backed yet, for an update to add the DB to.
+const SEED_TEMPLATE: &str = r#"{
+  "Resources": {
+    "Seed": {"Type": "AWS::SNS::Topic", "Properties": {"TopicName": "rds-endpoint-seed"}}
+  }
+}"#;
+
+async fn create_seed_stack(cfn: &aws_sdk_cloudformation::Client, stack_name: &str) {
+    cfn.create_stack()
+        .stack_name(stack_name)
+        .template_body(SEED_TEMPLATE)
+        .send()
+        .await
+        .expect("create seed stack");
+    let seeded = wait_stack_terminal(cfn, stack_name).await;
+    assert_eq!(
+        seeded.stack_status().map(|s| s.as_str()),
+        Some("CREATE_COMPLETE")
+    );
 }
 
 #[tokio::test]
@@ -260,4 +290,56 @@ async fn execute_change_set_refuses_a_stack_in_progress() {
     );
 
     assert_real_endpoint(&server, id, id).await;
+}
+
+/// UpdateStack that adds a DB instance completes only once the instance is
+/// available, so its Outputs, Exports and same-stack consumers carry the real
+/// endpoint, as with CreateStack and ExecuteChangeSet.
+#[tokio::test]
+async fn update_stack_outputs_carry_real_rds_endpoint() {
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let id = "rds-endpoint-update";
+    create_seed_stack(&cfn, id).await;
+    cfn.update_stack()
+        .stack_name(id)
+        .template_body(template(id))
+        .send()
+        .await
+        .expect("update_stack");
+    assert_real_endpoint_after(&server, id, id, "UPDATE_COMPLETE").await;
+}
+
+/// While an update is still in progress, another UpdateStack is refused
+/// rather than applied on top of it. The DB instance's container keeps the
+/// first update in progress long enough to try.
+#[tokio::test]
+async fn update_stack_refuses_a_stack_in_progress() {
+    if helpers::container_cli().is_empty() {
+        return;
+    }
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let id = "rds-endpoint-update-busy";
+    create_seed_stack(&cfn, id).await;
+    cfn.update_stack()
+        .stack_name(id)
+        .template_body(template(id))
+        .send()
+        .await
+        .expect("first update_stack");
+
+    let err = cfn
+        .update_stack()
+        .stack_name(id)
+        .template_body(SEED_TEMPLATE)
+        .send()
+        .await
+        .expect_err("a stack in progress takes no second update");
+    assert_eq!(
+        err.as_service_error().and_then(|e| e.meta().code()),
+        Some("ValidationError")
+    );
+
+    assert_real_endpoint_after(&server, id, id, "UPDATE_COMPLETE").await;
 }

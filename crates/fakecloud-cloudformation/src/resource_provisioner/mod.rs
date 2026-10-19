@@ -1089,21 +1089,20 @@ pub struct ResourceProvisioner {
     /// containers (the create-side #2031-#2034 hardening never reached delete).
     pub pending_container_teardowns: Arc<parking_lot::Mutex<Vec<ContainerTeardownIntent>>>,
     /// Custom-resource (`Custom::*`) Lambda invoke intents queued during a
-    /// changeset/update provision when `defer_custom_invokes` is set. Invoking
-    /// the Lambda synchronously (`invoke_lambda_sync`) can cold-pull a container
-    /// image for minutes -- far past the client's 60s read timeout -- and, on
-    /// the changeset/update path, it ran while holding the CloudFormation state
-    /// write lock, stalling every other CFN op behind it. Queueing here lets the
+    /// stack delete when `defer_custom_invokes` is set. Invoking the Lambda
+    /// synchronously (`invoke_lambda_sync`) can cold-pull a container image for
+    /// minutes -- far past the client's 60s read timeout -- and the delete runs
+    /// inside the request. Queueing here lets the
     /// caller drain + `tokio::spawn` the invokes off the request path after the
     /// lock is dropped, mirroring how `CreateStack` provisions custom resources
     /// off the request path.
     pub pending_custom_invokes: Arc<parking_lot::Mutex<Vec<CustomInvokeIntent>>>,
     /// When `true`, `create_custom_resource` / `delete_custom_resource` queue
     /// their Lambda invoke onto `pending_custom_invokes` instead of running it
-    /// synchronously. Set on the changeset/update/delete provisioners; left
-    /// `false` for `CreateStack` (which already provisions off the request path
-    /// in a detached task, so its synchronous invoke never blocks the client or
-    /// the state lock).
+    /// synchronously. Set on the delete provisioner; left `false` for
+    /// CreateStack, ExecuteChangeSet and UpdateStack, which provision a stack
+    /// with custom resources in a detached task, so their synchronous invoke
+    /// never blocks the client or the state lock.
     pub defer_custom_invokes: bool,
     /// When `true`, `provision_stack_resources` waits after creating a
     /// container-backed resource until its container is up (see
