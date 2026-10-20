@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use fakecloud_core::container_net::{detect_container_cli, HostNetworking};
 use parking_lot::RwLock;
-use tokio_postgres::NoTls;
 
 mod k8s;
 
@@ -52,6 +51,10 @@ pub struct RunningDbContainer {
     pub endpoint_port: u16,
 }
 
+/// Whether `rds.force_ssl` applies to an instance, by its incarnation id. Set once by the service,
+/// which owns the parameter groups; the runtime asks at container start and at reboot.
+pub type ForceSslResolver = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 pub struct RdsRuntime {
     cli: String,
     /// Backing containers by the instance's incarnation id (its immutable
@@ -73,6 +76,7 @@ pub struct RdsRuntime {
     /// dispatch to it and the Docker fields above go unused. `None` is the
     /// default Docker/Podman backend.
     k8s: Option<k8s::K8sDb>,
+    force_ssl: RwLock<Option<ForceSslResolver>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -106,6 +110,8 @@ impl RdsRuntime {
         // `host-gateway`; Linux docker gets the resolved bridge IP).
         let cli = detect_container_cli()?;
         let net = HostNetworking::detect(&cli);
+        // Mint the CA now so `FAKECLOUD_RDS_CA_FILE` exists before the first instance, not after.
+        crate::tls::ca();
 
         Some(Self {
             cli,
@@ -115,6 +121,7 @@ impl RdsRuntime {
             server_port,
             image_cache: RwLock::new(HashMap::new()),
             k8s: None,
+            force_ssl: RwLock::new(None),
         })
     }
 
@@ -138,6 +145,7 @@ impl RdsRuntime {
             server_port,
             image_cache: RwLock::new(HashMap::new()),
             k8s: Some(db),
+            force_ssl: RwLock::new(None),
         })
     }
 
@@ -168,6 +176,7 @@ impl RdsRuntime {
             server_port: 0,
             image_cache: RwLock::new(HashMap::new()),
             k8s: None,
+            force_ssl: RwLock::new(None),
         }
     }
 
@@ -177,6 +186,118 @@ impl RdsRuntime {
         if let Some(k) = &self.k8s {
             k.reap_stale().await;
         }
+    }
+
+    /// Install the lookup for `rds.force_ssl`. Without one nothing is forced.
+    pub fn set_force_ssl_resolver(&self, resolver: ForceSslResolver) {
+        *self.force_ssl.write() = Some(resolver);
+    }
+
+    fn force_ssl_for(&self, incarnation: &str) -> bool {
+        self.force_ssl
+            .read()
+            .as_ref()
+            .is_some_and(|resolve| resolve(incarnation))
+    }
+
+    /// The names a client may dial and verify: the endpoint fakecloud advertises, the alias a
+    /// containerized fakecloud uses, and loopback.
+    fn tls_hosts(&self) -> Vec<String> {
+        let mut hosts = vec![self.net.sibling_host.clone()];
+        for extra in [
+            self.net.host_alias.as_str(),
+            "localhost",
+            "127.0.0.1",
+            "::1",
+        ] {
+            if !extra.is_empty() && !hosts.iter().any(|h| h == extra) {
+                hosts.push(extra.to_string());
+            }
+        }
+        hosts
+    }
+
+    /// Copy a tar stream into the container's root. `cp -` rather than a bind mount, which would
+    /// not resolve when fakecloud itself runs in a container, and rather than copying a host
+    /// directory, which makes every file root's: `postgres` rejects a key it does not own.
+    async fn copy_tar_into(&self, container_id: &str, tar: Vec<u8>) -> Result<(), RuntimeError> {
+        use tokio::io::AsyncWriteExt;
+        let mut child = tokio::process::Command::new(&self.cli)
+            .args(["cp", "-", &format!("{container_id}:/")])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| RuntimeError::ContainerStartFailed(e.to_string()))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(&tar)
+                .await
+                .map_err(|e| RuntimeError::ContainerStartFailed(e.to_string()))?;
+        }
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|e| RuntimeError::ContainerStartFailed(e.to_string()))?;
+        if !output.status.success() {
+            return Err(RuntimeError::ContainerStartFailed(format!(
+                "copying TLS files into the container failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Apply the current `rds.force_ssl` to a running container without restarting it: refresh the
+    /// connection rules and make `postgres` re-read them. `rds.force_ssl` is a dynamic parameter on
+    /// RDS (`DescribeEngineDefaultParameters`, 2026-10-20), so a change with `ApplyMethod=immediate`
+    /// takes effect with no reboot. A no-op on the Kubernetes backend, whose pods serve no TLS, and
+    /// for an incarnation with no running container.
+    pub async fn reload_force_ssl(&self, incarnation: &str) -> Result<(), RuntimeError> {
+        if self.k8s.is_some() {
+            return Ok(());
+        }
+        let Some(running) = self.containers.read().get(incarnation).cloned() else {
+            return Ok(());
+        };
+        let tar = crate::tls::hba_tar(self.force_ssl_for(incarnation))
+            .map_err(|e| RuntimeError::ContainerStartFailed(e.to_string()))?;
+        self.copy_tar_into(&running.container_id, tar).await?;
+        // `postgres` owns the data directory and refuses to be signalled by root, so run as it.
+        let output = tokio::process::Command::new(&self.cli)
+            .args([
+                "exec",
+                "-u",
+                "postgres",
+                &running.container_id,
+                "sh",
+                "-c",
+                "pg_ctl reload -D \"$PGDATA\"",
+            ])
+            .output()
+            .await
+            .map_err(|e| RuntimeError::ContainerStartFailed(e.to_string()))?;
+        if !output.status.success() {
+            return Err(RuntimeError::ContainerStartFailed(format!(
+                "reloading postgres failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Give a created, not yet started, PostgreSQL container its certificate, key and rules.
+    async fn install_postgres_tls(
+        &self,
+        container_id: &str,
+        force_ssl: bool,
+    ) -> Result<(), RuntimeError> {
+        let (cert, key) = crate::tls::ca()
+            .server_certificate(&self.tls_hosts())
+            .map_err(|e| RuntimeError::ContainerStartFailed(e.to_string()))?;
+        let tar = crate::tls::tls_tar(&cert, &key, force_ssl)
+            .map_err(|e| RuntimeError::ContainerStartFailed(e.to_string()))?;
+        self.copy_tar_into(container_id, tar).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -412,6 +533,11 @@ impl RdsRuntime {
         }
 
         args.push(image);
+        if engine == "postgres" {
+            // After the image, so they are `postgres` arguments (the entrypoint passes any
+            // leading `-c` straight through, and to the init-time server as well).
+            args.extend(crate::tls::POSTGRES_TLS_ARGS.map(String::from));
+        }
 
         let output = tokio::process::Command::new(&self.cli)
             .args(&args)
@@ -426,6 +552,15 @@ impl RdsRuntime {
         }
 
         let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if engine == "postgres" {
+            if let Err(error) = self
+                .install_postgres_tls(&container_id, self.force_ssl_for(incarnation))
+                .await
+            {
+                self.remove_container(&container_id).await;
+                return Err(error);
+            }
+        }
         let start_result = tokio::process::Command::new(&self.cli)
             .args(["start", &container_id])
             .output()
@@ -525,6 +660,13 @@ impl RdsRuntime {
             .get(incarnation)
             .cloned()
             .ok_or(RuntimeError::Unavailable)?;
+
+        if engine == "postgres" {
+            // A reboot is what applies a changed `rds.force_ssl`, so refresh the rules first.
+            let tar = crate::tls::hba_tar(self.force_ssl_for(incarnation))
+                .map_err(|e| RuntimeError::ContainerStartFailed(e.to_string()))?;
+            self.copy_tar_into(&running.container_id, tar).await?;
+        }
 
         let output = tokio::process::Command::new(&self.cli)
             .args(["restart", &running.container_id])
@@ -649,8 +791,10 @@ impl RdsRuntime {
                 "host={} port={host_port} user={username} password={password} dbname={db_name}",
                 self.net.sibling_host
             );
+            // `prefer` (the default): TLS where the server offers it, so a forced-TLS instance is
+            // reachable; plain where it does not (the Kubernetes backend's pods).
             if let Ok((client, connection)) =
-                tokio_postgres::connect(&connection_string, NoTls).await
+                tokio_postgres::connect(&connection_string, crate::tls::client_connector()).await
             {
                 tokio::spawn(async move {
                     let _ = connection.await;

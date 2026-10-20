@@ -4,6 +4,7 @@ pub(crate) mod filters;
 pub mod runtime;
 pub(crate) mod service;
 pub(crate) mod state;
+pub mod tls;
 pub(crate) mod validation;
 
 pub use service::service_helpers::{default_engine_version, default_port_for_engine};

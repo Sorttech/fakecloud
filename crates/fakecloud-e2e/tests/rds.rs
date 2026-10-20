@@ -1045,7 +1045,7 @@ async fn connect_with_retry(
 
     let mut last_error = None;
     for _ in 0..20 {
-        match tokio_postgres::connect(&connection_string, NoTls).await {
+        match tokio_postgres::connect(&connection_string, helpers::pg_tls()).await {
             Ok(connection) => return Ok(connection),
             Err(error) => {
                 last_error = Some(error);
@@ -2372,4 +2372,325 @@ async fn rds_engine_versions_use_aws_version_grammars() {
         cluster.db_cluster().unwrap().engine_version(),
         Some("8.0.mysql_aurora.3.04.0")
     );
+}
+
+/// A TLS connector that trusts only the CA fakecloud published to `ca_file`, so `verify-full`
+/// style checking (chain and host name) is what the connection has to pass.
+fn tls_connector_for(ca_file: &std::path::Path) -> tokio_postgres_rustls::MakeRustlsConnect {
+    use rustls::pki_types::{pem::PemObject, CertificateDer};
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_file_iter(ca_file).expect("read the published RDS CA") {
+        roots
+            .add(cert.expect("parse CA certificate"))
+            .expect("trust CA");
+    }
+    let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("protocol versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    tokio_postgres_rustls::MakeRustlsConnect::new(config)
+}
+
+/// Start a server that publishes the RDS CA, create a PostgreSQL instance and return the pieces a
+/// TLS client needs.
+async fn tls_instance(
+    server_dir: &std::path::Path,
+    identifier: &str,
+    parameter_group: Option<&str>,
+) -> (TestServer, aws_sdk_rds::Client, std::path::PathBuf, String) {
+    let ca_file = server_dir.join("rds-ca.pem");
+    let server =
+        TestServer::start_with_env(&[("FAKECLOUD_RDS_CA_FILE", ca_file.to_str().unwrap())]).await;
+    let client = server.rds_client().await;
+    let mut request = client
+        .create_db_instance()
+        .db_instance_identifier(identifier)
+        .allocated_storage(20)
+        .db_instance_class("db.t3.micro")
+        .engine("postgres")
+        .engine_version("16.3")
+        .master_username("admin")
+        .master_user_password("secret123")
+        .db_name("appdb");
+    if let Some(group) = parameter_group {
+        request = request.db_parameter_group_name(group);
+    }
+    request.send().await.unwrap();
+    let instance = helpers::wait_for_db_available(&client, identifier, 180).await;
+    let endpoint = instance.endpoint().expect("endpoint");
+    let connection_string = format!(
+        "host={} port={} user=admin password=secret123 dbname=appdb",
+        endpoint.address().expect("address"),
+        endpoint.port().expect("port"),
+    );
+    (server, client, ca_file, connection_string)
+}
+
+/// Connect with the verifying client, retrying while the instance settles.
+async fn connect_verified(
+    connection_string: &str,
+    ca_file: &std::path::Path,
+) -> (
+    tokio_postgres::Client,
+    impl std::future::Future<Output = Result<(), tokio_postgres::Error>>,
+) {
+    let mut last = None;
+    for _ in 0..20 {
+        match tokio_postgres::connect(
+            &format!("{connection_string} sslmode=require"),
+            tls_connector_for(ca_file),
+        )
+        .await
+        {
+            Ok(pair) => return pair,
+            Err(error) => {
+                last = Some(error);
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+    }
+    panic!("a verifying TLS client could not connect: {:?}", last);
+}
+
+async fn plain_connection_error(connection_string: &str) -> Option<String> {
+    match tokio_postgres::connect(connection_string, NoTls).await {
+        Ok(_) => None,
+        // `Display` on a server rejection is just "db error"; the text RDS clients see is the
+        // server's own message.
+        Err(error) => Some(
+            error
+                .as_db_error()
+                .map(|e| e.message().to_string())
+                .unwrap_or_else(|| error.to_string()),
+        ),
+    }
+}
+
+/// RDS for PostgreSQL "uses and expects all clients to connect using SSL/TLS"
+/// (https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/PostgreSQL.Concepts.General.SSL.md,
+/// fetched 2026-10-20). A client that verifies the chain and the host name against the published
+/// CA gets in, and the session is encrypted.
+#[tokio::test]
+async fn rds_postgres_serves_tls_that_a_verifying_client_accepts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_server, _client, ca_file, connection_string) =
+        tls_instance(dir.path(), "e2e-tls-db", None).await;
+
+    let (db_client, connection) = connect_verified(&connection_string, &ca_file).await;
+    tokio::spawn(connection);
+    let row = db_client
+        .query_one(
+            "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+            &[],
+        )
+        .await
+        .expect("pg_stat_ssl");
+    assert!(row.get::<_, bool>(0), "the session must be encrypted");
+}
+
+/// `rds.force_ssl` defaults to 1 for PostgreSQL 15 and later and to 0 for 14 and older; with it on a
+/// plain connection is rejected with `no pg_hba.conf entry for host "..."`.
+#[tokio::test]
+async fn rds_postgres_forces_tls_by_default_from_version_15() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_server, client, _ca_file, connection_string) =
+        tls_instance(dir.path(), "e2e-force-ssl-db", None).await;
+
+    let error = plain_connection_error(&connection_string)
+        .await
+        .expect("a plain connection must be refused while rds.force_ssl is on");
+    // The suffix ("no encryption" on the PostgreSQL 16 server probed 2026-10-20; "SSL off" in the
+    // older wording the AWS page shows) is the engine's own text, so only the stable part is
+    // asserted.
+    assert!(
+        error.starts_with("no pg_hba.conf entry for host"),
+        "unexpected rejection: {error}"
+    );
+
+    for (group, expected) in [("default.postgres16", "1"), ("default.postgres14", "0")] {
+        let parameters = client
+            .describe_db_parameters()
+            .db_parameter_group_name(group)
+            .source("engine-default")
+            .send()
+            .await
+            .unwrap();
+        let force_ssl = parameters
+            .parameters()
+            .iter()
+            .find(|p| p.parameter_name() == Some("rds.force_ssl"))
+            .unwrap_or_else(|| panic!("{group} lists rds.force_ssl"));
+        assert_eq!(force_ssl.parameter_value(), Some(expected), "{group}");
+    }
+}
+
+/// Setting `rds.force_ssl` to 0 in the instance's parameter group lets a plain connection in once
+/// the instance reboots, and setting it back refuses it again.
+#[tokio::test]
+async fn rds_postgres_applies_force_ssl_from_its_parameter_group_on_reboot() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca_file = dir.path().join("rds-ca.pem");
+    let server =
+        TestServer::start_with_env(&[("FAKECLOUD_RDS_CA_FILE", ca_file.to_str().unwrap())]).await;
+    let client = server.rds_client().await;
+    client
+        .create_db_parameter_group()
+        .db_parameter_group_name("e2e-force-ssl-group")
+        .db_parameter_group_family("postgres16")
+        .description("force_ssl toggling")
+        .send()
+        .await
+        .unwrap();
+    client
+        .create_db_instance()
+        .db_instance_identifier("e2e-force-ssl-reboot-db")
+        .allocated_storage(20)
+        .db_instance_class("db.t3.micro")
+        .engine("postgres")
+        .engine_version("16.3")
+        .master_username("admin")
+        .master_user_password("secret123")
+        .db_name("appdb")
+        .db_parameter_group_name("e2e-force-ssl-group")
+        .send()
+        .await
+        .unwrap();
+    let instance = helpers::wait_for_db_available(&client, "e2e-force-ssl-reboot-db", 180).await;
+    let endpoint = instance.endpoint().expect("endpoint");
+    let connection_string = format!(
+        "host={} port={} user=admin password=secret123 dbname=appdb",
+        endpoint.address().expect("address"),
+        endpoint.port().expect("port"),
+    );
+    assert!(
+        plain_connection_error(&connection_string).await.is_some(),
+        "forced by the engine default before any change"
+    );
+
+    for (value, plain_allowed) in [("0", true), ("1", false)] {
+        client
+            .modify_db_parameter_group()
+            .db_parameter_group_name("e2e-force-ssl-group")
+            .parameters(
+                aws_sdk_rds::types::Parameter::builder()
+                    .parameter_name("rds.force_ssl")
+                    .parameter_value(value)
+                    .apply_method(aws_sdk_rds::types::ApplyMethod::PendingReboot)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+        client
+            .reboot_db_instance()
+            .db_instance_identifier("e2e-force-ssl-reboot-db")
+            .send()
+            .await
+            .unwrap();
+        helpers::wait_for_db_available(&client, "e2e-force-ssl-reboot-db", 180).await;
+        // The published port can change on reboot, so read the endpoint again.
+        let after = helpers::wait_for_db_available(&client, "e2e-force-ssl-reboot-db", 180).await;
+        let endpoint = after.endpoint().expect("endpoint");
+        let connection_string = format!(
+            "host={} port={} user=admin password=secret123 dbname=appdb",
+            endpoint.address().expect("address"),
+            endpoint.port().expect("port"),
+        );
+        let mut outcome = plain_connection_error(&connection_string).await;
+        for _ in 0..10 {
+            if outcome.is_none() == plain_allowed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            outcome = plain_connection_error(&connection_string).await;
+        }
+        assert_eq!(
+            outcome.is_none(),
+            plain_allowed,
+            "rds.force_ssl={value}: plain connection result {outcome:?}"
+        );
+    }
+}
+
+/// `rds.force_ssl` is a dynamic parameter on RDS (`DescribeEngineDefaultParameters`, 2026-10-20),
+/// so a change made with `ApplyMethod=immediate` reaches the running instance with no reboot, and
+/// an existing connection is not dropped by it.
+#[tokio::test]
+async fn rds_postgres_applies_an_immediate_force_ssl_change_without_a_reboot() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca_file = dir.path().join("rds-ca.pem");
+    let server =
+        TestServer::start_with_env(&[("FAKECLOUD_RDS_CA_FILE", ca_file.to_str().unwrap())]).await;
+    let client = server.rds_client().await;
+    client
+        .create_db_parameter_group()
+        .db_parameter_group_name("e2e-force-ssl-live")
+        .db_parameter_group_family("postgres16")
+        .description("force_ssl, no reboot")
+        .send()
+        .await
+        .unwrap();
+    client
+        .create_db_instance()
+        .db_instance_identifier("e2e-force-ssl-live-db")
+        .allocated_storage(20)
+        .db_instance_class("db.t3.micro")
+        .engine("postgres")
+        .engine_version("16.3")
+        .master_username("admin")
+        .master_user_password("secret123")
+        .db_name("appdb")
+        .db_parameter_group_name("e2e-force-ssl-live")
+        .send()
+        .await
+        .unwrap();
+    let instance = helpers::wait_for_db_available(&client, "e2e-force-ssl-live-db", 180).await;
+    let endpoint = instance.endpoint().expect("endpoint");
+    let connection_string = format!(
+        "host={} port={} user=admin password=secret123 dbname=appdb",
+        endpoint.address().expect("address"),
+        endpoint.port().expect("port"),
+    );
+    assert!(plain_connection_error(&connection_string).await.is_some());
+
+    // A TLS session opened before the change must survive it.
+    let (open_client, connection) = connect_verified(&connection_string, &ca_file).await;
+    tokio::spawn(connection);
+
+    for (value, plain_allowed) in [("0", true), ("1", false)] {
+        client
+            .modify_db_parameter_group()
+            .db_parameter_group_name("e2e-force-ssl-live")
+            .parameters(
+                aws_sdk_rds::types::Parameter::builder()
+                    .parameter_name("rds.force_ssl")
+                    .parameter_value(value)
+                    .apply_method(aws_sdk_rds::types::ApplyMethod::Immediate)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+        // The reload runs behind the API call, so allow it a moment; no reboot is involved.
+        let mut outcome = plain_connection_error(&connection_string).await;
+        for _ in 0..20 {
+            if outcome.is_none() == plain_allowed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            outcome = plain_connection_error(&connection_string).await;
+        }
+        assert_eq!(
+            outcome.is_none(),
+            plain_allowed,
+            "rds.force_ssl={value} with no reboot: plain connection result {outcome:?}"
+        );
+        open_client
+            .simple_query("SELECT 1")
+            .await
+            .expect("the open session survives the reload");
+    }
 }

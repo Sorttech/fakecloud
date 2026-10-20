@@ -5602,6 +5602,7 @@ dependencies = [
  "reqwest",
  "rsa",
  "rskafka",
+ "rustls 0.23.45",
  "serde_json",
  "serde_urlencoded",
  "sha1",
@@ -5609,6 +5610,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-postgres",
+ "tokio-postgres-rustls",
  "tokio-tungstenite 0.29.0",
  "uuid",
  "x509-cert",
@@ -6542,12 +6544,16 @@ dependencies = [
  "kube",
  "mysql_async",
  "parking_lot",
+ "rcgen",
+ "rustls 0.23.45",
  "serde",
  "serde_json",
+ "tar",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-postgres",
+ "tokio-postgres-rustls",
  "tracing",
  "uuid",
 ]
@@ -11457,6 +11463,21 @@ dependencies = [
  "tokio",
  "tokio-util",
  "whoami",
+]
+
+[[package]]
+name = "tokio-postgres-rustls"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27d684bad428a0f2481f42241f821db42c54e2dc81d8c00db8536c506b0a0144"
+dependencies = [
+ "const-oid 0.9.6",
+ "ring",
+ "rustls 0.23.45",
+ "tokio",
+ "tokio-postgres",
+ "tokio-rustls 0.26.4",
+ "x509-cert",
 ]
 
 [[package]]

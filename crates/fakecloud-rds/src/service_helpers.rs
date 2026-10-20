@@ -2913,3 +2913,24 @@ mod instance_class_tests {
         }
     }
 }
+
+/// Whether `rds.force_ssl` is on for an instance: the value its parameter group sets, else the
+/// engine default (on for RDS for PostgreSQL 15 and later). Only RDS for PostgreSQL has the
+/// parameter; every other engine, Aurora included, is never forced.
+pub(crate) fn force_ssl_enabled(state: &RdsState, instance: &DbInstance) -> bool {
+    if instance.engine != "postgres" {
+        return false;
+    }
+    let group = instance
+        .db_parameter_group_name
+        .clone()
+        .unwrap_or_else(|| default_parameter_group(&instance.engine, &instance.engine_version));
+    match state
+        .parameter_groups
+        .get(&group)
+        .and_then(|g| g.parameters.get("rds.force_ssl"))
+    {
+        Some(value) => value == "1",
+        None => crate::state::postgres_major_forces_ssl(&instance.engine_version),
+    }
+}

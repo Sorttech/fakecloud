@@ -474,3 +474,70 @@ pub async fn root_s3_client(server: &TestServer) -> aws_sdk_s3::Client {
             .build(),
     )
 }
+
+/// A TLS connector for tests that connect to an RDS PostgreSQL container and do not care which CA
+/// signed it. RDS for PostgreSQL expects TLS (and forces it from version 15), so a test client has
+/// to speak it; the tests that check the certificate itself build their own verifying connector.
+pub fn pg_tls() -> tokio_postgres_rustls::MakeRustlsConnect {
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{DigitallySignedStruct, SignatureScheme};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct AcceptAnyCert(Arc<rustls::crypto::CryptoProvider>);
+
+    impl ServerCertVerifier for AcceptAnyCert {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
+        .with_no_client_auth();
+    tokio_postgres_rustls::MakeRustlsConnect::new(config)
+}

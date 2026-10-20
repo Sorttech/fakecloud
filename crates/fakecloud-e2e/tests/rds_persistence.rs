@@ -1,7 +1,6 @@
 mod helpers;
 
 use helpers::TestServer;
-use tokio_postgres::NoTls;
 
 async fn connect_postgres_with_retry(
     host: &str,
@@ -14,7 +13,7 @@ async fn connect_postgres_with_retry(
         format!("host={host} port={port} user={user} password={password} dbname={dbname}");
     let mut last_error = None;
     for _ in 0..40 {
-        match tokio_postgres::connect(&connection_string, NoTls).await {
+        match tokio_postgres::connect(&connection_string, helpers::pg_tls()).await {
             Ok((client, conn)) => {
                 tokio::spawn(conn);
                 return Ok(client);
@@ -181,7 +180,7 @@ async fn start_stop_db_instance_toggles_backing_container() {
         std::time::Duration::from_secs(2),
         tokio_postgres::connect(
             &format!("host={host} port={port_before} user=admin password=secret123 dbname=appdb"),
-            NoTls,
+            helpers::pg_tls(),
         ),
     )
     .await;
@@ -701,7 +700,7 @@ async fn renamed_instance_keeps_its_data_and_old_identifier_starts_clean() {
         std::time::Duration::from_secs(2),
         tokio_postgres::connect(
             &format!("host={host} port={port} user=admin password=secret123 dbname=appdb"),
-            NoTls,
+            helpers::pg_tls(),
         ),
     )
     .await;

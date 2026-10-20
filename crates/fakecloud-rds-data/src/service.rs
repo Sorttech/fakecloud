@@ -778,12 +778,13 @@ fn is_ident_char(b: u8) -> bool {
 }
 
 async fn pg_connect(conn: &DbConn) -> Result<tokio_postgres::Client, AwsServiceError> {
-    use tokio_postgres::NoTls;
     let cs = format!(
         "host={} port={} user={} password={} dbname={}",
         conn.host, conn.port, conn.user, conn.password, conn.db_name
     );
-    let (client, connection) = tokio_postgres::connect(&cs, NoTls)
+    // TLS where the instance offers it (RDS for PostgreSQL does, and forces it from 15), verified
+    // against the emulator's own CA; plain where it does not.
+    let (client, connection) = tokio_postgres::connect(&cs, fakecloud_rds::tls::client_connector())
         .await
         .map_err(|e| bad_request(format!("could not connect to database: {e}")))?;
     tokio::spawn(async move {
