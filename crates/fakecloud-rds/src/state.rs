@@ -664,7 +664,14 @@ pub struct EngineDefaultParameter {
 /// that round-trip `DescribeDBParameters` with `Source=engine-default`
 /// see meaningful entries. Unknown families fall through to an empty list.
 pub fn engine_default_parameters(family: &str) -> &'static [EngineDefaultParameter] {
-    if family.starts_with("postgres") || family.starts_with("aurora-postgresql") {
+    if let Some(major) = family.strip_prefix("postgres") {
+        // `rds.force_ssl` exists on RDS for PostgreSQL only, and defaults to 1 from version 15.
+        if postgres_major_forces_ssl(major) {
+            &POSTGRES_FORCE_SSL_DEFAULT_PARAMETERS
+        } else {
+            &POSTGRES_NO_FORCE_SSL_DEFAULT_PARAMETERS
+        }
+    } else if family.starts_with("aurora-postgresql") {
         POSTGRES_DEFAULT_PARAMETERS
     } else if family.starts_with("mysql") || family.starts_with("aurora-mysql") {
         MYSQL_DEFAULT_PARAMETERS
@@ -673,6 +680,45 @@ pub fn engine_default_parameters(family: &str) -> &'static [EngineDefaultParamet
     } else {
         &[]
     }
+}
+
+/// `rds.force_ssl` defaults to 1 for RDS for PostgreSQL 15 and later and to 0 for 14 and older
+/// (<https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/PostgreSQL.Concepts.General.SSL.md>,
+/// fetched 2026-10-20). `major` is the part after `postgres` in the family, or an engine version.
+pub fn postgres_major_forces_ssl(major: &str) -> bool {
+    major
+        .split('.')
+        .next()
+        .and_then(|m| m.parse::<u32>().ok())
+        .is_some_and(|m| m >= 15)
+}
+
+const fn force_ssl_parameter(value: &'static str) -> EngineDefaultParameter {
+    EngineDefaultParameter {
+        name: "rds.force_ssl",
+        value,
+        // Real RDS (DescribeEngineDefaultParameters, run 2026-10-20 by James against a PostgreSQL
+        // family; the family was not recorded): ApplyType "dynamic", DataType "boolean",
+        // AllowedValues "0,1", IsModifiable true. fakecloud re-reads the value only when the
+        // instance reboots; AWS applies a dynamic change without one.
+        apply_type: "dynamic",
+        data_type: "boolean",
+        allowed_values: "0,1",
+        is_modifiable: true,
+    }
+}
+
+/// The shared PostgreSQL list plus `rds.force_ssl`, one list per default. Built once because the
+/// callers want a `&'static` slice.
+static POSTGRES_FORCE_SSL_DEFAULT_PARAMETERS: std::sync::LazyLock<Vec<EngineDefaultParameter>> =
+    std::sync::LazyLock::new(|| postgres_defaults_with(force_ssl_parameter("1")));
+static POSTGRES_NO_FORCE_SSL_DEFAULT_PARAMETERS: std::sync::LazyLock<Vec<EngineDefaultParameter>> =
+    std::sync::LazyLock::new(|| postgres_defaults_with(force_ssl_parameter("0")));
+
+fn postgres_defaults_with(extra: EngineDefaultParameter) -> Vec<EngineDefaultParameter> {
+    let mut all = POSTGRES_DEFAULT_PARAMETERS.to_vec();
+    all.push(extra);
+    all
 }
 
 const POSTGRES_DEFAULT_PARAMETERS: &[EngineDefaultParameter] = &[
@@ -1354,9 +1400,12 @@ pub struct RdsSnapshot {
 mod tests {
     use chrono::Utc;
 
+    use std::collections::BTreeMap;
+
     use super::{
-        default_engine_versions, default_orderable_options, default_parameter_groups, Arn,
-        DataVolumeBinding, DbInstance, RdsState, SUPPORTED_INSTANCE_CLASSES,
+        default_engine_versions, default_orderable_options, default_parameter_groups,
+        engine_default_parameters, postgres_major_forces_ssl, Arn, DataVolumeBinding, DbInstance,
+        DbParameterGroup, RdsState, SUPPORTED_INSTANCE_CLASSES,
     };
 
     #[test]
@@ -1538,6 +1587,106 @@ mod tests {
     fn default_orderable_options_list_not_empty() {
         let opts = default_orderable_options();
         assert!(!opts.is_empty());
+    }
+
+    #[test]
+    fn postgres_forces_ssl_from_version_15() {
+        for forced in ["15", "16", "17", "18", "15.4", "16.3"] {
+            assert!(postgres_major_forces_ssl(forced), "{forced}");
+        }
+        for relaxed in ["14", "13", "12", "11.22", "9.6", "", "x"] {
+            assert!(!postgres_major_forces_ssl(relaxed), "{relaxed}");
+        }
+    }
+
+    #[test]
+    fn engine_default_force_ssl_follows_the_family_and_only_for_postgres() {
+        let value = |family: &str| {
+            engine_default_parameters(family)
+                .iter()
+                .find(|p| p.name == "rds.force_ssl")
+                .map(|p| (p.value, p.apply_type, p.data_type, p.allowed_values))
+        };
+        // Real RDS: dynamic boolean, "0,1" (DescribeEngineDefaultParameters, 2026-10-20).
+        assert_eq!(
+            value("postgres16"),
+            Some(("1", "dynamic", "boolean", "0,1"))
+        );
+        assert_eq!(value("postgres15").map(|v| v.0), Some("1"));
+        assert_eq!(value("postgres14").map(|v| v.0), Some("0"));
+        // Not an Aurora, MySQL or MariaDB parameter.
+        assert_eq!(value("aurora-postgresql16"), None);
+        assert_eq!(value("mysql8.0"), None);
+        assert_eq!(value("mariadb10.11"), None);
+        // The rest of the PostgreSQL list is still there.
+        assert!(engine_default_parameters("postgres16")
+            .iter()
+            .any(|p| p.name == "max_connections"));
+    }
+
+    fn state_with_group(name: &str, force_ssl: Option<&str>) -> RdsState {
+        let mut state = RdsState::new("123", "us-east-1");
+        let mut parameters = BTreeMap::new();
+        if let Some(value) = force_ssl {
+            parameters.insert("rds.force_ssl".to_string(), value.to_string());
+        }
+        state.parameter_groups.insert(
+            name.to_string(),
+            DbParameterGroup {
+                db_parameter_group_name: name.to_string(),
+                db_parameter_group_arn: String::new(),
+                db_parameter_group_family: "postgres16".to_string(),
+                description: String::new(),
+                parameters,
+                parameter_apply_methods: BTreeMap::new(),
+                tags: Vec::new(),
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn force_ssl_is_the_groups_value_else_the_engine_default() {
+        use crate::service::service_helpers::force_ssl_enabled;
+        let mut instance = make_instance("db");
+        instance.engine = "postgres".to_string();
+        instance.engine_version = "16.3".to_string();
+        instance.db_parameter_group_name = Some("custom".to_string());
+
+        // Group without the parameter: engine default (on for 16).
+        assert!(force_ssl_enabled(
+            &state_with_group("custom", None),
+            &instance
+        ));
+        // The group's own value wins either way.
+        assert!(!force_ssl_enabled(
+            &state_with_group("custom", Some("0")),
+            &instance
+        ));
+        assert!(force_ssl_enabled(
+            &state_with_group("custom", Some("1")),
+            &instance
+        ));
+
+        // No group named: the default group, so the engine default for the version.
+        instance.db_parameter_group_name = None;
+        assert!(force_ssl_enabled(
+            &state_with_group("custom", Some("0")),
+            &instance
+        ));
+        instance.engine_version = "14.9".to_string();
+        assert!(!force_ssl_enabled(
+            &state_with_group("custom", None),
+            &instance
+        ));
+
+        // Never forced off PostgreSQL.
+        instance.engine = "mysql".to_string();
+        instance.engine_version = "8.0.36".to_string();
+        assert!(!force_ssl_enabled(
+            &state_with_group("custom", Some("1")),
+            &instance
+        ));
     }
 
     #[test]

@@ -29,6 +29,12 @@ mysql_async = "0.34"
 base64 = { workspace = true }
 tracing = { workspace = true }
 tempfile = { workspace = true }
+# RDS for PostgreSQL serves TLS: a CA and per-instance server certificates (`tls.rs`), and the
+# verifying client fakecloud itself connects with.
+rcgen = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-postgres-rustls = "0.13"
+tar = "0.4"
 
 [dev-dependencies]
 fakecloud-kms = { workspace = true, features = ["test-util"] }

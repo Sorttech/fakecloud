@@ -221,6 +221,11 @@ impl RdsService {
         // ApplyMethod is accepted (immediate vs pending-reboot) but the
         // single-state model applies all changes immediately.
         let parsed_params = parse_db_parameter_members(request);
+        // `rds.force_ssl` is dynamic on RDS, so an `immediate` change reaches running instances
+        // now. A `pending-reboot` one waits for the reboot, which re-reads it.
+        let force_ssl_now = parsed_params
+            .iter()
+            .any(|p| p.name == "rds.force_ssl" && p.apply_method == "immediate");
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&request.account_id);
@@ -251,7 +256,32 @@ impl RdsService {
 
         let parameter_group_clone = parameter_group.clone();
         let arn = parameter_group_clone.db_parameter_group_arn.clone();
+        let reload: Vec<String> = if force_ssl_now {
+            state
+                .instances
+                .values()
+                .filter(|i| {
+                    i.engine == "postgres"
+                        && i.db_parameter_group_name.as_deref()
+                            == Some(db_parameter_group_name.as_str())
+                })
+                .map(|i| i.dbi_resource_id.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         drop(accounts);
+
+        if let Some(runtime) = self.runtime.clone().filter(|_| !reload.is_empty()) {
+            // The container work (copy, reload) is slow next to the API call, so it runs behind it.
+            tokio::spawn(async move {
+                for incarnation in reload {
+                    if let Err(error) = runtime.reload_force_ssl(&incarnation).await {
+                        tracing::warn!(%error, incarnation, "applying rds.force_ssl failed");
+                    }
+                }
+            });
+        }
 
         self.emit_event(
             RdsSourceType::DbParameterGroup,

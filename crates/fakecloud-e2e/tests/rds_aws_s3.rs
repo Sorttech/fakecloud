@@ -8,7 +8,6 @@ mod helpers;
 
 use aws_sdk_s3::primitives::ByteStream;
 use helpers::TestServer;
-use tokio_postgres::NoTls;
 
 async fn connect_with_retry(
     host: &str,
@@ -21,7 +20,7 @@ async fn connect_with_retry(
         format!("host={host} port={port} user={user} password={password} dbname={dbname}");
     let mut last_error = None;
     for _ in 0..30 {
-        match tokio_postgres::connect(&connection_string, NoTls).await {
+        match tokio_postgres::connect(&connection_string, helpers::pg_tls()).await {
             Ok((client, connection)) => {
                 tokio::spawn(async move {
                     let _ = connection.await;

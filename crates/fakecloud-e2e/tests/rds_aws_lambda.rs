@@ -13,7 +13,6 @@ use std::io::Write;
 
 use aws_sdk_lambda::primitives::Blob;
 use helpers::TestServer;
-use tokio_postgres::NoTls;
 
 fn make_echo_zip() -> Vec<u8> {
     // Returns the raw event back to the caller so we can verify the
@@ -41,7 +40,7 @@ async fn connect_with_retry(
         format!("host={host} port={port} user={user} password={password} dbname={dbname}");
     let mut last_error = None;
     for _ in 0..30 {
-        match tokio_postgres::connect(&connection_string, NoTls).await {
+        match tokio_postgres::connect(&connection_string, helpers::pg_tls()).await {
             Ok((client, connection)) => {
                 tokio::spawn(async move {
                     let _ = connection.await;

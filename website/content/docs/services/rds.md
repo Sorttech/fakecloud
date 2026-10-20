@@ -14,6 +14,7 @@ fakecloud implements **164 of 164** RDS operations at 100% Smithy conformance. D
 - **Read replicas** — CreateDBInstanceReadReplica, PromoteReadReplica
 - **Storage encryption** - `StorageEncrypted` without a `KmsKeyId` encrypts with the account's AWS-managed `aws/rds` key for the region and reports its key ARN; a key named by alias or key id is reported as its key ARN. Aurora cluster members report their cluster's encryption and key, and snapshots, copies, read replicas and restores carry the source's key (a restore or copy that names a `KmsKeyId` uses it).
 - **Parameter groups** — DBParameterGroup and DBClusterParameterGroup CRUD, parameter management
+- **PostgreSQL TLS** — RDS for PostgreSQL containers serve TLS with a certificate signed by a per-process CA, and `rds.force_ssl` is modelled (on by default from version 15, as on AWS); see [TLS and `rds.force_ssl`](#tls-and-rds-force-ssl)
 - **Option groups** — CRUD
 - **Subnet groups** — CRUD. Subnets resolve in EC2: the group reports their `VpcId` and each subnet's real Availability Zone, unknown subnets or subnets spanning VPCs are rejected with `InvalidSubnet`, and fewer than two zones with `DBSubnetGroupDoesNotCoverEnoughAZs`
 - **DB clusters** — Aurora-style clusters with full lifecycle: ModifyDBCluster (every mutable field on AWS's surface, including ServerlessV2 scaling, log-export updates, VPC SGs, NewDBClusterIdentifier rename), StartDBCluster / StopDBCluster (status transitions with `InvalidDBClusterStateFault` validation), RebootDBCluster, FailoverDBCluster (auto-picks a replica when no target is provided, swaps the writer flag, rejects non-member targets when the cluster tracks members), BacktrackDBCluster (Aurora MySQL only — `InvalidParameterCombination` on Aurora PostgreSQL — records BacktrackTo and the change-record count, append-tracked under DescribeDBClusterBacktracks)
@@ -206,6 +207,18 @@ Override knobs (env vars, both optional):
 
 - `FAKECLOUD_POSTGRES_REGISTRY=registry.example.com/team` — point at a private mirror (default `ghcr.io/faiscadev`).
 - `FAKECLOUD_REBUILD_POSTGRES_IMAGE=1` — skip inspect + pull and force a fresh local build. Use after editing the embedded Dockerfile or extension SQL during development.
+
+## TLS and `rds.force_ssl`
+
+RDS for PostgreSQL "uses and expects all clients to connect using SSL/TLS", and its `rds.force_ssl` parameter defaults to 1 (on) for version 15 and later, 0 for 14 and older ([AWS docs](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/PostgreSQL.Concepts.General.SSL.md)). fakecloud matches that:
+
+- Every PostgreSQL container starts with `ssl=on`. fakecloud mints one CA per process and a server certificate per container whose Common Name and subject alternative names are the addresses a client dials (the endpoint address, `localhost`, `127.0.0.1`, `::1`, and the host alias when fakecloud runs in a container).
+- Set `FAKECLOUD_RDS_CA_FILE=/path/ca.pem` and fakecloud writes the CA certificate there at startup. Pass it as `sslrootcert` (`sslmode=verify-full`) or add it to your trust store. Without it, a client that does not verify (`sslmode=require`) still works.
+- `rds.force_ssl` shows up in `DescribeDBParameters` with the engine default for the family. An instance's parameter group value wins. AWS reports `rds.force_ssl` as a dynamic parameter, so a change applies without a reboot there; fakecloud re-reads it only when the instance reboots (`RebootDBInstance`), so reboot after changing it. With it on, a connection without TLS is refused by PostgreSQL itself: `no pg_hba.conf entry for host "...", user "...", database "...", no encryption` (the suffix is `SSL off` on older servers).
+- The CA is minted again when fakecloud restarts, and each container's certificate is re-issued when the container is created or recovered. A client that cached the CA file must read it again after a restart.
+- The Kubernetes backend's pods serve no TLS and nothing forces it there; fakecloud's own connections use TLS when offered and fall back to plain.
+
+**This is a behaviour change for PostgreSQL 15+ instances.** A client that connected without TLS now needs TLS (`sslmode=require` or stricter), or the instance's parameter group needs `rds.force_ssl` set to `0`.
 
 ## Describe filters
 

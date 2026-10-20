@@ -210,6 +210,7 @@ Set `FAKECLOUD_RDS_BACKEND=k8s` (or the global `FAKECLOUD_CONTAINER_BACKEND=k8s`
 - Bridge engines receive `FAKECLOUD_ENDPOINT` pointing at the in-cluster `FAKECLOUD_K8S_SELF_URL`, so their `aws_lambda` / `aws_s3` / UDF callbacks reach fakecloud.
 - Readiness is a real connection for Postgres / MySQL / MariaDB and a Pod-log marker (then a TCP probe) for the heavy engines. Snapshot dump / restore and log-file reads run through `kubectl exec` (`pg_dump` / `mysqldump` / `psql` / `cat`) — another reason for the `pods/exec` RBAC rule.
 - **Reboot** recreates the Pod; for the dumpable engines the dataset is snapshotted and reloaded across the recreate.
+- Pods serve no TLS and `rds.force_ssl` is not enforced on this backend (the Docker backend serves TLS and forces it for PostgreSQL 15+; see the [RDS page](@/docs/services/rds.md)).
 - Because fakecloud connects to the DB over the Pod IP, the RDS k8s backend requires fakecloud to run **in-cluster** (the standard `FAKECLOUD_K8S_SELF_URL` deployment).
 
 ## ECS

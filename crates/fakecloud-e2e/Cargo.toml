@@ -103,6 +103,9 @@ aws-sdk-eks = "1"
 rskafka = { version = "0.5", default-features = false }
 aws-sdk-cloudwatch = "1.111"
 tokio-postgres = "0.7"
+# TLS for the RDS PostgreSQL tests: RDS expects TLS, so the tests connect the way a real client does.
+tokio-postgres-rustls = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 mysql_async = "0.34"
 aws-smithy-types = "1"
 aws-smithy-runtime-api = "1"

@@ -358,6 +358,20 @@ impl RdsService {
     }
 
     pub fn with_runtime(mut self, runtime: Arc<RdsRuntime>) -> Self {
+        // The runtime starts and reboots the containers but does not own the parameter groups,
+        // so it asks here whether `rds.force_ssl` applies to the incarnation it is starting.
+        let state = self.state.clone();
+        runtime.set_force_ssl_resolver(Arc::new(move |incarnation| {
+            let accounts = state.read();
+            let forced = accounts.iter().any(|(_, account)| {
+                account
+                    .instances
+                    .values()
+                    .find(|i| i.dbi_resource_id == incarnation)
+                    .is_some_and(|i| service_helpers::force_ssl_enabled(account, i))
+            });
+            forced
+        }));
         self.runtime = Some(runtime);
         self
     }
