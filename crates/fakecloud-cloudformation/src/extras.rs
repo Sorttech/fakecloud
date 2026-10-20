@@ -1730,7 +1730,7 @@ impl CloudFormationService {
                 // past its read timeout. Queue those invokes and settle them off
                 // the request path (bug-audit 0.2).
                 let mut provisioner = self.provisioner_deferred(&found_stack_id, &aid, &req.region);
-                let detached = self.waits_for_containers(&parsed.resources);
+                let detached = self.provisions_detached(&parsed.resources);
                 provisioner.wait_for_container_backing = detached;
 
                 // Cross-stack exports for `Fn::ImportValue` in resource
@@ -1762,9 +1762,10 @@ impl CloudFormationService {
                 // DescribeStacks action to view the status of the update."
                 // (ExecuteChangeSet, CloudFormation API Reference,
                 // https://docs.aws.amazon.com/AWSCloudFormation/latest/APIReference/API_ExecuteChangeSet.html,
-                // checked 2026-10-19). A DB instance's container can take
-                // minutes, so hold the stack at *_IN_PROGRESS and the change
-                // set at EXECUTE_IN_PROGRESS, and provision in a detached task.
+                // checked 2026-10-19). A DB instance's container or a custom
+                // resource's handler can take minutes, so hold the stack at
+                // *_IN_PROGRESS and the change set at EXECUTE_IN_PROGRESS, and
+                // provision in a detached task.
                 //
                 // Inline or detached, provisioning runs on a copy of the stack
                 // without the state lock: the nested-stack provisioner takes

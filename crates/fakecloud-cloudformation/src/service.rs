@@ -1763,7 +1763,7 @@ impl CloudFormationService {
             // flip this on (see `provisioner_deferred`) to queue the invoke and
             // drain it off the request path instead.
             defer_custom_invokes: false,
-            // Only a detached stack op turns this on (`waits_for_containers`).
+            // Only a detached stack op turns this on (`provisions_detached`).
             wait_for_container_backing: false,
             s3_store: self.s3_store.clone(),
             kms_hook: self.kms_hook.clone(),
@@ -1885,30 +1885,41 @@ impl CloudFormationService {
     }
 
     /// Whether a stack op provisioning `resource_defs` must run in a detached
-    /// task with `wait_for_container_backing` on. A container-backed DB
-    /// instance is only created once its container is up (see
-    /// `stabilize_rds_db_instance`), which can take minutes. Only on a
-    /// multi-thread runtime (the server); unit tests run current-thread.
-    pub(crate) fn waits_for_containers(
+    /// task with `wait_for_container_backing` on, because provisioning waits on
+    /// something that can take minutes:
+    ///
+    /// - a container-backed DB instance is only created once its container is
+    ///   up (see `stabilize_rds_db_instance`);
+    /// - a custom resource's handler is invoked, and awaited, before any
+    ///   resource that depends on it, so `Fn::GetAtt` reads its response
+    ///   `Data` (see `send_custom_resource_event`). The invoke can cold-pull an
+    ///   image for minutes.
+    ///
+    /// Only on a multi-thread runtime (the server); unit tests run
+    /// current-thread.
+    pub(crate) fn provisions_detached(
         &self,
         resource_defs: &[template::ResourceDefinition],
     ) -> bool {
-        self.deps.rds_runtime.is_some()
-            && resource_defs
-                .iter()
-                .any(|r| r.resource_type == "AWS::RDS::DBInstance")
+        let waits = resource_defs.iter().any(|r| {
+            crate::resource_provisioner::is_custom_resource_type(&r.resource_type)
+                || (r.resource_type == "AWS::RDS::DBInstance" && self.deps.rds_runtime.is_some())
+        });
+        waits
             && matches!(
                 tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
                 Ok(tokio::runtime::RuntimeFlavor::MultiThread)
             )
     }
 
-    /// Build a provisioner for the changeset/update/delete paths, which run
-    /// inside the request rather than in a detached `CreateStack` task. These
-    /// queue custom-resource Lambda invokes (`defer_custom_invokes`) so a cold
-    /// image pull never blocks the client past its read timeout or stalls every
-    /// other CFN op behind the state write lock; the caller drains and
-    /// `tokio::spawn`s the queued invokes after dropping the lock.
+    /// Build a provisioner for the changeset/update/delete paths, which can run
+    /// inside the request rather than in a detached task. These queue
+    /// custom-resource Lambda invokes (`defer_custom_invokes`) so a cold image
+    /// pull never blocks the client past its read timeout or stalls every other
+    /// CFN op behind the state write lock; the caller drains and `tokio::spawn`s
+    /// the queued invokes after dropping the lock. A changeset/update holding a
+    /// custom resource runs detached (`provisions_detached`), where only
+    /// Deletes stay queued.
     pub(crate) fn provisioner_deferred(
         &self,
         stack_id: &str,
@@ -2553,17 +2564,8 @@ impl CloudFormationService {
         // we keep provisioning inline for them: CreateStack returns with the
         // stack already CREATE_COMPLETE, matching long-standing client
         // expectations that the stack's resources/outputs are queryable as
-        // soon as CreateStack returns. The async branch only triggers on a
-        // multi-thread runtime (the server); unit tests run current-thread.
-        let has_custom_resource = ctx.resource_defs.iter().any(|r| {
-            r.resource_type.starts_with("Custom::")
-                || r.resource_type == "AWS::CloudFormation::CustomResource"
-        });
-        let multi_thread = matches!(
-            tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
-            Ok(tokio::runtime::RuntimeFlavor::MultiThread)
-        );
-        if (has_custom_resource && multi_thread) || self.waits_for_containers(&ctx.resource_defs) {
+        // soon as CreateStack returns. See `provisions_detached`.
+        if self.provisions_detached(&ctx.resource_defs) {
             // Off the request path, so provisioning may wait for containers.
             ctx.provisioner.wait_for_container_backing = true;
             // Emit the IN_PROGRESS lifecycle notification only on the async
@@ -3560,7 +3562,7 @@ impl CloudFormationService {
         // off the request path.
         let mut provisioner =
             self.provisioner_deferred(&found_stack_id, &req.account_id, &req.region);
-        let detached = self.waits_for_containers(&parsed.resources);
+        let detached = self.provisions_detached(&parsed.resources);
         provisioner.wait_for_container_backing = detached;
 
         // Cross-stack exports for `Fn::ImportValue` in resource properties (1.5).
@@ -3593,8 +3595,9 @@ impl CloudFormationService {
         // can check the status of the stack through the DescribeStacks action."
         // (UpdateStack, CloudFormation API Reference,
         // https://docs.aws.amazon.com/AWSCloudFormation/latest/APIReference/API_UpdateStack.html,
-        // checked 2026-10-19). A DB instance's container can take minutes, so
-        // hold the stack at UPDATE_IN_PROGRESS and provision in a detached task.
+        // checked 2026-10-19). A DB instance's container or a custom resource's
+        // handler can take minutes, so hold the stack at UPDATE_IN_PROGRESS and
+        // provision in a detached task.
         //
         // Inline or detached, provisioning runs on a copy of the stack without
         // the state lock: the nested-stack provisioner takes that lock to
