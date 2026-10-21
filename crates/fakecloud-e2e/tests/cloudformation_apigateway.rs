@@ -725,3 +725,219 @@ async fn cfn_provisions_all_apigateway_v1_types() {
     let after_dom = agw.get_domain_name().domain_name(domain).send().await;
     assert!(after_dom.is_err(), "domain should be gone after delete");
 }
+
+const VPC_LINK_TEMPLATE: &str = r#"{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Resources": {
+    "Link": {
+      "Type": "AWS::ApiGateway::VpcLink",
+      "Properties": {
+        "Name": "cfn-link",
+        "Description": "to the internal nlb",
+        "TargetArns": ["arn:aws:elasticloadbalancing:us-east-1:000000000000:loadbalancer/net/cfn-nlb/50dc6c495c0c9188"],
+        "Tags": [{"Key": "env", "Value": "test"}]
+      }
+    }
+  },
+  "Outputs": {
+    "LinkId": {"Value": {"Ref": "Link"}}
+  }
+}"#;
+
+/// An `AWS::ApiGateway::VpcLink` has to exist in API Gateway once the stack is green. Without
+/// a provisioner for it CloudFormation reported `CREATE_COMPLETE`, used the logical id as the
+/// physical id, and created nothing, so an integration naming the link by `Ref` failed at request
+/// time with `VPC_LINK not found: <logical id>`.
+#[tokio::test]
+async fn cfn_provisions_an_apigateway_vpc_link_and_removes_it_on_delete() {
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let agw = server.apigateway_client().await;
+
+    cfn.create_stack()
+        .stack_name("vpc-link-stack")
+        .template_body(VPC_LINK_TEMPLATE)
+        .send()
+        .await
+        .expect("create_stack");
+
+    let stack = cfn
+        .describe_stacks()
+        .stack_name("vpc-link-stack")
+        .send()
+        .await
+        .expect("describe_stacks");
+    let stack = stack.stacks().first().expect("stack present");
+    assert_eq!(stack.stack_status().unwrap().as_str(), "CREATE_COMPLETE");
+    let link_id = stack
+        .outputs()
+        .iter()
+        .find(|o| o.output_key() == Some("LinkId"))
+        .and_then(|o| o.output_value())
+        .expect("LinkId output")
+        .to_string();
+    // `Ref` is the VPC link's id, not the logical id.
+    assert_ne!(link_id, "Link");
+
+    let link = agw
+        .get_vpc_link()
+        .vpc_link_id(&link_id)
+        .send()
+        .await
+        .expect("the VPC link exists in API Gateway under the id `Ref` returned");
+    assert_eq!(link.id(), Some(link_id.as_str()));
+    assert_eq!(link.name(), Some("cfn-link"));
+    assert_eq!(link.description(), Some("to the internal nlb"));
+    assert_eq!(
+        link.target_arns(),
+        ["arn:aws:elasticloadbalancing:us-east-1:000000000000:loadbalancer/net/cfn-nlb/50dc6c495c0c9188"]
+    );
+    assert_eq!(link.status().map(|s| s.as_str()), Some("AVAILABLE"));
+    assert_eq!(
+        link.tags().and_then(|t| t.get("env")).map(String::as_str),
+        Some("test")
+    );
+    let listed = agw.get_vpc_links().send().await.unwrap();
+    assert!(listed
+        .items()
+        .iter()
+        .any(|l| l.id() == Some(link_id.as_str())));
+
+    cfn.delete_stack()
+        .stack_name("vpc-link-stack")
+        .send()
+        .await
+        .expect("delete_stack");
+    assert!(
+        agw.get_vpc_link()
+            .vpc_link_id(&link_id)
+            .send()
+            .await
+            .is_err(),
+        "the VPC link is gone after the stack is deleted"
+    );
+}
+
+fn vpc_link_template(name: &str, description: &str, env: &str, target_arn: &str) -> String {
+    format!(
+        r#"{{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Resources": {{
+    "Link": {{
+      "Type": "AWS::ApiGateway::VpcLink",
+      "Properties": {{
+        "Name": "{name}",
+        "Description": "{description}",
+        "TargetArns": ["{target_arn}"],
+        "Tags": [{{"Key": "env", "Value": "{env}"}}]
+      }}
+    }}
+  }},
+  "Outputs": {{ "LinkId": {{"Value": {{"Ref": "Link"}}}} }}
+}}"#
+    )
+}
+
+/// `Name`, `Description` and `Tags` of a VPC link update in place, so the id stays; `TargetArns`
+/// needs replacement, so a changed one is a new link and the old one is removed
+/// (<https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigateway-vpclink.md>,
+/// fetched 2026-10-21).
+#[tokio::test]
+async fn cfn_updates_an_apigateway_vpc_link_in_place_and_replaces_it_when_target_arns_change() {
+    const NLB_A: &str =
+        "arn:aws:elasticloadbalancing:us-east-1:000000000000:loadbalancer/net/nlb-a/50dc6c495c0c9188";
+    const NLB_B: &str =
+        "arn:aws:elasticloadbalancing:us-east-1:000000000000:loadbalancer/net/nlb-b/60dc6c495c0c9188";
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let agw = server.apigateway_client().await;
+
+    async fn link_id(cfn: &aws_sdk_cloudformation::Client) -> String {
+        let described = cfn
+            .describe_stacks()
+            .stack_name("vpc-link-update")
+            .send()
+            .await
+            .expect("describe_stacks");
+        let stack = described.stacks().first().expect("stack present");
+        assert_eq!(stack.stack_status().unwrap().as_str(), "UPDATE_COMPLETE");
+        stack
+            .outputs()
+            .iter()
+            .find(|o| o.output_key() == Some("LinkId"))
+            .and_then(|o| o.output_value())
+            .expect("LinkId output")
+            .to_string()
+    }
+
+    cfn.create_stack()
+        .stack_name("vpc-link-update")
+        .template_body(vpc_link_template("first", "one", "a", NLB_A))
+        .send()
+        .await
+        .expect("create_stack");
+    let created = cfn
+        .describe_stacks()
+        .stack_name("vpc-link-update")
+        .send()
+        .await
+        .unwrap();
+    let original = created.stacks()[0]
+        .outputs()
+        .iter()
+        .find(|o| o.output_key() == Some("LinkId"))
+        .and_then(|o| o.output_value())
+        .unwrap()
+        .to_string();
+
+    // In place: the id survives and the new values are read back.
+    cfn.update_stack()
+        .stack_name("vpc-link-update")
+        .template_body(vpc_link_template("second", "two", "b", NLB_A))
+        .send()
+        .await
+        .expect("update_stack in place");
+    assert_eq!(
+        link_id(&cfn).await,
+        original,
+        "an in-place update keeps the id"
+    );
+    let link = agw
+        .get_vpc_link()
+        .vpc_link_id(&original)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(link.name(), Some("second"));
+    assert_eq!(link.description(), Some("two"));
+    assert_eq!(
+        link.tags().and_then(|t| t.get("env")).map(String::as_str),
+        Some("b")
+    );
+    assert_eq!(link.target_arns(), [NLB_A]);
+
+    // Replacement: a different load balancer is a different link.
+    cfn.update_stack()
+        .stack_name("vpc-link-update")
+        .template_body(vpc_link_template("second", "two", "b", NLB_B))
+        .send()
+        .await
+        .expect("update_stack with new TargetArns");
+    let replaced = link_id(&cfn).await;
+    assert_ne!(replaced, original, "a changed TargetArns replaces the link");
+    let link = agw
+        .get_vpc_link()
+        .vpc_link_id(&replaced)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(link.target_arns(), [NLB_B]);
+    assert!(
+        agw.get_vpc_link()
+            .vpc_link_id(&original)
+            .send()
+            .await
+            .is_err(),
+        "the replaced link is gone"
+    );
+}
