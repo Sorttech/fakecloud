@@ -2665,6 +2665,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_nlb_fails_open_when_every_registered_target_is_unhealthy() {
+        let backend = echo_backend().await;
+        let service = nlb_service(8001, &[("127.0.0.1", backend)]);
+        // The health prober has marked the only target unhealthy, as it does while a backend is
+        // still starting.
+        {
+            let state = service.elbv2_state.as_ref().expect("elbv2 wired");
+            let mut accounts = state.write();
+            let group = accounts
+                .get_mut(TEST_ACCOUNT)
+                .and_then(|a| a.target_groups.get_mut(NLB_TG_ARN))
+                .expect("target group");
+            group.targets[0].health.state = "unhealthy".to_string();
+        }
+        let integration = nlb_proxy_integration();
+        let req = make_request(HeaderMap::new());
+        let mapped = nlb_mapped(&integration, &req);
+        let response = vpc_link_proxy_mapped(&req, &integration, &mapped, None, &service)
+            .await
+            .expect("traffic still goes to the registered target");
+        assert_eq!(response.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn the_listener_is_chosen_by_the_integration_uris_port() {
         let backend = echo_backend().await;
         // The only listener is on 8002; the integration asks for 8001.
