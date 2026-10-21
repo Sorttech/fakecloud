@@ -336,6 +336,27 @@ impl EcsService {
                     .cloned()
                     .collect();
                 for service in scalable {
+                    // Count how the tasks launched since the last tick turned out, and leave a
+                    // service alone while the scheduler is backing off from launches that keep
+                    // failing to start (see `throttle.rs`).
+                    let now = chrono::Utc::now();
+                    let throttled = {
+                        let tasks = &state.tasks;
+                        let key = crate::state::EcsState::service_key(
+                            &service.cluster_name,
+                            &service.service_name,
+                        );
+                        match state.services.get_mut(&key) {
+                            Some(svc) => {
+                                crate::throttle::settle(svc, tasks, now);
+                                crate::throttle::is_throttled(svc, now)
+                            }
+                            None => false,
+                        }
+                    };
+                    if throttled {
+                        continue;
+                    }
                     let active = state
                         .active_service_task_count(&service.cluster_name, &service.service_name);
                     let shortfall = service.desired_count - active;

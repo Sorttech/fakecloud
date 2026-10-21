@@ -434,6 +434,8 @@ impl ResourceProvisioner {
                 .into_iter()
                 .map(lowercase_first_keys)
                 .collect(),
+            events: vec![],
+            launch_throttle: Default::default(),
         };
         state.record_service_revision(&service);
         state.services.insert(key.clone(), service);
