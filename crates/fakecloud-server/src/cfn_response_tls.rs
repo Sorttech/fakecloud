@@ -88,11 +88,19 @@ pub fn serve(listener: TcpListener, app: axum::Router, config: rustls::ServerCon
 
     tokio::spawn(async move {
         loop {
-            let Ok((stream, _peer)) = listener.accept().await else {
+            let Ok((stream, peer)) = listener.accept().await else {
                 continue;
             };
             let acceptor = acceptor.clone();
-            let app = app.clone();
+            // Dispatch extracts `ConnectInfo<SocketAddr>`, which the 4566
+            // listener gets from `into_make_service_with_connect_info`; this
+            // hand-rolled loop has to supply it itself.
+            // ponytail: rebuilds the router's layer stack per connection; fine
+            // for occasional ResponseURL signals, share one service if this
+            // listener ever carries real traffic.
+            let app = app
+                .clone()
+                .layer(axum::Extension(axum::extract::ConnectInfo(peer)));
             tokio::spawn(async move {
                 let tls = match acceptor.accept(stream).await {
                     Ok(tls) => tls,
@@ -142,5 +150,51 @@ mod tests {
         if std::env::var("FAKECLOUD_CFN_RESPONSE_TLS_PORT").is_err() {
             assert_eq!(tls_port(), 443);
         }
+    }
+
+    #[tokio::test]
+    async fn a_request_over_tls_carries_the_callers_address() {
+        // The real router's dispatch extracts `ConnectInfo<SocketAddr>`, which
+        // plain `axum::serve` does not supply; without it every request here
+        // is a 500 before it reaches a route.
+        use rustls::pki_types::pem::PemObject;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (config, pem) = self_signed(&["localhost".to_string()]).expect("certificate");
+        let (listener, addr) = bind(0).await.expect("bind");
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::put(
+                |axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>| async move {
+                    peer.ip().to_string()
+                },
+            ),
+        );
+        serve(listener, app, config);
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from_pem_slice(pem.as_bytes()).unwrap())
+            .unwrap();
+        let client = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", addr.port()))
+            .await
+            .unwrap();
+        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client))
+            .connect("localhost".try_into().unwrap(), tcp)
+            .await
+            .expect("handshake against the published certificate");
+        tls.write_all(
+            b"PUT / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut response = String::new();
+        tls.read_to_string(&mut response).await.unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with("127.0.0.1"), "{response}");
     }
 }
