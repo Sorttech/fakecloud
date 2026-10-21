@@ -1684,3 +1684,142 @@ async fn capacity_providers_list_builtins_and_scope_managed_instances() {
         .collect();
     assert_eq!(names, ["mi-provider"]);
 }
+
+/// The service scheduler throttles tasks that keep failing to start: it waits longer between
+/// attempts and says `(service X) is unable to consistently start tasks successfully.`, and a new
+/// task definition returns the service to normal operation at once
+/// (<https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-throttle-logic.md>,
+/// fetched 2026-10-21). Without it a service with an unpullable image launched a new task on every
+/// scheduler tick, for ever (2467 pending tasks after a day).
+#[tokio::test]
+async fn a_service_whose_tasks_cannot_start_is_throttled_and_a_new_task_definition_resets_it() {
+    if !require_docker_or_skip(
+        "a_service_whose_tasks_cannot_start_is_throttled_and_a_new_task_definition_resets_it",
+    ) {
+        return;
+    }
+    let server = TestServer::start().await;
+    let client = server.ecs_client().await;
+
+    client
+        .create_cluster()
+        .cluster_name("throttle-cluster")
+        .send()
+        .await
+        .expect("create_cluster");
+    // Nothing listens on port 1, so the image pull is refused at once: the task goes from PENDING
+    // straight to STOPPED, which is what the throttle counts.
+    let register = |image: &'static str| {
+        let client = client.clone();
+        async move {
+            client
+                .register_task_definition()
+                .family("throttle-td")
+                .container_definitions(
+                    ContainerDefinition::builder()
+                        .name("app")
+                        .image(image)
+                        .essential(true)
+                        .build(),
+                )
+                .send()
+                .await
+                .expect("register_task_definition")
+        }
+    };
+    register("127.0.0.1:1/never/exists:v1").await;
+    client
+        .create_service()
+        .cluster("throttle-cluster")
+        .service_name("web")
+        .task_definition("throttle-td")
+        .desired_count(1)
+        .send()
+        .await
+        .expect("create_service");
+
+    let stopped_tasks = || {
+        let client = client.clone();
+        async move {
+            client
+                .list_tasks()
+                .cluster("throttle-cluster")
+                .desired_status(aws_sdk_ecs::types::DesiredStatus::Stopped)
+                .send()
+                .await
+                .expect("list_tasks")
+                .task_arns()
+                .len()
+        }
+    };
+    let events = || {
+        let client = client.clone();
+        async move {
+            client
+                .describe_services()
+                .cluster("throttle-cluster")
+                .services("web")
+                .send()
+                .await
+                .expect("describe_services")
+                .services()[0]
+                .events()
+                .iter()
+                .filter_map(|e| e.message().map(str::to_string))
+                .collect::<Vec<_>>()
+        }
+    };
+    let throttle_message = "(service web) is unable to consistently start tasks successfully.";
+
+    // The scheduler ticks every 3 seconds: the second failure in a row throttles.
+    let mut throttled = false;
+    for _ in 0..40 {
+        if events().await.iter().any(|m| m == throttle_message) {
+            throttled = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    assert!(throttled, "the service never reported being throttled");
+
+    // Throttled means it stops launching: several ticks later there are no more tasks.
+    let before = stopped_tasks().await;
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    assert_eq!(
+        stopped_tasks().await,
+        before,
+        "a throttled service must not launch a task on every tick"
+    );
+    // And it said so once, not once per tick.
+    assert_eq!(
+        events()
+            .await
+            .iter()
+            .filter(|m| *m == throttle_message)
+            .count(),
+        1
+    );
+
+    // A new task definition returns it to normal at once: a task is launched again within a few ticks.
+    register("127.0.0.1:1/never/exists:v2").await;
+    client
+        .update_service()
+        .cluster("throttle-cluster")
+        .service("web")
+        .task_definition("throttle-td")
+        .send()
+        .await
+        .expect("update_service");
+    let mut relaunched = false;
+    for _ in 0..20 {
+        if stopped_tasks().await > before {
+            relaunched = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    assert!(
+        relaunched,
+        "a new task definition must lift the throttle and launch a task"
+    );
+}
