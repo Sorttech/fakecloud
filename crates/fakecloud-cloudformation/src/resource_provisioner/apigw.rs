@@ -1257,6 +1257,110 @@ impl ResourceProvisioner {
         Ok(())
     }
 
+    /// `AWS::ApiGateway::VpcLink`: the same record `CreateVpcLink` stores, so an integration naming
+    /// the link by `Ref` (its id,
+    /// <https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigateway-vpclink.md>,
+    /// fetched 2026-10-21) finds it at request time. `Name` and `TargetArns` are required.
+    pub(super) fn create_apigw_vpc_link(
+        &self,
+        resource: &ResourceDefinition,
+    ) -> Result<ProvisionResult, String> {
+        let props = &resource.properties;
+        let name = props
+            .get("Name")
+            .and_then(|v| v.as_str())
+            .ok_or("Name is required")?;
+        let target_arns = vpc_link_target_arns(props).ok_or("TargetArns is required")?;
+        let id = apigw_make_id();
+        let body = serde_json::json!({
+            "id": id,
+            "name": name,
+            "description": props.get("Description").and_then(|v| v.as_str()),
+            "targetArns": target_arns,
+            "status": "AVAILABLE",
+            "tags": serde_json::Value::Object(
+                parse_acm_tags(props.get("Tags"))
+                    .into_iter()
+                    .map(|(k, v)| (k, serde_json::Value::String(v)))
+                    .collect(),
+            ),
+        });
+        let mut accounts = self.apigateway_state.write();
+        let state = accounts.get_or_create(&self.account_id);
+        state.vpc_links.insert(id.clone(), body);
+        Ok(ProvisionResult::new(id.clone()).with("VpcLinkId", id))
+    }
+
+    /// `TargetArns` is the one property that needs replacement; `Name`, `Description` and `Tags`
+    /// update in place (same page as above).
+    pub(super) fn apigw_vpc_link_requires_replacement(
+        &self,
+        existing: &StackResource,
+        new_def: &ResourceDefinition,
+    ) -> bool {
+        let accounts = self.apigateway_state.read();
+        let current = accounts
+            .get(&self.account_id)
+            .and_then(|s| s.vpc_links.get(&existing.physical_id))
+            .and_then(|link| link.get("targetArns"))
+            .and_then(|v| v.as_array())
+            .map(|arns| {
+                arns.iter()
+                    .filter_map(|a| a.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            });
+        // A link that is no longer there cannot be updated in place.
+        current.is_none_or(|current| {
+            vpc_link_target_arns(&new_def.properties).is_none_or(|new| new != current)
+        })
+    }
+
+    pub(super) fn update_apigw_vpc_link(
+        &self,
+        existing: &StackResource,
+        resource: &ResourceDefinition,
+    ) -> Result<ProvisionResult, String> {
+        let props = &resource.properties;
+        let id = existing.physical_id.clone();
+        let mut accounts = self.apigateway_state.write();
+        let state = accounts.get_or_create(&self.account_id);
+        let link = state
+            .vpc_links
+            .get_mut(&id)
+            .and_then(|v| v.as_object_mut())
+            .ok_or_else(|| format!("VpcLink {id} not found"))?;
+        if let Some(name) = props.get("Name").and_then(|v| v.as_str()) {
+            link.insert("name".into(), serde_json::Value::String(name.into()));
+        }
+        // A property left out of the new template goes back to its default, not to its old value.
+        link.insert(
+            "description".into(),
+            props
+                .get("Description")
+                .and_then(|v| v.as_str())
+                .map_or(serde_json::Value::Null, |d| {
+                    serde_json::Value::String(d.into())
+                }),
+        );
+        link.insert(
+            "tags".into(),
+            serde_json::Value::Object(
+                parse_acm_tags(props.get("Tags"))
+                    .into_iter()
+                    .map(|(k, v)| (k, serde_json::Value::String(v)))
+                    .collect(),
+            ),
+        );
+        Ok(ProvisionResult::new(id.clone()).with("VpcLinkId", id))
+    }
+
+    pub(super) fn delete_apigw_vpc_link(&self, physical_id: &str) -> Result<(), String> {
+        let mut accounts = self.apigateway_state.write();
+        let state = accounts.get_or_create(&self.account_id);
+        state.vpc_links.remove(physical_id);
+        Ok(())
+    }
+
     pub(super) fn create_apigw_base_path_mapping(
         &self,
         resource: &ResourceDefinition,
@@ -1885,4 +1989,15 @@ impl ResourceProvisioner {
             .with("DomainName", domain)
             .with("BasePath", base_path))
     }
+}
+
+/// `TargetArns` as strings; `None` when it is missing, not a list, or empty.
+fn vpc_link_target_arns(props: &serde_json::Value) -> Option<Vec<String>> {
+    let arns: Vec<String> = props
+        .get("TargetArns")?
+        .as_array()?
+        .iter()
+        .filter_map(|a| a.as_str().map(str::to_string))
+        .collect();
+    (!arns.is_empty()).then_some(arns)
 }
