@@ -121,7 +121,7 @@ struct NlbTarget {
     load_balancer_security_groups: Vec<String>,
 }
 
-/// The first usable registered target behind the listener on `listener_port` of the first of
+/// The first healthy registered target (else, failing open, the first registered one) behind the listener on `listener_port` of the first of
 /// `target_arns` that is a load balancer with such a listener. `Ok(None)` when none has one, which
 /// leaves the caller's own "no data plane" error to say so; `Err` when a listener exists and
 /// nothing is registered behind it.
@@ -161,10 +161,17 @@ fn nlb_target(
             let Some(group) = state.target_groups.get(group_arn) else {
                 continue;
             };
+            // A healthy target if there is one. With none, the load balancer fails open and sends
+            // to the registered targets anyway ("If all targets fail health checks at the same
+            // time in all enabled Availability Zones, the load balancer fails open",
+            // <https://docs.aws.amazon.com/elasticloadbalancing/latest/network/target-group-health-checks.md>,
+            // fetched 2026-10-21), so a backend that is still starting answers with its own error
+            // or a refused connection instead of this one.
             let usable = group
                 .targets
                 .iter()
-                .find(|t| t.health.state != "unhealthy" && t.health.state != "unused");
+                .find(|t| t.health.state != "unhealthy" && t.health.state != "unused")
+                .or_else(|| group.targets.first());
             if let Some(target) = usable {
                 let port = target
                     .port
