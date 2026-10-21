@@ -1396,7 +1396,21 @@ pub(crate) fn service_to_json(svc: &Service) -> Value {
         Value::Array(svc.volume_configurations.clone()),
     );
     map.insert("taskSets".into(), json!([]));
-    map.insert("events".into(), json!([]));
+    map.insert(
+        "events".into(),
+        Value::Array(
+            svc.events
+                .iter()
+                .map(|e| {
+                    json!({
+                        "id": e.id,
+                        "createdAt": e.created_at.timestamp(),
+                        "message": e.message,
+                    })
+                })
+                .collect(),
+        ),
+    );
     map.insert(
         "capacityProviderStrategy".into(),
         json!(svc.capacity_provider_strategy),

@@ -337,3 +337,152 @@ async fn cfn_provisions_ecs_cluster_taskdef_service_capacity_provider() {
         "cluster should be gone or non-active after stack deletion"
     );
 }
+
+fn rolling_template(version: &str) -> String {
+    format!(
+        r#"{{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Resources": {{
+    "Cluster": {{ "Type": "AWS::ECS::Cluster", "Properties": {{ "ClusterName": "roll-cluster" }} }},
+    "TaskDef": {{
+      "Type": "AWS::ECS::TaskDefinition",
+      "Properties": {{
+        "Family": "roll-task",
+        "NetworkMode": "awsvpc",
+        "RequiresCompatibilities": ["FARGATE"],
+        "Cpu": "256",
+        "Memory": "512",
+        "ContainerDefinitions": [{{
+          "Name": "app",
+          "Image": "redis:7-alpine",
+          "Essential": true,
+          "Environment": [{{"Name": "RELEASE", "Value": "{version}"}}]
+        }}]
+      }}
+    }},
+    "Svc": {{
+      "Type": "AWS::ECS::Service",
+      "Properties": {{
+        "ServiceName": "roll-svc",
+        "Cluster": {{"Ref": "Cluster"}},
+        "TaskDefinition": {{"Ref": "TaskDef"}},
+        "DesiredCount": 1,
+        "LaunchType": "FARGATE"
+      }}
+    }}
+  }}
+}}"#
+    )
+}
+
+/// A CloudFormation update that changes a service's task definition must replace its tasks: start a
+/// replacement beside the old one (`maximumPercent` allows it), stop the old one once the new one
+/// serves (`minimumHealthyPercent` allows it), and end with one deployment, `COMPLETED`, whose
+/// counts are real. Before this the old deployment was relabelled `ACTIVE` and nothing else
+/// happened: the old task ran on for ever, no replacement started, and the deployment counts only
+/// ever grew
+/// (<https://docs.aws.amazon.com/AmazonECS/latest/developerguide/deployment-type-ecs.md>, fetched
+/// 2026-10-21).
+#[tokio::test]
+async fn a_cloudformation_task_definition_update_rolls_the_service_to_the_new_revision() {
+    let docker_ok = std::process::Command::new("docker")
+        .arg("info")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !docker_ok {
+        assert!(std::env::var("CI").is_err(), "docker is required in CI");
+        eprintln!("Skipping: docker not available");
+        return;
+    }
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let ecs = server.ecs_client().await;
+
+    cfn.create_stack()
+        .stack_name("roll-stack")
+        .template_body(rolling_template("1"))
+        .send()
+        .await
+        .expect("create_stack");
+
+    let service = || {
+        let ecs = ecs.clone();
+        async move {
+            ecs.describe_services()
+                .cluster("roll-cluster")
+                .services("roll-svc")
+                .send()
+                .await
+                .expect("describe_services")
+                .services()[0]
+                .clone()
+        }
+    };
+    let revision = |arn: &str| arn.rsplit(':').next().unwrap_or("").to_string();
+
+    // Wait for the first task to be serving.
+    let mut first_revision = String::new();
+    for _ in 0..90 {
+        let svc = service().await;
+        if svc.running_count() == 1 {
+            first_revision = revision(svc.task_definition().unwrap());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    assert!(
+        !first_revision.is_empty(),
+        "the first task never reached RUNNING"
+    );
+
+    cfn.update_stack()
+        .stack_name("roll-stack")
+        .template_body(rolling_template("2"))
+        .send()
+        .await
+        .expect("update_stack");
+
+    // The service ends on the new revision with exactly one deployment, completed, with real counts.
+    let mut settled = None;
+    for _ in 0..150 {
+        let svc = service().await;
+        let current = revision(svc.task_definition().unwrap());
+        let deployments = svc.deployments();
+        if current != first_revision
+            && deployments.len() == 1
+            && deployments[0].status() == Some("PRIMARY")
+            && deployments[0].rollout_state().map(|s| s.as_str()) == Some("COMPLETED")
+            && deployments[0].running_count() == 1
+        {
+            settled = Some(svc);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    let svc = settled.expect("the rollout never completed on the new task definition");
+    assert_eq!(svc.deployments()[0].pending_count(), 0);
+    assert_eq!(svc.running_count(), 1);
+    assert_eq!(svc.pending_count(), 0);
+
+    // And the old task is really gone: the only RUNNING task is on the new revision.
+    let running = ecs
+        .list_tasks()
+        .cluster("roll-cluster")
+        .desired_status(aws_sdk_ecs::types::DesiredStatus::Running)
+        .send()
+        .await
+        .expect("list_tasks");
+    assert_eq!(running.task_arns().len(), 1);
+    let described = ecs
+        .describe_tasks()
+        .cluster("roll-cluster")
+        .tasks(&running.task_arns()[0])
+        .send()
+        .await
+        .expect("describe_tasks");
+    let task_definition = described.tasks()[0].task_definition_arn().unwrap();
+    assert_ne!(revision(task_definition), first_revision);
+}

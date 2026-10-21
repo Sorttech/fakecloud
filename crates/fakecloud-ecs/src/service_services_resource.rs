@@ -210,6 +210,8 @@ impl EcsService {
                     .filter(|v| !v.is_null())
                     .cloned(),
                 vpc_lattice_configurations: vpc_lattice_configurations.clone(),
+                events: vec![],
+                launch_throttle: Default::default(),
             };
             state.services.insert(key.clone(), service.clone());
             state.record_service_revision(&service);
@@ -492,6 +494,9 @@ impl EcsService {
                 }
 
                 if let Some(arn) = new_td_arn.clone() {
+                    // A new task definition "immediately returns the service to normal,
+                    // non-throttled operation" (the service throttle logic page).
+                    svc.launch_throttle = crate::state::LaunchThrottle::default();
                     svc.task_definition_arn = arn;
                     svc.family = new_family;
                     svc.revision = new_revision;

@@ -712,6 +712,38 @@ pub struct Service {
     /// service revisions.
     #[serde(default)]
     pub vpc_lattice_configurations: Vec<Value>,
+    /// Service events, newest first, at most [`SERVICE_EVENT_LIMIT`] (what AWS keeps).
+    #[serde(default)]
+    pub events: Vec<ServiceEvent>,
+    /// The service scheduler's throttle on launching tasks that keep failing to start.
+    #[serde(default)]
+    pub launch_throttle: LaunchThrottle,
+}
+
+/// `DescribeServices` returns the 100 most recent events.
+pub const SERVICE_EVENT_LIMIT: usize = 100;
+
+/// One entry of a service's `events`, as `DescribeServices` returns it (`ServiceEvent`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ServiceEvent {
+    pub id: String,
+    pub created_at: DateTime<Utc>,
+    pub message: String,
+}
+
+/// Where the service scheduler stands on its launch throttle: tasks that fail to start (go from
+/// `PENDING` straight to `STOPPED`) make it wait longer between attempts. See `throttle.rs`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LaunchThrottle {
+    /// Launches in a row whose task never reached `RUNNING`.
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    /// No task is launched before this instant.
+    #[serde(default)]
+    pub not_before: Option<DateTime<Utc>>,
+    /// Failures and starts up to this instant have been counted, so a task is never counted twice.
+    #[serde(default)]
+    pub counted_until: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1279,5 +1311,100 @@ mod tests {
         assert!(s.clusters.is_empty());
         assert!(s.next_revision.is_empty());
         assert!(s.account_setting_defaults.is_empty());
+    }
+}
+
+/// Builders for unit tests in other modules of this crate.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
+
+    pub(crate) fn service(name: &str) -> Service {
+        Service {
+            service_name: name.into(),
+            service_arn: format!("arn:aws:ecs:us-east-1:000000000000:service/default/{name}"),
+            cluster_name: "default".into(),
+            cluster_arn: "arn:aws:ecs:us-east-1:000000000000:cluster/default".into(),
+            task_definition_arn: "arn:aws:ecs:us-east-1:000000000000:task-definition/web:1".into(),
+            family: "web".into(),
+            revision: 1,
+            desired_count: 1,
+            running_count: 0,
+            pending_count: 0,
+            launch_type: "FARGATE".into(),
+            status: "ACTIVE".into(),
+            scheduling_strategy: "REPLICA".into(),
+            deployment_controller: "ECS".into(),
+            minimum_healthy_percent: None,
+            maximum_percent: None,
+            circuit_breaker: None,
+            deployments: vec![],
+            load_balancers: vec![],
+            service_registries: vec![],
+            placement_constraints: vec![],
+            placement_strategy: vec![],
+            network_configuration: None,
+            tags: vec![],
+            created_at: Utc::now(),
+            created_by: None,
+            role_arn: None,
+            platform_version: None,
+            health_check_grace_period_seconds: None,
+            enable_execute_command: false,
+            enable_ecs_managed_tags: false,
+            propagate_tags: None,
+            capacity_provider_strategy: vec![],
+            availability_zone_rebalancing: None,
+            volume_configurations: vec![],
+            service_connect_configuration: None,
+            vpc_lattice_configurations: vec![],
+            events: vec![],
+            launch_throttle: LaunchThrottle::default(),
+        }
+    }
+
+    pub(crate) fn task(task_id: &str) -> Task {
+        Task {
+            task_arn: format!("arn:aws:ecs:us-east-1:000000000000:task/default/{task_id}"),
+            task_id: task_id.into(),
+            cluster_arn: "arn:aws:ecs:us-east-1:000000000000:cluster/default".into(),
+            cluster_name: "default".into(),
+            task_definition_arn: "arn:aws:ecs:us-east-1:000000000000:task-definition/web:1".into(),
+            family: "web".into(),
+            revision: 1,
+            container_instance_arn: None,
+            capacity_provider_name: None,
+            last_status: "PENDING".into(),
+            desired_status: "RUNNING".into(),
+            launch_type: "FARGATE".into(),
+            platform_version: None,
+            cpu: None,
+            memory: None,
+            containers: Vec::new(),
+            overrides: serde_json::json!({}),
+            started_by: None,
+            group: None,
+            connectivity: "CONNECTING".into(),
+            stop_code: None,
+            stopped_reason: None,
+            created_at: Utc::now(),
+            started_at: None,
+            stopping_at: None,
+            stopped_at: None,
+            pull_started_at: None,
+            pull_stopped_at: None,
+            connectivity_at: None,
+            started_by_ref_id: None,
+            execution_role_arn: None,
+            task_role_arn: None,
+            tags: Vec::new(),
+            awslogs: None,
+            captured_logs: String::new(),
+            protection: None,
+            enable_execute_command: false,
+            attachments: Vec::new(),
+            volume_configurations: Vec::new(),
+            task_set_arn: None,
+        }
     }
 }
