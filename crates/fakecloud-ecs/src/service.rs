@@ -320,6 +320,7 @@ impl EcsService {
         // is accurate immediately. Collect the new task IDs to launch after the
         // lock is released.
         let mut to_launch: Vec<(String, String)> = Vec::new(); // (account_id, task_id)
+        let mut to_stop: Vec<(String, String)> = Vec::new(); // (account_id, task_id)
         {
             let mut accounts = self.state.write();
             for (account_id, state) in accounts.iter_mut() {
@@ -336,30 +337,55 @@ impl EcsService {
                     .cloned()
                     .collect();
                 for service in scalable {
-                    // Count how the tasks launched since the last tick turned out, and leave a
-                    // service alone while the scheduler is backing off from launches that keep
-                    // failing to start (see `throttle.rs`).
+                    // Count how the tasks launched since the last tick turned out, refresh the
+                    // deployment counts, and work out what to start and stop (`throttle.rs`,
+                    // `deployment.rs`).
                     let now = chrono::Utc::now();
-                    let throttled = {
+                    let key = crate::state::EcsState::service_key(
+                        &service.cluster_name,
+                        &service.service_name,
+                    );
+                    let (throttled, plan) = {
                         let tasks = &state.tasks;
-                        let key = crate::state::EcsState::service_key(
-                            &service.cluster_name,
-                            &service.service_name,
-                        );
                         match state.services.get_mut(&key) {
                             Some(svc) => {
                                 crate::throttle::settle(svc, tasks, now);
-                                crate::throttle::is_throttled(svc, now)
+                                crate::deployment::refresh(svc, tasks, now);
+                                let throttled = crate::throttle::is_throttled(svc, now);
+                                let plan = if svc.deployment_controller == "ECS" {
+                                    crate::deployment::plan(svc, tasks)
+                                } else {
+                                    // CODE_DEPLOY / EXTERNAL: a plain top-up, as before.
+                                    let active = state.active_service_task_count(
+                                        &service.cluster_name,
+                                        &service.service_name,
+                                    );
+                                    crate::deployment::Plan {
+                                        launch: (service.desired_count - active).max(0),
+                                        stop: Vec::new(),
+                                    }
+                                };
+                                (throttled, plan)
                             }
-                            None => false,
+                            None => (false, crate::deployment::Plan::default()),
                         }
                     };
-                    if throttled {
-                        continue;
+                    // Stopping old tasks is never throttled: it is the launches that keep failing.
+                    for id in &plan.stop {
+                        if let Some(task) = state.tasks.get_mut(id) {
+                            task.desired_status = "STOPPED".into();
+                            task.stopping_at = Some(now);
+                        }
+                        to_stop.push((account_id.to_string(), id.clone()));
                     }
-                    let active = state
-                        .active_service_task_count(&service.cluster_name, &service.service_name);
-                    let shortfall = service.desired_count - active;
+                    if !plan.stop.is_empty() {
+                        tracing::info!(
+                            service = %service.service_name,
+                            stopping = plan.stop.len(),
+                            "ecs scheduler: stopping tasks on an older task definition",
+                        );
+                    }
+                    let shortfall = if throttled { 0 } else { plan.launch };
                     if shortfall <= 0 {
                         continue;
                     }
@@ -420,7 +446,42 @@ impl EcsService {
             }
         }
 
+        if to_launch.is_empty() && to_stop.is_empty() {
+            return;
+        }
+
+        // Tasks on an older task definition that the deployment has replaced. Without a runtime
+        // there is no container to kill, so they simply become STOPPED.
+        if let Some(rt) = &self.runtime {
+            for (_, task_id) in &to_stop {
+                let rt = rt.clone();
+                let task_id = task_id.clone();
+                tokio::spawn(async move {
+                    rt.stop_task(
+                        &task_id,
+                        "Replaced by a newer task definition in a deployment",
+                    )
+                    .await;
+                });
+            }
+        } else if !to_stop.is_empty() {
+            let mut accounts = self.state.write();
+            for (account_id, task_id) in &to_stop {
+                if let Some(t) = accounts
+                    .get_mut(account_id)
+                    .and_then(|state| state.tasks.get_mut(task_id))
+                {
+                    t.last_status = "STOPPED".into();
+                    t.stop_code = Some("ServiceSchedulerInitiated".into());
+                    t.stopped_at = Some(chrono::Utc::now());
+                    for c in t.containers.iter_mut() {
+                        c.last_status = "STOPPED".into();
+                    }
+                }
+            }
+        }
         if to_launch.is_empty() {
+            self.save_snapshot().await;
             return;
         }
 
