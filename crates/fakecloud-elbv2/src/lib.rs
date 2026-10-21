@@ -12,7 +12,7 @@ pub use service::normalize_action_config;
 pub use service::Elbv2Service;
 pub use state::{
     listener_arn, listener_rule_arn, load_balancer_arn, target_group_arn, trust_store_arn, Action,
-    AvailabilityZone, Certificate, Elbv2Accounts, Elbv2Snapshot, FixedResponseConfig,
+    AvailabilityZone, Certificate, Elbv2Accounts, Elbv2Snapshot, Elbv2State, FixedResponseConfig,
     ForwardConfig, Listener, LoadBalancer, LoadBalancerAddress, RedirectConfig, Rule,
     RuleCondition, SharedElbv2State, Tag, TargetDescription, TargetGroup,
     TargetGroupStickinessConfig, TargetGroupTuple, TargetHealth, TrustStore,

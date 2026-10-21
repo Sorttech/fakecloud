@@ -198,6 +198,11 @@ impl Context {
         }
     }
 
+    /// The value bound to `name`, or `null`.
+    pub(crate) fn variable(&self, name: &str) -> Value {
+        self.get(name)
+    }
+
     fn get(&self, name: &str) -> Value {
         for scope in self.scopes.iter().rev() {
             if let Some(v) = scope.get(name) {
