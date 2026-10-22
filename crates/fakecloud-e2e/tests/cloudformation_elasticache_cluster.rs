@@ -60,13 +60,20 @@ async fn cfn_provisions_elasticache_cluster_and_replication_group() {
         .await
         .expect("create_stack");
 
-    let described = cfn
-        .describe_stacks()
-        .stack_name("ec-stack")
-        .send()
-        .await
-        .expect("describe_stacks");
-    let stack = described.stacks().first().expect("stack present");
+    // A cache cluster is only complete once its container is up, so the stack is IN_PROGRESS
+    // until then (as a real CloudFormation stack is); wait for it instead of reading it at once.
+    let stack = helpers::wait_until(std::time::Duration::from_secs(300), || async {
+        let out = cfn
+            .describe_stacks()
+            .stack_name("ec-stack")
+            .send()
+            .await
+            .ok()?;
+        let s = out.stacks().first()?;
+        (!s.stack_status()?.as_str().ends_with("IN_PROGRESS")).then(|| s.clone())
+    })
+    .await
+    .expect("stack reached a terminal status");
     assert_eq!(stack.stack_status().unwrap().as_str(), "CREATE_COMPLETE");
 
     let cluster_resp = ec
