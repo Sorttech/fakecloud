@@ -1563,10 +1563,17 @@ impl CloudFormationService {
         &self,
         resource_defs: &[template::ResourceDefinition],
     ) -> bool {
-        self.deps.rds_runtime.is_some()
-            && resource_defs
-                .iter()
-                .any(|r| r.resource_type == "AWS::RDS::DBInstance")
+        let backed = |runtime_present: bool, resource_type: &str| {
+            runtime_present
+                && resource_defs
+                    .iter()
+                    .any(|r| r.resource_type == resource_type)
+        };
+        (backed(self.deps.rds_runtime.is_some(), "AWS::RDS::DBInstance")
+            || backed(
+                self.deps.elasticache_runtime.is_some(),
+                "AWS::ElastiCache::CacheCluster",
+            ))
             && matches!(
                 tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
                 Ok(tokio::runtime::RuntimeFlavor::MultiThread)

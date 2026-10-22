@@ -4,7 +4,115 @@
 
 use super::*;
 
+/// How long a CacheCluster may take to become available. AWS gives no figure that means anything
+/// for a local container; this covers a cold image pull, as for an RDS instance.
+const EC_CONTAINER_BACKING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
 impl ResourceProvisioner {
+    /// Wait for a just-created `AWS::ElastiCache::CacheCluster` to be available, as a
+    /// CloudFormation resource handler does, and read its endpoint back: before its container is up
+    /// the attributes are only the placeholder `<id>.fakecloud.<region>.cache.amazonaws.com:6379`.
+    /// Mirrors `stabilize_rds_db_instance`.
+    pub(super) fn stabilize_ec_cache_cluster(
+        &self,
+        resource: &mut StackResource,
+    ) -> Result<(), String> {
+        let id = resource.physical_id.as_str();
+        let Some(runtime) = self.elasticache_runtime.clone() else {
+            // Metadata-only: the cluster was inserted `available`.
+            return Ok(());
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            // No runtime to wait on: leave the queued intent to the post-provision drain.
+            return Ok(());
+        };
+        // Take over the spawn the create queued, so the post-provision drain does not start a
+        // second container for the same cluster.
+        let queued = {
+            let mut spawns = self.pending_container_spawns.lock();
+            let before = spawns.len();
+            spawns.retain(|intent| {
+                !matches!(
+                    intent,
+                    ContainerSpawnIntent::ElastiCacheCluster { cache_cluster_id } if cache_cluster_id == id
+                )
+            });
+            spawns.len() != before
+        };
+        if !queued {
+            return Ok(());
+        }
+
+        let boot = handle.spawn(
+            fakecloud_elasticache::cfn_provision::cfn_ensure_cluster_container(
+                self.elasticache_state.clone(),
+                runtime,
+                id.to_string(),
+                self.account_id.clone(),
+            ),
+        );
+        match handle.block_on(tokio::time::timeout(EC_CONTAINER_BACKING_TIMEOUT, boot)) {
+            Ok(Ok(())) => {}
+            Ok(Err(join_err)) => {
+                return Err(format!("Cache cluster container start failed: {join_err}"));
+            }
+            Err(_) => {
+                return Err(format!(
+                    "Cache cluster did not become available within {} minutes",
+                    EC_CONTAINER_BACKING_TIMEOUT.as_secs() / 60
+                ));
+            }
+        }
+
+        let status = self
+            .elasticache_state
+            .read()
+            .get(&self.account_id)
+            .and_then(|st| st.cache_clusters.get(id))
+            .map(|c| c.cache_cluster_status.clone());
+        match status.as_deref() {
+            Some("available") => {
+                for attr in [
+                    "RedisEndpoint.Address",
+                    "RedisEndpoint.Port",
+                    "ConfigurationEndpoint.Address",
+                    "ConfigurationEndpoint.Port",
+                ] {
+                    if let Some(value) = self.get_att_ec_cache_cluster(id, attr) {
+                        resource.attributes.insert(attr.to_string(), value);
+                    }
+                }
+                Ok(())
+            }
+            Some(other) => Err(format!("Cache cluster is in state: {other}")),
+            None => Err(format!("Cache cluster {id} not found")),
+        }
+    }
+
+    /// Live `GetAtt` for the endpoint attributes of `AWS::ElastiCache::CacheCluster`: the address
+    /// and port are only known once the container is up, so they are read from the cluster rather
+    /// than from the value captured at create time.
+    pub(super) fn get_att_ec_cache_cluster(
+        &self,
+        physical_id: &str,
+        attribute: &str,
+    ) -> Option<String> {
+        let accounts = self.elasticache_state.read();
+        let cluster = accounts
+            .get(&self.account_id)?
+            .cache_clusters
+            .get(physical_id)?;
+        match attribute {
+            "RedisEndpoint.Address" | "ConfigurationEndpoint.Address" => {
+                Some(cluster.endpoint_address.clone())
+            }
+            "RedisEndpoint.Port" | "ConfigurationEndpoint.Port" => {
+                Some(cluster.endpoint_port.to_string())
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn create_ec_parameter_group(
         &self,
         resource: &ResourceDefinition,
