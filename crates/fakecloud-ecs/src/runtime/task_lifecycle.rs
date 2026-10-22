@@ -89,6 +89,7 @@ impl EcsRuntime {
                     self.server_port, task_id
                 ),
             ));
+            with_aws_endpoint(&mut env, host_alias, self.server_port);
             resolved_plans.push(ResolvedContainerPlan { plan, env });
         }
 
@@ -822,5 +823,56 @@ impl EcsRuntime {
         for id in holders {
             let _ = self.cli_output(["rm", "-f", &id], CLI_CALL_TIMEOUT).await;
         }
+    }
+}
+
+/// Point a task container's AWS SDK at fakecloud.
+///
+/// On AWS the SDK's default endpoints are the right ones; here they would call the real services (a
+/// task's DynamoDB call came back `UnrecognizedClientException: The security token included in the
+/// request is invalid`, real DynamoDB rejecting the emulator's credentials). Lambda makes the same
+/// deliberate deviation, adding `AWS_ENDPOINT_URL` for the function; an ECS task needs it too. A
+/// container definition that sets its own `AWS_ENDPOINT_URL` keeps it, as a Lambda function does.
+/// `host_alias` is how the container reaches the machine fakecloud runs on, the name the task
+/// metadata endpoints already use.
+pub(crate) fn with_aws_endpoint(env: &mut Vec<(String, String)>, host_alias: &str, port: u16) {
+    if env.iter().any(|(name, _)| name == "AWS_ENDPOINT_URL") {
+        return;
+    }
+    env.push((
+        "AWS_ENDPOINT_URL".into(),
+        format!("http://{host_alias}:{port}"),
+    ));
+}
+
+#[cfg(test)]
+mod aws_endpoint_tests {
+    use super::with_aws_endpoint;
+
+    #[test]
+    fn a_container_without_one_gets_fakeclouds_endpoint_on_the_host_alias() {
+        let mut env = vec![("A".to_string(), "1".to_string())];
+        with_aws_endpoint(&mut env, "host.docker.internal", 4566);
+        assert!(env.contains(&(
+            "AWS_ENDPOINT_URL".to_string(),
+            "http://host.docker.internal:4566".to_string()
+        )));
+        assert_eq!(env.len(), 2);
+    }
+
+    #[test]
+    fn a_container_that_sets_its_own_keeps_it_and_gets_no_second() {
+        let mut env = vec![(
+            "AWS_ENDPOINT_URL".to_string(),
+            "http://example.invalid:9999".to_string(),
+        )];
+        with_aws_endpoint(&mut env, "host.docker.internal", 4566);
+        assert_eq!(
+            env,
+            vec![(
+                "AWS_ENDPOINT_URL".to_string(),
+                "http://example.invalid:9999".to_string()
+            )]
+        );
     }
 }
