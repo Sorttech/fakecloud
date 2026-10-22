@@ -65,13 +65,20 @@ async fn cfn_elasticache_resources_reach_available() {
         .await
         .expect("create_stack");
 
-    let described = cfn
-        .describe_stacks()
-        .stack_name("ec-backing-stack")
-        .send()
-        .await
-        .expect("describe_stacks");
-    let stack = described.stacks().first().expect("stack present");
+    // A cache cluster is only complete once its container is up, so the stack is IN_PROGRESS
+    // until then (as a real CloudFormation stack is); wait for it instead of reading it at once.
+    let stack = helpers::wait_until(std::time::Duration::from_secs(300), || async {
+        let out = cfn
+            .describe_stacks()
+            .stack_name("ec-backing-stack")
+            .send()
+            .await
+            .ok()?;
+        let s = out.stacks().first()?;
+        (!s.stack_status()?.as_str().ends_with("IN_PROGRESS")).then(|| s.clone())
+    })
+    .await
+    .expect("stack reached a terminal status");
     assert_eq!(stack.stack_status().unwrap().as_str(), "CREATE_COMPLETE");
 
     // The backing container boots in a detached task after CreateStack returns,

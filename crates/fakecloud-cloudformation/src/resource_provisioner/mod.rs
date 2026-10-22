@@ -1428,6 +1428,7 @@ impl ResourceProvisioner {
         }
         match resource.resource_type.as_str() {
             "AWS::RDS::DBInstance" => self.stabilize_rds_db_instance(resource),
+            "AWS::ElastiCache::CacheCluster" => self.stabilize_ec_cache_cluster(resource),
             _ => Ok(()),
         }
     }
@@ -2443,6 +2444,11 @@ impl ResourceProvisioner {
             }
             "AWS::RDS::DBCluster" => {
                 if let Some(v) = self.get_att_rds_db_cluster(&resource.physical_id, attribute) {
+                    return Some(v);
+                }
+            }
+            "AWS::ElastiCache::CacheCluster" => {
+                if let Some(v) = self.get_att_ec_cache_cluster(&resource.physical_id, attribute) {
                     return Some(v);
                 }
             }

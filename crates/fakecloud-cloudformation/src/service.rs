@@ -1904,6 +1904,8 @@ impl CloudFormationService {
         let waits = resource_defs.iter().any(|r| {
             crate::resource_provisioner::is_custom_resource_type(&r.resource_type)
                 || (r.resource_type == "AWS::RDS::DBInstance" && self.deps.rds_runtime.is_some())
+                || (r.resource_type == "AWS::ElastiCache::CacheCluster"
+                    && self.deps.elasticache_runtime.is_some())
         });
         waits
             && matches!(

@@ -117,7 +117,7 @@ For **container-backed** services, a CloudFormation-provisioned resource is back
 - **ECR** — `Repository`, `RepositoryPolicy`, `LifecyclePolicy`, `PullThroughCacheRule`, `RegistryPolicy`, `RegistryScanningConfiguration`, `ReplicationConfiguration`
 - **ECS** — `Cluster`, `Service` (starts its PRIMARY deployment and `DeploymentCircuitBreaker` as `CreateService` does, launches real running tasks to reach `DesiredCount`, and a new `TaskDefinition` on update rolls a new deployment), `TaskDefinition`, `CapacityProvider`
 - **EKS** — `Cluster`, `Nodegroup`, `FargateProfile`, `Addon`, `AccessEntry`, `IdentityProviderConfig`, `PodIdentityAssociation`
-- **ElastiCache** — `CacheCluster` and `ReplicationGroup` (backed by a real Redis/Memcached container), `ParameterGroup`, `SubnetGroup`, `SecurityGroup`, `User`, `UserGroup`
+- **ElastiCache** — `CacheCluster` (the stack stays in progress until the cluster's container is up, as a real stack does, and `RedisEndpoint.Address` / `.Port` and `ConfigurationEndpoint.Address` / `.Port` resolve live to the endpoint `DescribeCacheClusters` reports) and `ReplicationGroup` (backed by a real Redis/Memcached container; its endpoint attributes are still the values captured at create time),  `ParameterGroup`, `SubnetGroup`, `SecurityGroup`, `User`, `UserGroup`
 - **ELBv2** — `LoadBalancer`, `Listener`, `ListenerRule`, `ListenerCertificate`, `TargetGroup`, `TrustStore`
 - **EventBridge** — `EventBus`, `Rule` (`Ref` is the rule name, or `<bus>|<rule>` off the default bus), `Archive`, `Connection`, `ApiDestination`, `Endpoint`, `EventBusPolicy`
 - **Firehose** — `DeliveryStream`
