@@ -1686,6 +1686,7 @@ impl ResourceProvisioner {
             "AWS::ApiGateway::ApiKey" => self.create_apigw_api_key(resource),
             "AWS::ApiGateway::UsagePlanKey" => self.create_apigw_usage_plan_key(resource),
             "AWS::ApiGateway::DomainName" => self.create_apigw_domain_name(resource),
+            "AWS::ApiGateway::VpcLink" => self.create_apigw_vpc_link(resource),
             "AWS::ApiGateway::BasePathMapping" => self.create_apigw_base_path_mapping(resource),
             "AWS::ApiGatewayV2::Api" => self.create_apigwv2_api(resource),
             "AWS::ApiGatewayV2::Route" => self.create_apigwv2_route(resource),
@@ -1907,6 +1908,13 @@ impl ResourceProvisioner {
             "AWS::ApiGateway::DomainName" => {
                 Some(self.update_apigw_domain_name(existing, new_def)?)
             }
+            // `TargetArns` needs replacement on AWS; everything else updates in place.
+            "AWS::ApiGateway::VpcLink"
+                if self.apigw_vpc_link_requires_replacement(existing, new_def) =>
+            {
+                self.reprovision_resource(existing, new_def)?
+            }
+            "AWS::ApiGateway::VpcLink" => Some(self.update_apigw_vpc_link(existing, new_def)?),
             "AWS::ApiGateway::BasePathMapping" => {
                 Some(self.update_apigw_base_path_mapping(existing, new_def)?)
             }
@@ -3122,6 +3130,7 @@ impl ResourceProvisioner {
                 self.delete_apigw_usage_plan_key(&resource.physical_id, &resource.attributes)
             }
             "AWS::ApiGateway::DomainName" => self.delete_apigw_domain_name(&resource.physical_id),
+            "AWS::ApiGateway::VpcLink" => self.delete_apigw_vpc_link(&resource.physical_id),
             "AWS::ApiGateway::BasePathMapping" => {
                 self.delete_apigw_base_path_mapping(&resource.physical_id, &resource.attributes)
             }
