@@ -6,6 +6,12 @@ services:
       dockerfile: Dockerfile
     ports:
       - "4566:4566"
+      # CloudFormation custom resources signal their outcome by HTTPS PUT to the
+      # ResponseURL on their event. CDK's handler calls `https.request` with no
+      # port, so that URL can only ever be 443 — published here so a Lambda
+      # container can reach it via the host. Without this, custom resources that
+      # signal (CDK's do) cannot report success or failure.
+      - "443:443"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     # Lambda / RDS / ElastiCache / ECS publish their backing-container ports on
