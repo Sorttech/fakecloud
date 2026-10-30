@@ -14,16 +14,23 @@ pub(super) fn integration_method_override(integration: &Integration) -> Option<M
         .and_then(|m| Method::from_bytes(m.to_ascii_uppercase().as_bytes()).ok())
 }
 
-pub(super) async fn http_proxy(
+/// Call an `HTTP` / `HTTP_PROXY` integration's backend, with its `requestParameters` applied: `{name}` in the URI filled
+/// from the mapped path parameters, the mapped query string and headers added, and, for a proxy
+/// integration, the client's own query string passed through.
+pub(super) async fn http_proxy_mapped(
     req: &AwsRequest,
     integration: &Integration,
+    mapped: &MappedRequest,
     body_override: Option<bytes::Bytes>,
     method_override: Option<Method>,
 ) -> Result<AwsResponse, AwsServiceError> {
-    let url = integration
+    let uri = integration
         .uri
         .as_ref()
         .ok_or_else(|| bad_gateway("HTTP integration missing uri"))?;
+    let forward_query = (integration.integration_type == "HTTP_PROXY" && !req.raw_query.is_empty())
+        .then_some(req.raw_query.as_str());
+    let url = mapped.url_for(uri, forward_query);
     let effective_method = method_override.as_ref().unwrap_or(&req.method);
     let method = match *effective_method {
         Method::GET => reqwest::Method::GET,
@@ -47,10 +54,22 @@ pub(super) async fn http_proxy(
         .build()
         .map_err(|e| bad_gateway(format!("failed to build HTTP client: {e}")))?;
     let mut builder = client.request(method, url);
+    // The mapped headers replace a client header of the same name rather than joining it.
+    let mapped_names: Vec<String> = mapped
+        .headers()
+        .iter()
+        .map(|(name, _)| name.to_ascii_lowercase())
+        .collect();
     for (k, v) in req.headers.iter() {
+        if mapped_names.iter().any(|n| n == k.as_str()) {
+            continue;
+        }
         if let Ok(s) = v.to_str() {
             builder = builder.header(k.as_str(), s);
         }
+    }
+    for (name, value) in mapped.headers() {
+        builder = builder.header(name.as_str(), value.as_str());
     }
     let body = body_override.as_ref().unwrap_or(&req.body);
     if !body.is_empty() {
@@ -94,12 +113,101 @@ pub(super) async fn http_proxy(
     })
 }
 
-/// Resolve a VPC_LINK integration by looking up the VpcLink's
-/// `targetArns`, finding the first NLB/ALB that has a bound port in
-/// the ELBv2 dataplane, and forwarding the request there.
-pub(super) async fn vpc_link_proxy(
+/// A backend picked from a network load balancer's listener.
+struct NlbTarget {
+    target_group_arn: String,
+    target_id: String,
+    port: u16,
+    load_balancer_security_groups: Vec<String>,
+}
+
+/// The first healthy registered target (else, failing open, the first registered one) behind the listener on `listener_port` of the first of
+/// `target_arns` that is a load balancer with such a listener. `Ok(None)` when none has one, which
+/// leaves the caller's own "no data plane" error to say so; `Err` when a listener exists and
+/// nothing is registered behind it.
+// ponytail: always the first usable target, not round-robin. A shared counter is the upgrade when
+// a test needs to see traffic spread across several targets.
+fn nlb_target(
+    state: &fakecloud_elbv2::Elbv2State,
+    target_arns: &[String],
+    listener_port: u16,
+) -> Result<Option<NlbTarget>, AwsServiceError> {
+    for arn in target_arns {
+        let Some(lb) = state.load_balancers.get(arn) else {
+            continue;
+        };
+        let Some(listener) = state
+            .listeners
+            .values()
+            .find(|l| l.load_balancer_arn == lb.arn && l.port == Some(i32::from(listener_port)))
+        else {
+            continue;
+        };
+        let mut group_arns: Vec<&str> = Vec::new();
+        for action in &listener.default_actions {
+            if let Some(forward) = &action.forward {
+                group_arns.extend(
+                    forward
+                        .target_groups
+                        .iter()
+                        .map(|t| t.target_group_arn.as_str()),
+                );
+            }
+            if let Some(group) = &action.target_group_arn {
+                group_arns.push(group);
+            }
+        }
+        for group_arn in group_arns {
+            let Some(group) = state.target_groups.get(group_arn) else {
+                continue;
+            };
+            // A healthy target if there is one. With none, the load balancer fails open and sends
+            // to the registered targets anyway ("If all targets fail health checks at the same
+            // time in all enabled Availability Zones, the load balancer fails open",
+            // <https://docs.aws.amazon.com/elasticloadbalancing/latest/network/target-group-health-checks.md>,
+            // fetched 2026-10-21), so a backend that is still starting answers with its own error
+            // or a refused connection instead of this one.
+            let usable = group
+                .targets
+                .iter()
+                .find(|t| t.health.state != "unhealthy" && t.health.state != "unused")
+                .or_else(|| group.targets.first());
+            if let Some(target) = usable {
+                let port = target
+                    .port
+                    .or(group.port)
+                    .and_then(|p| u16::try_from(p).ok())
+                    .ok_or_else(|| bad_gateway("VPC_LINK: target has no valid port"))?;
+                return Ok(Some(NlbTarget {
+                    target_group_arn: group.arn.clone(),
+                    target_id: target.id.clone(),
+                    port,
+                    load_balancer_security_groups: lb.security_groups.clone(),
+                }));
+            }
+        }
+        return Err(bad_gateway(format!(
+            "VPC_LINK: nothing is registered behind port {listener_port} of {}",
+            lb.name
+        )));
+    }
+    Ok(None)
+}
+
+/// Resolve a VPC_LINK integration by looking up the VpcLink's `targetArns` and forwarding the
+/// request to what they front:
+///
+/// 1. a load balancer the ELBv2 data plane has bound a port for (an ALB), or else
+/// 2. a network load balancer, which has no bound port: the listener on the integration URI's port
+///    (default 80), its forward action's target group, and the first registered target that is
+///    not `unhealthy` or `unused`, as the ALB data plane does.
+///
+/// The integration's `requestParameters` are applied as for [`http_proxy_mapped`].
+pub(super) async fn vpc_link_proxy_mapped(
     req: &AwsRequest,
     integration: &Integration,
+    mapped: &MappedRequest,
+    method_override: Option<Method>,
     service: &ApiGatewayService,
 ) -> Result<AwsResponse, AwsServiceError> {
     let connection_id = integration
@@ -129,42 +237,78 @@ pub(super) async fn vpc_link_proxy(
             .collect()
     };
 
+    let original_url = integration.uri.as_deref().unwrap_or("http://localhost/");
+    let listener_port = http::Uri::try_from(original_url)
+        .ok()
+        .and_then(|u| u.port_u16())
+        .unwrap_or(80);
+
     let elbv2 = service
         .elbv2_state
         .as_ref()
         .ok_or_else(|| bad_gateway("VPC_LINK not available: ELBv2 state not wired"))?;
-    let port = {
+    let (bound_port, nlb) = {
         let elbv2_read = elbv2.read();
         let elbv2_account = elbv2_read
             .get(&req.account_id)
             .ok_or_else(|| bad_gateway("VPC_LINK: account not found in ELBv2 state"))?;
-        let mut bound_port = None;
-        for arn in &target_arns {
-            if let Some(lb) = elbv2_account.load_balancers.get(arn) {
-                if let Some(port) = lb.bound_port {
-                    bound_port = Some(port);
-                    break;
-                }
-            }
+        let bound_port = target_arns
+            .iter()
+            .filter_map(|arn| elbv2_account.load_balancers.get(arn))
+            .find_map(|lb| lb.bound_port);
+        let nlb = if bound_port.is_none() {
+            nlb_target(elbv2_account, &target_arns, listener_port)?
+        } else {
+            None
+        };
+        (bound_port, nlb)
+    };
+    let backend = match (bound_port, nlb) {
+        (Some(port), _) => format!("http://127.0.0.1:{port}"),
+        (None, Some(target)) => {
+            let account =
+                fakecloud_core::dataplane::account_of_arn(&target.target_group_arn).unwrap_or_default();
+            let endpoint = fakecloud_core::dataplane::resolve_target(
+                account,
+                &target.target_id,
+                target.port,
+                &sibling_host(),
+                &target.load_balancer_security_groups,
+            )
+            .await;
+            format!("http://{}:{}", endpoint.host, endpoint.port)
         }
-        bound_port.ok_or_else(|| {
-            bad_gateway("VPC_LINK: none of the target NLBs/ALBs have an active dataplane port")
-        })?
+        (None, None) => {
+            return Err(bad_gateway(
+                "VPC_LINK: none of the target NLBs/ALBs have an active dataplane port or a listener on the integration's port",
+            ))
+        }
     };
 
-    // Build the backend URL from the integration URI, replacing the
-    // host with the local ELBv2 dataplane endpoint.
-    let original_url = integration.uri.as_deref().unwrap_or("http://localhost/");
-    let path_and_query = http::Uri::try_from(original_url)
+    // The integration URI's path and query, on the backend's address, with the mapped path
+    // parameters filled in.
+    let expanded = mapped.url_for(original_url, None);
+    let path_and_query = http::Uri::try_from(expanded.as_str())
         .ok()
         .and_then(|u| u.path_and_query().map(|p| p.as_str().to_string()))
         .unwrap_or_else(|| req.raw_path.clone());
-    let backend_url = format!("http://127.0.0.1:{port}{path_and_query}");
-
     let mut proxy_integration = integration.clone();
-    proxy_integration.uri = Some(backend_url);
-    let method_override = integration_method_override(integration);
-    http_proxy(req, &proxy_integration, None, method_override).await
+    proxy_integration.uri = Some(format!("{backend}{path_and_query}"));
+    // The path is already filled in, so only the query and headers are left to map.
+    let remaining = MappedRequest::without_path(mapped);
+    http_proxy_mapped(req, &proxy_integration, &remaining, None, method_override).await
+}
+
+/// How fakecloud reaches a sibling it just started: the shared container networking's answer,
+/// worked out once.
+fn sibling_host() -> String {
+    static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HOST.get_or_init(|| {
+        fakecloud_core::container_net::detect_container_cli()
+            .map(|cli| fakecloud_core::container_net::HostNetworking::detect(&cli).sibling_host)
+            .unwrap_or_else(|| "127.0.0.1".to_string())
+    })
+    .clone()
 }
 
 /// Apply the integration's `requestTemplates` to the request body.

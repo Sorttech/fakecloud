@@ -406,6 +406,16 @@ pub async fn handle(
         &stage_vars,
     );
 
+    // `requestParameters`: the path parameters, query string and headers the integration maps
+    // onto the backend request.
+    let mapped = MappedRequest::build(
+        &integration,
+        req,
+        &path_params,
+        &stage_vars,
+        &vtl_ctx.variable("context"),
+    );
+
     let result: Result<AwsResponse, AwsServiceError> = match integration.integration_type.as_str() {
         "AWS_PROXY" => {
             let function_arn = match integration.uri.as_deref() {
@@ -434,18 +444,39 @@ pub async fn handle(
                 .ok_or_else(|| bad_gateway("Lambda delivery not configured"))?;
             lambda_proxy::invoke_lambda(delivery, &function_arn, event).await
         }
-        "HTTP_PROXY" => http_proxy(req, &integration, None, None).await,
+        "HTTP_PROXY" => {
+            // A proxy keeps the client's method. Through a VPC link it reaches what the link's
+            // load balancer fronts, not the (unresolvable) name in the URI.
+            if integration.connection_type.as_deref() == Some("VPC_LINK") {
+                vpc_link_proxy_mapped(req, &integration, &mapped, None, service).await
+            } else {
+                http_proxy_mapped(req, &integration, &mapped, None, None).await
+            }
+        }
         "HTTP" => {
             if integration.connection_type.as_deref() == Some("VPC_LINK") {
-                vpc_link_proxy(req, &integration, service).await
+                vpc_link_proxy_mapped(
+                    req,
+                    &integration,
+                    &mapped,
+                    integration_method_override(&integration),
+                    service,
+                )
+                .await
             } else {
                 // Apply request template before sending to backend.
                 let transformed_body = apply_request_template(req, &integration, &mut vtl_ctx);
                 // Non-proxy HTTP calls the backend with the configured
                 // integrationHttpMethod, not the client's method.
                 let method_override = integration_method_override(&integration);
-                let backend_resp =
-                    http_proxy(req, &integration, transformed_body, method_override).await?;
+                let backend_resp = http_proxy_mapped(
+                    req,
+                    &integration,
+                    &mapped,
+                    transformed_body,
+                    method_override,
+                )
+                .await?;
                 // Apply response template after receiving from backend.
                 apply_response_template(
                     backend_resp,
@@ -2439,7 +2470,14 @@ mod tests {
         };
 
         let req = make_request(HeaderMap::new());
-        let result = vpc_link_proxy(&req, &integration, &service).await;
+        let result = vpc_link_proxy_mapped(
+            &req,
+            &integration,
+            &MappedRequest::default(),
+            integration_method_override(&integration),
+            &service,
+        )
+        .await;
         let err = match result {
             Err(e) => e,
             Ok(_) => panic!("VPC_LINK to port 54321 with no server must fail"),
@@ -2451,6 +2489,241 @@ mod tests {
         assert!(
             msg.contains("backend HTTP failure") || msg.contains("connection refused"),
             "expected backend connection error, got: {msg}"
+        );
+    }
+
+    const NLB_ARN: &str =
+        "arn:aws:elasticloadbalancing:us-east-1:000000000000:loadbalancer/net/my-nlb/50dc6c495c0c9188";
+    const NLB_TG_ARN: &str =
+        "arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/my-tg/73e2d6bc24d8a067";
+
+    /// A network load balancer with no data-plane port: one TCP listener on `listener_port`
+    /// forwarding to a target group holding `targets` (`(id, port)`), behind a VPC link.
+    fn nlb_service(listener_port: i32, targets: &[(&str, u16)]) -> ApiGatewayService {
+        let mut state = ApiGatewayState::new(TEST_ACCOUNT, TEST_REGION);
+        state.vpc_links.insert(
+            "vpclink001".to_string(),
+            serde_json::json!({
+                "id": "vpclink001",
+                "name": "link",
+                "targetArns": [NLB_ARN],
+                "status": "AVAILABLE"
+            }),
+        );
+        let apigw_state: SharedApiGatewayState = {
+            let mut mas =
+                MultiAccountState::new(TEST_ACCOUNT, TEST_REGION, "http://localhost:4566");
+            *mas.get_or_create(TEST_ACCOUNT) = state;
+            Arc::new(parking_lot::RwLock::new(mas))
+        };
+
+        let mut accounts = fakecloud_elbv2::Elbv2Accounts::new();
+        let elbv2 = accounts.get_or_create(TEST_ACCOUNT);
+        let lb: fakecloud_elbv2::LoadBalancer = serde_json::from_value(serde_json::json!({
+            "arn": NLB_ARN,
+            "name": "my-nlb",
+            "dns_name": "my-nlb-123.elb.us-east-1.amazonaws.com",
+            "canonical_hosted_zone_id": "Z35SXDOTRQ7X7K",
+            "created_time": "2024-01-01T00:00:00Z",
+            "scheme": "internal",
+            "vpc_id": "vpc-123",
+            "state_code": "active",
+            "lb_type": "network",
+            "availability_zones": [],
+            "security_groups": [],
+            "ip_address_type": "ipv4",
+            "tags": [],
+            "attributes": {}
+        }))
+        .unwrap();
+        elbv2.load_balancers.insert(NLB_ARN.to_string(), lb);
+        let listener: fakecloud_elbv2::Listener = serde_json::from_value(serde_json::json!({
+            "arn": "arn:aws:elasticloadbalancing:us-east-1:000000000000:listener/net/my-nlb/50dc6c495c0c9188/1",
+            "load_balancer_arn": NLB_ARN,
+            "port": listener_port,
+            "protocol": "TCP",
+            "certificates": [],
+            "default_actions": [{"action_type": "forward", "target_group_arn": NLB_TG_ARN}],
+            "alpn_policy": [],
+            "tags": [],
+            "attributes": {}
+        }))
+        .unwrap();
+        elbv2.listeners.insert(listener.arn.clone(), listener);
+        let group: fakecloud_elbv2::TargetGroup = serde_json::from_value(serde_json::json!({
+            "arn": NLB_TG_ARN,
+            "name": "my-tg",
+            "target_type": "ip",
+            "ip_address_type": "ipv4",
+            "health_check_enabled": true,
+            "health_check_interval_seconds": 30,
+            "health_check_timeout_seconds": 5,
+            "healthy_threshold_count": 5,
+            "unhealthy_threshold_count": 2,
+            "load_balancer_arns": [NLB_ARN],
+            "targets": targets
+                .iter()
+                .map(|(id, port)| serde_json::json!({"id": id, "port": port}))
+                .collect::<Vec<_>>(),
+            "tags": [],
+            "attributes": {},
+            "created_time": "2024-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        elbv2.target_groups.insert(NLB_TG_ARN.to_string(), group);
+        ApiGatewayService::new(apigw_state).with_elbv2(Arc::new(parking_lot::RwLock::new(accounts)))
+    }
+
+    /// The integration our onboarding stack deploys: a proxy resource behind a VPC link.
+    fn nlb_proxy_integration() -> Integration {
+        Integration {
+            rest_api_id: "api1".to_string(),
+            resource_id: "res1".to_string(),
+            http_method: "ANY".to_string(),
+            integration_type: "HTTP_PROXY".to_string(),
+            integration_http_method: Some("ANY".to_string()),
+            uri: Some("http://my-nlb-123.elb.us-east-1.amazonaws.com:8001/{proxy}".to_string()),
+            credentials: None,
+            request_parameters: BTreeMap::from([
+                (
+                    "integration.request.path.proxy".to_string(),
+                    "method.request.path.proxy".to_string(),
+                ),
+                (
+                    "integration.request.header.x-mapped".to_string(),
+                    "'yes'".to_string(),
+                ),
+            ]),
+            request_templates: BTreeMap::new(),
+            passthrough_behavior: "WHEN_NO_MATCH".to_string(),
+            timeout_in_millis: None,
+            cache_namespace: None,
+            cache_key_parameters: vec![],
+            content_handling: None,
+            connection_type: Some("VPC_LINK".to_string()),
+            connection_id: Some("vpclink001".to_string()),
+            tls_config: None,
+        }
+    }
+
+    /// An HTTP server that answers one request with its own request head.
+    async fn echo_backend() -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&chunk[..n]);
+            }
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                head.len()
+            );
+            socket.write_all(reply.as_bytes()).await.unwrap();
+            socket.write_all(&head).await.unwrap();
+        });
+        port
+    }
+
+    fn nlb_mapped(integration: &Integration, req: &AwsRequest) -> MappedRequest {
+        let path_params = BTreeMap::from([("proxy".to_string(), "api/ping".to_string())]);
+        MappedRequest::build(
+            integration,
+            req,
+            &path_params,
+            &BTreeMap::new(),
+            &serde_json::json!({}),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_proxy_integration_through_a_vpc_link_reaches_the_target_behind_an_nlb_listener() {
+        let backend = echo_backend().await;
+        let service = nlb_service(8001, &[("127.0.0.1", backend)]);
+        let integration = nlb_proxy_integration();
+        let mut req = make_request(HeaderMap::new());
+        req.raw_query = "page=2".to_string();
+
+        let mapped = nlb_mapped(&integration, &req);
+        let response = vpc_link_proxy_mapped(&req, &integration, &mapped, None, &service)
+            .await
+            .expect("the target answers");
+
+        assert_eq!(response.status, StatusCode::OK);
+        let body = String::from_utf8_lossy(response.body.expect_bytes()).to_lowercase();
+        // `{proxy}` filled from the method request path, the client's query string forwarded, the
+        // mapped header added, and the request sent to the registered target, not the URI's host.
+        assert!(body.starts_with("get /api/ping?page=2 http/1.1"), "{body}");
+        assert!(body.contains("x-mapped: yes"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_nlb_fails_open_when_every_registered_target_is_unhealthy() {
+        let backend = echo_backend().await;
+        let service = nlb_service(8001, &[("127.0.0.1", backend)]);
+        // The health prober has marked the only target unhealthy, as it does while a backend is
+        // still starting.
+        {
+            let state = service.elbv2_state.as_ref().expect("elbv2 wired");
+            let mut accounts = state.write();
+            let group = accounts
+                .get_mut(TEST_ACCOUNT)
+                .and_then(|a| a.target_groups.get_mut(NLB_TG_ARN))
+                .expect("target group");
+            group.targets[0].health.state = "unhealthy".to_string();
+        }
+        let integration = nlb_proxy_integration();
+        let req = make_request(HeaderMap::new());
+        let mapped = nlb_mapped(&integration, &req);
+        let response = vpc_link_proxy_mapped(&req, &integration, &mapped, None, &service)
+            .await
+            .expect("traffic still goes to the registered target");
+        assert_eq!(response.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_listener_is_chosen_by_the_integration_uris_port() {
+        let backend = echo_backend().await;
+        // The only listener is on 8002; the integration asks for 8001.
+        let service = nlb_service(8002, &[("127.0.0.1", backend)]);
+        let integration = nlb_proxy_integration();
+        let req = make_request(HeaderMap::new());
+        let mapped = nlb_mapped(&integration, &req);
+        let err = match vpc_link_proxy_mapped(&req, &integration, &mapped, None, &service).await {
+            Err(e) => e,
+            Ok(_) => panic!("no listener on port 8001 must fail"),
+        };
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            err.message().contains("listener on the integration's port"),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_listener_with_nothing_registered_behind_it_is_a_bad_gateway() {
+        let service = nlb_service(8001, &[]);
+        let integration = nlb_proxy_integration();
+        let req = make_request(HeaderMap::new());
+        let mapped = nlb_mapped(&integration, &req);
+        let err = match vpc_link_proxy_mapped(&req, &integration, &mapped, None, &service).await {
+            Err(e) => e,
+            Ok(_) => panic!("an empty target group must fail"),
+        };
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            err.message()
+                .contains("nothing is registered behind port 8001"),
+            "{}",
+            err.message()
         );
     }
 
@@ -2488,7 +2761,9 @@ mod tests {
             tls_config: None,
         };
         let req = make_request(HeaderMap::new());
-        let err = match http_proxy(&req, &integration, None, None).await {
+        let err = match http_proxy_mapped(&req, &integration, &MappedRequest::default(), None, None)
+            .await
+        {
             Err(e) => e,
             Ok(_) => panic!("hung backend must time out, not return a response"),
         };
@@ -2762,9 +3037,10 @@ mod tests {
             tls_config: None,
         };
         let req = make_request(HeaderMap::new());
-        let resp = http_proxy(
+        let resp = http_proxy_mapped(
             &req,
             &integration,
+            &MappedRequest::default(),
             None,
             integration_method_override(&integration),
         )
@@ -3156,6 +3432,7 @@ mod tests {
 mod authorizers;
 mod errors;
 mod integrations;
+mod request_mapping;
 mod routing;
 mod usage_plans;
 mod validator;
@@ -3163,6 +3440,7 @@ pub(crate) use authorizers::test_invoke_authorizer_eval;
 use authorizers::*;
 use errors::*;
 use integrations::*;
+use request_mapping::MappedRequest;
 use routing::*;
 use usage_plans::*;
 use validator::*;
