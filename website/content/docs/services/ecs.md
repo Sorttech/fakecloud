@@ -119,6 +119,10 @@ Services declared with `loadBalancers[]` register each task's primary IP (awsvpc
 
 Task state transitions fire `aws.ecs` / `ECS Task State Change` events on the default EventBridge bus. Event `detail` carries the task ARN, cluster ARN, last status, stop code / reason on STOPPED, and a summary of each container including exit code. Rules matching `source: aws.ecs` receive these events and can route to SQS, SNS, Lambda, Step Functions — the standard target fan-out.
 
+### AWS endpoint
+
+Every container of a task gets `AWS_ENDPOINT_URL=http://<host alias>:<fakecloud port>`, so the AWS SDK inside it calls fakecloud and not the real services. This is the same deliberate deviation from AWS that Lambda functions get (on AWS the SDK's default endpoints are the right ones); `<host alias>` is the name the container already uses for the task metadata endpoints (`host.docker.internal`, or `host.containers.internal` under Podman). A container definition that sets its own `AWS_ENDPOINT_URL` keeps it. Without this a task's SDK calls went to the real service and failed with `UnrecognizedClientException` on the emulator's credentials. Not yet done for the Kubernetes backend's Pods.
+
 ### Task role credentials
 
 Tasks whose task definition (or a `RunTask` `overrides.taskRoleArn`) names a `taskRoleArn` get the credentials the way they do on ECS: every container gets `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/v2/credentials/<task-id>`, and `http://169.254.170.2` inside the task's network answers it. An unmodified AWS SDK or CLI in the container resolves the task role through its default credential chain, and so do scripts that call `curl 169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`. Tasks without a task role get no credentials URI, as on AWS. The endpoint returns the container-credentials JSON the ECS agent serves:

@@ -305,3 +305,140 @@ async fn ecs_task_state_change_emits_eventbridge() {
         "expected an ECS Task State Change STOPPED event for our task on SQS"
     );
 }
+
+/// The stdout of a one-shot `alpine` task running `command`, read back through CloudWatch Logs.
+async fn run_and_read_stdout(
+    server: &TestServer,
+    family: &str,
+    environment: Vec<KeyValuePair>,
+    command: &str,
+) -> Vec<String> {
+    let ecs = server.ecs_client().await;
+    let logs = server.logs_client().await;
+    let group = format!("/fakecloud/ecs/{family}");
+
+    ecs.create_cluster()
+        .cluster_name(family)
+        .send()
+        .await
+        .expect("create_cluster");
+    let mut container = ContainerDefinition::builder()
+        .name("app")
+        .image("public.ecr.aws/docker/library/alpine:3.20")
+        .essential(true)
+        .command("sh")
+        .command("-c")
+        .command(command)
+        .log_configuration(awslogs_config(&group, "fc", "us-east-1"));
+    for pair in environment {
+        container = container.environment(pair);
+    }
+    ecs.register_task_definition()
+        .family(family)
+        .container_definitions(container.build())
+        .send()
+        .await
+        .expect("register_task_definition");
+    let run = ecs
+        .run_task()
+        .cluster(family)
+        .task_definition(family)
+        .send()
+        .await
+        .expect("run_task");
+    let arn = run.tasks()[0].task_arn().unwrap().to_string();
+    wait_for_task_stopped(&ecs, family, &arn).await;
+
+    let streams = logs
+        .describe_log_streams()
+        .log_group_name(&group)
+        .send()
+        .await
+        .expect("describe_log_streams");
+    let stream = streams.log_streams()[0]
+        .log_stream_name()
+        .unwrap()
+        .to_string();
+    let events = logs
+        .get_log_events()
+        .log_group_name(&group)
+        .log_stream_name(stream)
+        .send()
+        .await
+        .expect("get_log_events");
+    events
+        .events()
+        .iter()
+        .filter_map(|e| e.message().map(str::to_string))
+        .collect()
+}
+
+/// The value after `ENDPOINT=` in the one log line that has it. CloudWatch lines carry a
+/// `[<container>] ` prefix, so the marker is searched for, not matched at the start.
+fn endpoint_from(messages: &[String]) -> String {
+    let line = messages
+        .iter()
+        .find(|m| m.contains("ENDPOINT="))
+        .unwrap_or_else(|| panic!("no ENDPOINT line in {messages:?}"));
+    line.split_once("ENDPOINT=").unwrap().1.trim().to_string()
+}
+
+/// A task's AWS SDK has to reach the emulator, not real AWS. On Lambda fakecloud adds
+/// `AWS_ENDPOINT_URL` pointing back at the server, "the one deliberate deviation from AWS" (the SDK's
+/// default endpoints are right on AWS and would call real AWS here); an ECS task needs the same.
+/// Without it a task's SDK calls went to the real service, which answered
+/// `UnrecognizedClientException: The security token included in the request is invalid`.
+#[tokio::test]
+async fn ecs_task_gets_the_emulators_aws_endpoint() {
+    if !require_docker_or_skip("ecs_task_gets_the_emulators_aws_endpoint") {
+        return;
+    }
+    let server = TestServer::start().await;
+    let messages = run_and_read_stdout(
+        &server,
+        "ep-injected",
+        vec![],
+        "echo ENDPOINT=${AWS_ENDPOINT_URL:-unset}",
+    )
+    .await;
+    let endpoint = endpoint_from(&messages);
+    assert_ne!(endpoint, "unset", "the task has no AWS_ENDPOINT_URL");
+    // It names the host alias the container reaches fakecloud by (never loopback, which inside the
+    // container is the container itself) and fakecloud's own port.
+    assert!(
+        endpoint.starts_with("http://")
+            && !endpoint.contains("localhost")
+            && !endpoint.contains("127.0.0.1"),
+        "unexpected endpoint {endpoint}"
+    );
+    assert!(
+        endpoint.ends_with(&format!(":{}", server.port())),
+        "endpoint {endpoint} should point at fakecloud on port {}",
+        server.port()
+    );
+}
+
+/// A task definition that sets its own `AWS_ENDPOINT_URL` keeps it (the container may be pointed at
+/// something else on purpose, as a Lambda function may).
+#[tokio::test]
+async fn ecs_task_keeps_an_aws_endpoint_its_definition_sets() {
+    if !require_docker_or_skip("ecs_task_keeps_an_aws_endpoint_its_definition_sets") {
+        return;
+    }
+    let server = TestServer::start().await;
+    let messages = run_and_read_stdout(
+        &server,
+        "ep-own",
+        vec![KeyValuePair::builder()
+            .name("AWS_ENDPOINT_URL")
+            .value("http://example.invalid:9999")
+            .build()],
+        "echo ENDPOINT=${AWS_ENDPOINT_URL:-unset}",
+    )
+    .await;
+    assert_eq!(
+        endpoint_from(&messages),
+        "http://example.invalid:9999",
+        "the definition's own endpoint must be kept, got {messages:?}"
+    );
+}
