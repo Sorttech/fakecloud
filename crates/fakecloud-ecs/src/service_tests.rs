@@ -84,6 +84,8 @@ fn resolve_service_key_handles_short_and_long() {
             volume_configurations: vec![],
             service_connect_configuration: None,
             vpc_lattice_configurations: vec![],
+            events: vec![],
+            launch_throttle: Default::default(),
         },
     );
     // Long-form: cluster/service.
@@ -333,6 +335,8 @@ mod scheduler_reconcile {
             volume_configurations: vec![],
             service_connect_configuration: None,
             vpc_lattice_configurations: vec![],
+            events: vec![],
+            launch_throttle: Default::default(),
         }
     }
 
