@@ -902,3 +902,147 @@ async fn template_url_from_an_sse_kms_bucket_is_decrypted() {
         );
     }
 }
+
+/// A change set whose template holds a nested `AWS::CloudFormation::Stack`
+/// must execute. The nested-stack provisioner records the child stack in the
+/// CloudFormation state, so provisioning must not run while ExecuteChangeSet
+/// holds that state's write lock, or the request never returns.
+#[tokio::test]
+async fn execute_change_set_provisions_nested_stack() {
+    let server = TestServer::start().await;
+    let cf = server.cloudformation_client().await;
+    let s3 = server.s3_client().await;
+
+    let child = r#"{
+        "Resources": {
+            "ChildTopic": {
+                "Type": "AWS::SNS::Topic",
+                "Properties": {"TopicName": "cs-nested-child-topic"}
+            }
+        }
+    }"#;
+    s3.create_bucket()
+        .bucket("cfn-nested")
+        .send()
+        .await
+        .unwrap();
+    s3.put_object()
+        .bucket("cfn-nested")
+        .key("child.json")
+        .body(ByteStream::from(child.as_bytes().to_vec()))
+        .send()
+        .await
+        .unwrap();
+    let parent = r#"{
+        "Resources": {
+            "Child": {
+                "Type": "AWS::CloudFormation::Stack",
+                "Properties": {"TemplateURL": "https://s3.amazonaws.com/cfn-nested/child.json"}
+            }
+        }
+    }"#;
+
+    cf.create_change_set()
+        .stack_name("cs-nested-parent")
+        .change_set_name("nested-cs")
+        .change_set_type(ChangeSetType::Create)
+        .template_body(parent)
+        .send()
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        cf.execute_change_set()
+            .stack_name("cs-nested-parent")
+            .change_set_name("nested-cs")
+            .send(),
+    )
+    .await
+    .expect("ExecuteChangeSet returned")
+    .unwrap();
+
+    let status = helpers::wait_until(std::time::Duration::from_secs(60), || async {
+        let out = cf
+            .describe_stacks()
+            .stack_name("cs-nested-parent")
+            .send()
+            .await
+            .ok()?;
+        let s = out.stacks().first()?.stack_status()?.as_str().to_string();
+        (!s.ends_with("IN_PROGRESS")).then_some(s)
+    })
+    .await;
+    assert_eq!(status.as_deref(), Some("CREATE_COMPLETE"));
+}
+
+/// A change set whose resource fails to provision is still accepted: the call
+/// only starts the execution ("After the call successfully completes,
+/// CloudFormation starts updating the stack. Use the DescribeStacks action to
+/// view the status of the update.", ExecuteChangeSet API Reference). The
+/// failure is reported on the stack and the change set.
+#[tokio::test]
+async fn execute_change_set_reports_a_failed_resource_on_the_stack() {
+    let server = TestServer::start().await;
+    let cf = server.cloudformation_client().await;
+    let template = r#"{
+        "Resources": {
+            "BadSub": {
+                "Type": "AWS::SNS::Subscription",
+                "Properties": {
+                    "TopicArn": "arn:aws:sns:us-east-1:123456789012:no-such-topic",
+                    "Protocol": "sqs",
+                    "Endpoint": "arn:aws:sqs:us-east-1:123456789012:q1"
+                }
+            }
+        }
+    }"#;
+    let cs = cf
+        .create_change_set()
+        .stack_name("cs-failing-stack")
+        .change_set_name("failing")
+        .change_set_type(ChangeSetType::Create)
+        .template_body(template)
+        .send()
+        .await
+        .unwrap();
+    let cs_id = cs.id().expect("change set id").to_string();
+    cf.execute_change_set()
+        .change_set_name(&cs_id)
+        .send()
+        .await
+        .expect("ExecuteChangeSet accepts the change set");
+
+    let stack = helpers::wait_until(std::time::Duration::from_secs(60), || async {
+        let out = cf
+            .describe_stacks()
+            .stack_name("cs-failing-stack")
+            .send()
+            .await
+            .ok()?;
+        let s = out.stacks().first()?.clone();
+        (!s.stack_status()?.as_str().ends_with("IN_PROGRESS")).then_some(s)
+    })
+    .await
+    .expect("stack reached a terminal status");
+    assert_eq!(
+        stack.stack_status().map(|s| s.as_str()),
+        Some("ROLLBACK_COMPLETE")
+    );
+    assert!(
+        stack
+            .stack_status_reason()
+            .is_some_and(|r| r.contains("BadSub")),
+        "reason names the failed resource: {:?}",
+        stack.stack_status_reason()
+    );
+    let described = cf
+        .describe_change_set()
+        .change_set_name(&cs_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        described.execution_status().map(|s| s.as_str()),
+        Some("EXECUTE_FAILED")
+    );
+}

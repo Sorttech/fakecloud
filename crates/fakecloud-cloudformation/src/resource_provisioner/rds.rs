@@ -5,6 +5,13 @@
 
 use super::*;
 
+/// How long a stack op waits for a DB instance's backing container. AWS's
+/// handler allows 2160 minutes ("timeoutInMinutes": 2160 in
+/// aws-rds-dbinstance.json at the same commit as below), which means nothing
+/// for a local container. 15 minutes covers a cold image pull; raise it here
+/// if a slower engine image needs more.
+const RDS_CONTAINER_BACKING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
 impl ResourceProvisioner {
     // --- RDS ---
 
@@ -335,6 +342,94 @@ impl ResourceProvisioner {
             m.remove(physical_id);
         }
         Ok(())
+    }
+
+    /// Start the container backing a just-created DB instance and block until
+    /// the instance is `available`, so the stack's dependents, Outputs and
+    /// Exports read the real endpoint rather than the placeholder.
+    ///
+    /// AWS's own `AWS::RDS::DBInstance` handler does the same. Source,
+    /// fetched 2026-10-16 at commit 5a410e84:
+    /// https://github.com/aws-cloudformation/aws-cloudformation-resource-providers-rds/blob/master/aws-rds-dbinstance/src/main/java/software/amazon/rds/dbinstance/CreateHandler.java
+    /// follows `createDBInstance` with
+    /// ".stabilize((request, response, proxyInvocation, model, context) ->
+    /// isDBInstanceStabilizedAfterMutate(proxyInvocation, model, context))", and
+    /// https://github.com/aws-cloudformation/aws-cloudformation-resource-providers-rds/blob/master/aws-rds-dbinstance/src/main/java/software/amazon/rds/dbinstance/DBInstancePredicates.java
+    /// requires "isDBInstanceAvailable(dbInstance)", i.e.
+    /// "DBInstanceStatus.Available.equalsString(dbInstance.dbInstanceStatus())",
+    /// and fails a terminal status such as `failed` with
+    /// "DB Instance is in state: " + status. The handler then returns the model
+    /// from "new ReadHandler().handleRequest(...)", so the endpoint attributes
+    /// are read back from the available instance here too.
+    ///
+    /// The container start runs as its own task, so a timeout leaves it to
+    /// finish and reap itself once the rollback has removed the instance.
+    pub(super) fn stabilize_rds_db_instance(
+        &self,
+        resource: &mut StackResource,
+    ) -> Result<(), String> {
+        let identifier = resource.physical_id.as_str();
+        let Some(runtime) = self.rds_runtime.clone() else {
+            // Metadata-only: the instance was inserted `available`.
+            return Ok(());
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            // No runtime to wait on: leave the queued intent to the
+            // post-provision drain, as before.
+            return Ok(());
+        };
+        // Take over the spawn the create queued, so the post-provision drain
+        // does not start a second container for the same instance.
+        let queued = {
+            let mut spawns = self.pending_container_spawns.lock();
+            let before = spawns.len();
+            spawns.retain(|intent| {
+                !matches!(intent, ContainerSpawnIntent::RdsInstance { identifier: id } if id == identifier)
+            });
+            spawns.len() != before
+        };
+        if !queued {
+            return Ok(());
+        }
+
+        let boot = handle.spawn(fakecloud_rds::cfn_provision::cfn_ensure_instance_container(
+            self.rds_state.clone(),
+            runtime,
+            identifier.to_string(),
+            self.account_id.clone(),
+            self.region.clone(),
+        ));
+        match handle.block_on(tokio::time::timeout(RDS_CONTAINER_BACKING_TIMEOUT, boot)) {
+            Ok(Ok(())) => {}
+            Ok(Err(join_err)) => {
+                return Err(format!("DB Instance container start failed: {join_err}"));
+            }
+            Err(_) => {
+                return Err(format!(
+                    "DB Instance did not become available within {} minutes",
+                    RDS_CONTAINER_BACKING_TIMEOUT.as_secs() / 60
+                ));
+            }
+        }
+
+        let status = self
+            .rds_state
+            .read()
+            .get(&self.account_id)
+            .and_then(|st| st.instances.get(identifier))
+            .map(|inst| inst.db_instance_status.clone());
+        match status.as_deref() {
+            Some("available") => {
+                for attr in ["Endpoint.Address", "Endpoint.Port"] {
+                    if let Some(value) = self.get_att_rds_db_instance(identifier, attr) {
+                        resource.attributes.insert(attr.to_string(), value);
+                    }
+                }
+                Ok(())
+            }
+            Some(other) => Err(format!("DB Instance is in state: {other}")),
+            None => Err(format!("DB Instance {identifier} not found")),
+        }
     }
 
     /// Live `GetAtt` for `AWS::RDS::DBInstance`: the endpoint moves once a

@@ -1115,8 +1115,20 @@ pub struct ResourceProvisioner {
     /// synchronously. Set on the changeset/update/delete provisioners; left
     /// `false` for `CreateStack` (which already provisions off the request path
     /// in a detached task, so its synchronous invoke never blocks the client or
-    /// the state lock).
+    /// the state lock). A detached changeset/update provisioner
+    /// (`wait_for_container_backing`) still queues Deletes, which run as
+    /// cleanup after the update, but runs Create/Update inline so their `Data`
+    /// reaches dependents (see `send_custom_resource_event`).
     pub defer_custom_invokes: bool,
+    /// When `true`, `provision_stack_resources` and `apply_resource_updates`
+    /// wait after creating a container-backed resource until its container is
+    /// up (see `stabilize_resource`), so dependents, Outputs and Exports read
+    /// the real endpoint. Only set by a `CreateStack`, `ExecuteChangeSet` or
+    /// `UpdateStack` provisioning in a detached task (see
+    /// `provisions_detached`): the wait can last minutes, which must never
+    /// happen on a request path or under the state write lock (the #1539/#1730
+    /// timeout lesson).
+    pub wait_for_container_backing: bool,
     /// Fine-grained S3 disk store. Bucket create/delete (and bucket-policy
     /// updates) write through this so a CFN-provisioned bucket lands on disk,
     /// matching the real `CreateBucket`/`DeleteBucket` handlers. A
@@ -1235,6 +1247,12 @@ pub enum ContainerTeardownIntent {
     MskCluster { cluster_arn: String },
 }
 
+/// Whether `resource_type` is a custom resource, whose lifecycle a handler
+/// behind its `ServiceToken` owns.
+pub(crate) fn is_custom_resource_type(resource_type: &str) -> bool {
+    resource_type.starts_with("Custom::") || resource_type == "AWS::CloudFormation::CustomResource"
+}
+
 /// A queued custom-resource (`Custom::*`) Lambda invocation. Built by
 /// `create_custom_resource` / `delete_custom_resource` when
 /// `defer_custom_invokes` is set, drained and `tokio::spawn`ed off the request
@@ -1242,7 +1260,16 @@ pub enum ContainerTeardownIntent {
 #[derive(Debug, Clone)]
 pub struct CustomInvokeIntent {
     pub service_token: String,
+    pub logical_id: String,
+    /// The event's `RequestType`. A stack update treats a `Delete` (of a
+    /// resource the new template dropped) as cleanup, which cannot fail it.
+    pub request_type: &'static str,
     pub payload: String,
+    /// `RequestId` to wait for a `ResponseURL` signal under, when the event
+    /// carried a `ResponseURL` at all. `None` means no endpoint was reachable,
+    /// so no handler can signal and there is nothing to wait for -- the same
+    /// condition `await_custom_resource_signal` short-circuits on.
+    pub signal_request_id: Option<String>,
 }
 
 mod acm;
@@ -1268,6 +1295,7 @@ mod codepipeline;
 mod cognito;
 mod config;
 mod cwlogs;
+mod dynamic_references;
 mod dynamodb;
 mod ec2;
 mod ec2_network;
@@ -1365,6 +1393,22 @@ impl ResourceProvisioner {
             &self.region,
             service,
         )
+    }
+
+    /// Wait for a just-created resource to stabilize, as a CloudFormation
+    /// resource handler does after its create call returns. A no-op unless
+    /// `wait_for_container_backing` is set; then a container-backed resource
+    /// is only complete once its container is up, and its attributes are read
+    /// back afterwards. `Err` carries the reason the resource failed to
+    /// stabilize.
+    pub(crate) fn stabilize_resource(&self, resource: &mut StackResource) -> Result<(), String> {
+        if !self.wait_for_container_backing {
+            return Ok(());
+        }
+        match resource.resource_type.as_str() {
+            "AWS::RDS::DBInstance" => self.stabilize_rds_db_instance(resource),
+            _ => Ok(()),
+        }
     }
 
     /// Create a resource and return the StackResource with physical ID.
@@ -1740,9 +1784,7 @@ impl ResourceProvisioner {
             "AWS::AppConfig::ConfigurationProfile" => {
                 self.create_appconfig_configuration_profile(resource)
             }
-            t if t.starts_with("Custom::") || t == "AWS::CloudFormation::CustomResource" => self
-                .create_custom_resource(resource)
-                .map(ProvisionResult::new),
+            t if is_custom_resource_type(t) => self.create_custom_resource(resource),
             other if self.strict_unknown_types => {
                 // Cloud Control API path: reject a resource type fakecloud has
                 // no provisioner for instead of recording a phantom resource.
@@ -1772,8 +1814,7 @@ impl ResourceProvisioner {
             }
         };
 
-        let is_custom = resource.resource_type.starts_with("Custom::")
-            || resource.resource_type == "AWS::CloudFormation::CustomResource";
+        let is_custom = is_custom_resource_type(&resource.resource_type);
         let service_token = if is_custom {
             resource
                 .properties
@@ -1790,6 +1831,7 @@ impl ResourceProvisioner {
             resource_type: resource.resource_type.clone(),
             status: "CREATE_COMPLETE".to_string(),
             service_token,
+            properties: is_custom.then(|| resource.properties.clone()),
             attributes: res.attributes,
             deletion_policy: resource.deletion_policy.clone(),
             update_replace_policy: resource.update_replace_policy.clone(),
@@ -2243,6 +2285,12 @@ impl ResourceProvisioner {
             "AWS::EC2::InternetGateway" => {
                 Some(self.update_ec2_internet_gateway(existing, new_def)?)
             }
+            // A custom resource is updated by its handler, never replaced by
+            // fakecloud: a Delete + Create would tell the handler to destroy
+            // what it manages. See `update_custom_resource`.
+            t if is_custom_resource_type(t) => {
+                Some(self.update_custom_resource(existing, new_def)?)
+            }
             // No dedicated in-place update arm for this type. Real
             // CloudFormation, lacking an in-place mutator for a changed
             // property, falls back to REPLACEMENT: it deletes the old backing
@@ -2260,6 +2308,8 @@ impl ResourceProvisioner {
             resource_type: existing.resource_type.clone(),
             status: "UPDATE_COMPLETE".to_string(),
             service_token: existing.service_token.clone(),
+            properties: is_custom_resource_type(&existing.resource_type)
+                .then(|| new_def.properties.clone()),
             attributes: res.attributes,
             // Carry the new template's policies onto the updated record.
             deletion_policy: new_def.deletion_policy.clone(),
@@ -3218,9 +3268,7 @@ impl ResourceProvisioner {
             "AWS::AppConfig::ConfigurationProfile" => {
                 self.delete_appconfig_configuration_profile(&resource.physical_id)
             }
-            t if t.starts_with("Custom::") || t == "AWS::CloudFormation::CustomResource" => {
-                self.delete_custom_resource(resource)
-            }
+            t if is_custom_resource_type(t) => self.delete_custom_resource(resource),
             // No provisioner for this type — it was recorded with no backing
             // state at create time (see `create_resource`), so there is nothing
             // to delete. Succeed so stack teardown isn't blocked.
@@ -3499,6 +3547,14 @@ impl ResourceProvisioner {
 
     // --- Organizations ---
 
+    /// The id a deferred invoke waits for its handler's signal under, or `None`
+    /// when no `ResponseURL` was attached for the handler to PUT to.
+    fn signal_request_id(&self, request_id: &str) -> Option<String> {
+        self.custom_resource_response_base
+            .as_ref()
+            .map(|_| request_id.to_string())
+    }
+
     /// Add the `ResponseURL` a handler signals its outcome to.
     ///
     /// Omitted entirely, rather than set to null, when there is no reachable
@@ -3518,9 +3574,12 @@ impl ResourceProvisioner {
     /// No signal is not a failure: handlers predating `cfn-response`, and any
     /// handler invoked without a reachable `ResponseURL`, never send one, and
     /// failing those would break stacks that work today.
-    fn await_custom_resource_signal(&self, request_id: &str) -> Result<(), String> {
+    fn await_custom_resource_signal(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<crate::custom_resource_response::CustomResourceSignal>, String> {
         if self.custom_resource_response_base.is_none() {
-            return Ok(());
+            return Ok(None);
         }
         match self
             .custom_resource_responses
@@ -3530,11 +3589,48 @@ impl ResourceProvisioner {
                 "Custom resource failed: {}",
                 signal.failure_reason()
             )),
-            _ => Ok(()),
+            signal => Ok(signal),
         }
     }
 
-    fn invoke_lambda_sync(&self, function_arn: &str, payload: &str) -> Result<(), String> {
+    /// Whether a custom-resource Lambda's response says it failed, and why.
+    ///
+    /// A handler that raises does not fail the invocation: the runtime returns
+    /// 200 with an error payload (`errorMessage`/`errorType`), the same shape
+    /// `Invoke` reports via `FunctionError`. Treating that as success is how a
+    /// custom resource that did nothing still reached CREATE_COMPLETE, which is
+    /// a state real CloudFormation cannot reach — there the resource signals
+    /// FAILED, or never signals and the stack times out.
+    ///
+    /// Also honours an explicit `{"Status": "FAILED", "Reason": ...}` body, the
+    /// shape cfn-response sends, for handlers that return it rather than PUT it.
+    pub(crate) fn custom_resource_failure(response: &[u8]) -> Option<String> {
+        let body: serde_json::Value = serde_json::from_slice(response).ok()?;
+        if let Some(message) = body.get("errorMessage").and_then(|v| v.as_str()) {
+            let kind = body
+                .get("errorType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unhandled");
+            return Some(format!("{kind}: {message}"));
+        }
+        if body
+            .get("Status")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("FAILED"))
+        {
+            return Some(
+                body.get("Reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("custom resource reported FAILED")
+                    .to_string(),
+            );
+        }
+        None
+    }
+
+    /// Invoke `function_arn` and return its response body (empty when no
+    /// Lambda delivery is configured).
+    fn invoke_lambda_sync(&self, function_arn: &str, payload: &str) -> Result<Vec<u8>, String> {
         let delivery = self.delivery.clone();
         let function_arn = function_arn.to_string();
         let payload = payload.to_string();
@@ -3546,12 +3642,23 @@ impl ResourceProvisioner {
                     .map_err(|e| format!("Failed to create runtime: {e}"))?;
                 rt.block_on(async {
                     match delivery.invoke_lambda(&function_arn, &payload).await {
-                        Some(Ok(_)) => {
+                        Some(Ok(response)) => {
+                            // A handler that raised still returns 200; the error
+                            // is in the body. Reporting that as success is how a
+                            // custom resource that did nothing reached
+                            // CREATE_COMPLETE.
+                            if let Some(reason) = Self::custom_resource_failure(&response) {
+                                tracing::warn!(
+                                    "Custom resource Lambda {} failed: {reason}",
+                                    function_arn
+                                );
+                                return Err(format!("Custom resource failed: {reason}"));
+                            }
                             tracing::info!(
                                 "Custom resource Lambda {} invoked successfully",
                                 function_arn
                             );
-                            Ok(())
+                            Ok(response)
                         }
                         Some(Err(e)) => {
                             tracing::warn!(
@@ -3565,7 +3672,7 @@ impl ResourceProvisioner {
                                 "No Lambda delivery configured; skipping custom resource invocation for {}",
                                 function_arn
                             );
-                            Ok(())
+                            Ok(Vec::new())
                         }
                     }
                 })
@@ -3575,7 +3682,10 @@ impl ResourceProvisioner {
         })
     }
 
-    fn create_custom_resource(&self, resource: &ResourceDefinition) -> Result<String, String> {
+    fn create_custom_resource(
+        &self,
+        resource: &ResourceDefinition,
+    ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
         let service_token = props
             .get("ServiceToken")
@@ -3594,28 +3704,133 @@ impl ResourceProvisioner {
             "LogicalResourceId": resource.logical_id,
             "ResourceProperties": stringify_resource_properties(props),
         });
-
-        let mut event = event;
-        self.attach_response_url(&mut event, &request_id);
-        let payload = serde_json::to_string(&event).map_err(|e| e.to_string())?;
-        if self.defer_custom_invokes {
-            // Changeset/update path: queue the invoke so the caller runs it off
-            // the request path after the state write lock is dropped. The Lambda
-            // response is not consumed for `GetAtt` (the physical id is generated
-            // below regardless), so deferring loses nothing.
-            self.pending_custom_invokes.lock().push(CustomInvokeIntent {
-                service_token: service_token.to_string(),
-                payload,
-            });
-        } else {
-            self.invoke_lambda_sync(service_token, &payload)?;
-            self.await_custom_resource_signal(&request_id)?;
-        }
+        let data = self.send_custom_resource_event(
+            service_token,
+            &resource.logical_id,
+            "Create",
+            event,
+            &request_id,
+        )?;
 
         // Physical resource ID: use a generated ID (the Lambda could return one,
         // but for simplicity we generate one here).
         let physical_id = format!("{}-{}", resource.logical_id, &request_id[..8]);
-        Ok(physical_id)
+        Ok(ProvisionResult::new(physical_id).merge_attributes(data))
+    }
+
+    /// Send the handler an Update for a property change, keeping the physical
+    /// id: a custom resource is updated by its handler, not replaced.
+    ///
+    /// AWS CloudFormation User Guide, "CloudFormation custom resource request
+    /// and response reference" (docs.aws.amazon.com/AWSCloudFormation/latest/
+    /// UserGuide/crpg-ref.html, checked 2026-10-16): "When the template
+    /// developer makes changes to the properties of a custom resource within
+    /// the template and updates the stack, CloudFormation sends a request to
+    /// the custom resource provider with RequestType set to Update." Update
+    /// requests carry `PhysicalResourceId`, `ResourceProperties` and
+    /// `OldResourceProperties`: "The resource property values that were
+    /// previously declared by the template developer in the CloudFormation
+    /// template."
+    ///
+    /// The template reference for `AWS::CloudFormation::CustomResource` says of
+    /// `ServiceToken` "Updates aren't supported", and CloudFormation fails such
+    /// an update with "Modifying service token is not allowed." (reported in
+    /// github.com/cloudcomponents/cdk-constructs/issues/197).
+    fn update_custom_resource(
+        &self,
+        existing: &StackResource,
+        new_def: &ResourceDefinition,
+    ) -> Result<ProvisionResult, String> {
+        let props = &new_def.properties;
+        let service_token = props
+            .get("ServiceToken")
+            .and_then(|v| v.as_str())
+            .ok_or("Custom resource requires ServiceToken property")?;
+        if existing
+            .service_token
+            .as_deref()
+            .is_some_and(|old| old != service_token)
+        {
+            return Err("Modifying service token is not allowed.".to_string());
+        }
+
+        let request_id = Uuid::new_v4().to_string();
+        let event = serde_json::json!({
+            "RequestType": "Update",
+            "ServiceToken": service_token,
+            "StackId": self.stack_id,
+            "RequestId": request_id,
+            "ResourceType": new_def.resource_type,
+            "LogicalResourceId": new_def.logical_id,
+            "PhysicalResourceId": existing.physical_id,
+            "ResourceProperties": stringify_resource_properties(props),
+            // A record from before properties were stored has none to send.
+            "OldResourceProperties": existing
+                .properties
+                .as_ref()
+                .map_or_else(|| serde_json::json!({}), stringify_resource_properties),
+        });
+        let data = self.send_custom_resource_event(
+            service_token,
+            &new_def.logical_id,
+            "Update",
+            event,
+            &request_id,
+        )?;
+        Ok(ProvisionResult::new(existing.physical_id.clone()).merge_attributes(data))
+    }
+
+    /// Invoke a Create or Update handler and return its response `Data`, or
+    /// queue it under `defer_custom_invokes`, and turn a failure into a
+    /// resource failure.
+    ///
+    /// CloudFormation "sends a request to the specified service token, and then
+    /// waits for a response before proceeding with the stack operation", and
+    /// "The template developer can retrieve that data by using the Fn::GetAtt
+    /// function" (User Guide, "Create custom provisioning logic with custom
+    /// resources", https://docs.aws.amazon.com/AWSCloudFormation/latest/
+    /// UserGuide/template-custom-resources.html, checked 2026-10-19). So the
+    /// invoke has to finish before a dependent resolves its `Fn::GetAtt`, which
+    /// is why a detached provisioner invokes here rather than queueing.
+    ///
+    /// The `Data` comes from the `ResponseURL` signal, or, for a handler that
+    /// returns its response instead of PUTting it, from the invoke result, as
+    /// `custom_resource_failure` already reads a returned FAILED.
+    fn send_custom_resource_event(
+        &self,
+        service_token: &str,
+        logical_id: &str,
+        request_type: &'static str,
+        mut event: serde_json::Value,
+        request_id: &str,
+    ) -> Result<BTreeMap<String, String>, String> {
+        self.attach_response_url(&mut event, request_id);
+        let payload = serde_json::to_string(&event).map_err(|e| e.to_string())?;
+        // A detached provisioner (`wait_for_container_backing`) runs on a
+        // blocking thread without the state lock, like CreateStack's, so it can
+        // wait for the handler. Only an inline one, under the lock, queues.
+        if self.defer_custom_invokes && !self.wait_for_container_backing {
+            // Queue the invoke so the caller runs it off the request path after
+            // the state write lock is dropped. Its `Data` arrives too late for
+            // any `Fn::GetAtt`; a template holding a custom resource provisions
+            // detached on the server (`provisions_detached`), so only a
+            // current-thread runtime (unit tests) gets here for a Create/Update.
+            self.pending_custom_invokes.lock().push(CustomInvokeIntent {
+                service_token: service_token.to_string(),
+                logical_id: logical_id.to_string(),
+                request_type,
+                payload,
+                signal_request_id: self.signal_request_id(request_id),
+            });
+            return Ok(BTreeMap::new());
+        }
+        let returned = self.invoke_lambda_sync(service_token, &payload)?;
+        Ok(match self.await_custom_resource_signal(request_id)? {
+            Some(signal) => signal.data,
+            None => serde_json::from_slice(&returned)
+                .map(|body| crate::custom_resource_response::response_data(&body))
+                .unwrap_or_default(),
+        })
     }
 
     fn delete_custom_resource(&self, resource: &StackResource) -> Result<(), String> {
@@ -3629,7 +3844,7 @@ impl ResourceProvisioner {
 
         let request_id = Uuid::new_v4().to_string();
 
-        let event = serde_json::json!({
+        let mut event = serde_json::json!({
             "RequestType": "Delete",
             "ServiceToken": service_token,
             "StackId": self.stack_id,
@@ -3638,8 +3853,14 @@ impl ResourceProvisioner {
             "LogicalResourceId": resource.logical_id,
             "PhysicalResourceId": resource.physical_id,
         });
-
-        let mut event = event;
+        // Delete requests carry `ResourceProperties` too (crpg-ref.html, see
+        // `update_custom_resource`); CDK's handlers read it unconditionally
+        // and fail "Missing key 'ResourceProperties'" without it. A record
+        // from before properties were stored omits the field, which the
+        // reference marks optional.
+        if let Some(props) = &resource.properties {
+            event["ResourceProperties"] = stringify_resource_properties(props);
+        }
         self.attach_response_url(&mut event, &request_id);
         let payload = serde_json::to_string(&event).map_err(|e| e.to_string())?;
 
@@ -3648,7 +3869,10 @@ impl ResourceProvisioner {
             // caller runs it off the request path after the lock is dropped.
             self.pending_custom_invokes.lock().push(CustomInvokeIntent {
                 service_token,
+                logical_id: resource.logical_id.clone(),
+                request_type: "Delete",
                 payload,
+                signal_request_id: self.signal_request_id(&request_id),
             });
         } else if let Err(e) = self.invoke_lambda_sync(&service_token, &payload) {
             // Best-effort: don't fail stack deletion if Lambda invocation fails
@@ -4565,6 +4789,7 @@ mod tests {
             custom_resource_responses: Default::default(),
             custom_resource_response_base: None,
             defer_custom_invokes: false,
+            wait_for_container_backing: false,
             s3_store: Arc::new(fakecloud_persistence::s3::MemoryS3Store::new()),
             kms_hook: None,
             quota_provider: None,
@@ -6949,6 +7174,143 @@ mod tests {
         assert!(result.is_ok());
         let sr = result.unwrap();
         assert_eq!(sr.resource_type, "AWS::CloudFormation::CustomResource");
+    }
+
+    /// A property change sends the handler one Update carrying the old and new
+    /// properties, not a Delete and a Create, and the later Delete carries the
+    /// properties too.
+    #[test]
+    fn custom_resource_property_change_sends_an_update_event() {
+        let mut prov = make_provisioner();
+        prov.defer_custom_invokes = true;
+        let token = "arn:aws:lambda:us-east-1:123456789012:function:my-func";
+        let created = prov
+            .create_resource(&make_resource(
+                "Custom::Thing",
+                "C",
+                serde_json::json!({"ServiceToken": token, "Version": "1"}),
+            ))
+            .unwrap();
+        prov.pending_custom_invokes.lock().clear();
+
+        let updated = prov
+            .update_resource(
+                &created,
+                &make_resource(
+                    "Custom::Thing",
+                    "C",
+                    serde_json::json!({"ServiceToken": token, "Version": "2"}),
+                ),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.physical_id, created.physical_id);
+        let events = take_custom_events(&prov);
+        assert_eq!(events.len(), 1, "{events:#?}");
+        let update = &events[0];
+        assert_eq!(update["RequestType"], "Update");
+        assert_eq!(update["ServiceToken"], token);
+        assert_eq!(update["PhysicalResourceId"], created.physical_id.as_str());
+        assert_eq!(update["ResourceProperties"]["Version"], "2");
+        assert_eq!(update["OldResourceProperties"]["Version"], "1");
+
+        prov.delete_resource(&updated).unwrap();
+        let events = take_custom_events(&prov);
+        assert_eq!(events[0]["RequestType"], "Delete");
+        assert_eq!(events[0]["ResourceProperties"]["Version"], "2");
+    }
+
+    /// Update and Delete stringify their properties as Create does; CDK's
+    /// bucket deployment calls `.lower()` on `Prune` in every request type.
+    #[test]
+    fn custom_resource_update_and_delete_stringify_properties() {
+        let mut prov = make_provisioner();
+        prov.defer_custom_invokes = true;
+        let token = "arn:aws:lambda:us-east-1:123456789012:function:my-func";
+        let created = prov
+            .create_resource(&make_resource(
+                "Custom::Thing",
+                "C",
+                serde_json::json!({"ServiceToken": token, "Prune": false}),
+            ))
+            .unwrap();
+        prov.pending_custom_invokes.lock().clear();
+
+        let updated = prov
+            .update_resource(
+                &created,
+                &make_resource(
+                    "Custom::Thing",
+                    "C",
+                    serde_json::json!({"ServiceToken": token, "Prune": true}),
+                ),
+            )
+            .unwrap()
+            .unwrap();
+        let events = take_custom_events(&prov);
+        assert_eq!(events[0]["ResourceProperties"]["Prune"], "true");
+        assert_eq!(events[0]["OldResourceProperties"]["Prune"], "false");
+
+        prov.delete_resource(&updated).unwrap();
+        let events = take_custom_events(&prov);
+        assert_eq!(events[0]["ResourceProperties"]["Prune"], "true");
+    }
+
+    #[test]
+    fn custom_resource_service_token_change_is_refused() {
+        let mut prov = make_provisioner();
+        prov.defer_custom_invokes = true;
+        let created = prov
+            .create_resource(&make_resource(
+                "Custom::Thing",
+                "C",
+                serde_json::json!({"ServiceToken": "arn:aws:lambda:us-east-1:123456789012:function:a"}),
+            ))
+            .unwrap();
+        prov.pending_custom_invokes.lock().clear();
+
+        let err = prov
+            .update_resource(
+                &created,
+                &make_resource(
+                    "Custom::Thing",
+                    "C",
+                    serde_json::json!({"ServiceToken": "arn:aws:lambda:us-east-1:123456789012:function:b"}),
+                ),
+            )
+            .unwrap_err();
+        assert_eq!(err, "Modifying service token is not allowed.");
+        assert!(take_custom_events(&prov).is_empty());
+    }
+
+    /// A detached changeset/update provisioner runs a Create inline, so its
+    /// `Data` exists before a dependent resolves `Fn::GetAtt`, but still queues
+    /// a Delete, which is cleanup after the update succeeded.
+    #[test]
+    fn a_detached_deferred_provisioner_invokes_create_inline_and_queues_delete() {
+        let mut prov = make_provisioner();
+        prov.defer_custom_invokes = true;
+        prov.wait_for_container_backing = true;
+        let created = prov
+            .create_resource(&make_resource(
+                "Custom::Thing",
+                "C",
+                serde_json::json!({"ServiceToken": "arn:aws:lambda:us-east-1:123456789012:function:a"}),
+            ))
+            .unwrap();
+        assert!(take_custom_events(&prov).is_empty());
+
+        prov.delete_resource(&created).unwrap();
+        let events = take_custom_events(&prov);
+        assert_eq!(events.len(), 1, "{events:#?}");
+        assert_eq!(events[0]["RequestType"], "Delete");
+    }
+
+    fn take_custom_events(prov: &ResourceProvisioner) -> Vec<serde_json::Value> {
+        std::mem::take(&mut *prov.pending_custom_invokes.lock())
+            .iter()
+            .map(|i| serde_json::from_str(&i.payload).unwrap())
+            .collect()
     }
 
     // ── Resource create/delete lifecycle tests ──
@@ -9922,6 +10284,7 @@ mod tests {
             resource_type: "AWS::Made::Up".to_string(),
             status: "CREATE_COMPLETE".to_string(),
             service_token: None,
+            properties: None,
             attributes: BTreeMap::new(),
             deletion_policy: None,
             update_replace_policy: None,
@@ -9941,6 +10304,7 @@ mod tests {
             resource_type: "AWS::SNS::Topic".to_string(),
             status: "CREATE_COMPLETE".to_string(),
             service_token: None,
+            properties: None,
             attributes: {
                 let mut m = BTreeMap::new();
                 m.insert("TopicArn".to_string(), "captured-arn".to_string());
@@ -10153,6 +10517,7 @@ mod tests {
             resource_type: "AWS::WAFv2::WebACL".to_string(),
             status: "CREATE_COMPLETE".to_string(),
             service_token: None,
+            properties: None,
             attributes: BTreeMap::new(),
             deletion_policy: None,
             update_replace_policy: None,
@@ -10185,6 +10550,7 @@ mod tests {
             resource_type: "AWS::WAFv2::IPSet".to_string(),
             status: "CREATE_COMPLETE".to_string(),
             service_token: None,
+            properties: None,
             attributes: BTreeMap::new(),
             deletion_policy: None,
             update_replace_policy: None,
@@ -10216,6 +10582,7 @@ mod tests {
             resource_type: "AWS::WAFv2::RegexPatternSet".to_string(),
             status: "CREATE_COMPLETE".to_string(),
             service_token: None,
+            properties: None,
             attributes: BTreeMap::new(),
             deletion_policy: None,
             update_replace_policy: None,
@@ -10249,6 +10616,7 @@ mod tests {
             resource_type: "AWS::WAFv2::RuleGroup".to_string(),
             status: "CREATE_COMPLETE".to_string(),
             service_token: None,
+            properties: None,
             attributes: BTreeMap::new(),
             deletion_policy: None,
             update_replace_policy: None,
@@ -10380,6 +10748,7 @@ mod tests {
             resource_type: "AWS::SES::ConfigurationSet".to_string(),
             status: "CREATE_COMPLETE".to_string(),
             service_token: None,
+            properties: None,
             attributes: BTreeMap::new(),
             deletion_policy: None,
             update_replace_policy: None,
@@ -10409,6 +10778,7 @@ mod tests {
             resource_type: "AWS::SES::EmailIdentity".to_string(),
             status: "CREATE_COMPLETE".to_string(),
             service_token: None,
+            properties: None,
             attributes: BTreeMap::new(),
             deletion_policy: None,
             update_replace_policy: None,
@@ -10445,6 +10815,7 @@ mod tests {
             resource_type: "AWS::SES::Template".to_string(),
             status: "CREATE_COMPLETE".to_string(),
             service_token: None,
+            properties: None,
             attributes: BTreeMap::new(),
             deletion_policy: None,
             update_replace_policy: None,
@@ -10478,6 +10849,7 @@ mod tests {
             resource_type: "AWS::SES::ContactList".to_string(),
             status: "CREATE_COMPLETE".to_string(),
             service_token: None,
+            properties: None,
             attributes: BTreeMap::new(),
             deletion_policy: None,
             update_replace_policy: None,
@@ -10504,6 +10876,7 @@ mod tests {
             resource_type: "AWS::SES::DedicatedIpPool".to_string(),
             status: "CREATE_COMPLETE".to_string(),
             service_token: None,
+            properties: None,
             attributes: BTreeMap::new(),
             deletion_policy: None,
             update_replace_policy: None,
@@ -10530,6 +10903,7 @@ mod tests {
             resource_type: "AWS::SES::ReceiptRuleSet".to_string(),
             status: "CREATE_COMPLETE".to_string(),
             service_token: None,
+            properties: None,
             attributes: BTreeMap::new(),
             deletion_policy: None,
             update_replace_policy: None,
@@ -10631,6 +11005,7 @@ mod tests {
                     logical_id: "MyWg".to_string(),
                     status: "CREATE_COMPLETE".to_string(),
                     service_token: None,
+                    properties: None,
                     attributes: BTreeMap::new(),
                     deletion_policy: None,
                     update_replace_policy: None,
@@ -12737,5 +13112,55 @@ mod resource_property_tests {
     fn a_float_keeps_its_value() {
         let out = stringify_resource_properties(&serde_json::json!({"Ratio": 1.5}));
         assert_eq!(out["Ratio"], "1.5");
+    }
+}
+
+#[cfg(test)]
+mod custom_resource_response_tests {
+    use super::ResourceProvisioner;
+
+    #[test]
+    fn a_raised_handler_is_a_failure() {
+        // What the runtime returns when the handler throws: a 200 whose body
+        // carries the error. Previously treated as success.
+        let payload = br#"{"errorMessage":"Could not connect to the endpoint URL","errorType":"EndpointConnectionError"}"#;
+        let reason = ResourceProvisioner::custom_resource_failure(payload).expect("failure");
+        assert!(reason.contains("EndpointConnectionError"), "{reason}");
+        assert!(reason.contains("Could not connect"), "{reason}");
+    }
+
+    #[test]
+    fn an_explicit_failed_status_is_a_failure() {
+        let payload = br#"{"Status":"FAILED","Reason":"bucket not empty"}"#;
+        assert_eq!(
+            ResourceProvisioner::custom_resource_failure(payload).as_deref(),
+            Some("bucket not empty")
+        );
+    }
+
+    #[test]
+    fn a_successful_response_is_not_a_failure() {
+        for payload in [
+            &br#"{"Status":"SUCCESS","PhysicalResourceId":"abc"}"#[..],
+            &br#"{"Data":{"Key":"value"}}"#[..],
+            &b"null"[..],
+            &b""[..],
+        ] {
+            assert_eq!(
+                ResourceProvisioner::custom_resource_failure(payload),
+                None,
+                "{}",
+                String::from_utf8_lossy(payload)
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_json_response_is_not_treated_as_a_failure() {
+        // Don't invent failures out of a body we cannot parse.
+        assert_eq!(
+            ResourceProvisioner::custom_resource_failure(b"not json at all"),
+            None
+        );
     }
 }

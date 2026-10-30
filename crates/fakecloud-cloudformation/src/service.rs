@@ -18,7 +18,8 @@ use fakecloud_sqs::SharedSqsState;
 use fakecloud_ssm::SharedSsmState;
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::resource_provisioner::ResourceProvisioner;
+use crate::custom_resource_response::SharedCustomResourceResponses;
+use crate::resource_provisioner::{CustomInvokeIntent, ResourceProvisioner};
 use crate::state;
 use crate::state::{
     CloudFormationSnapshot, CloudFormationState, RegionalAccounts, SharedCloudFormationState,
@@ -475,8 +476,28 @@ pub(crate) fn provision_stack_resources(
                 )
             })?;
 
-            match provisioner.create_resource(&resolved_def) {
+            match provisioner
+                .resolve_dynamic_references(resolved_def)
+                .and_then(|def| provisioner.create_resource(&def))
+            {
                 Ok(mut stack_resource) => {
+                    // The resource exists, so a failure to stabilize is
+                    // final, not a dependency to retry: roll it back with
+                    // everything created before it.
+                    if let Err(err) = provisioner.stabilize_resource(&mut stack_resource) {
+                        resources.push(stack_resource);
+                        for r in &resources {
+                            let _ = provisioner.delete_resource(r);
+                        }
+                        return Err(AwsServiceError::aws_error(
+                            StatusCode::BAD_REQUEST,
+                            "ValidationError",
+                            format!(
+                                "Failed to create resource {}: {err}",
+                                resource_def.logical_id
+                            ),
+                        ));
+                    }
                     physical_ids.insert(
                         stack_resource.logical_id.clone(),
                         stack_resource.physical_id.clone(),
@@ -517,7 +538,10 @@ pub(crate) fn provision_stack_resources(
                 imports,
             )
             .unwrap_or_else(|_| resource_def.clone());
-            let err = provisioner.create_resource(&resolved_def).unwrap_err();
+            let err = provisioner
+                .resolve_dynamic_references(resolved_def)
+                .and_then(|def| provisioner.create_resource(&def))
+                .unwrap_err();
             for r in &resources {
                 let _ = provisioner.delete_resource(r);
             }
@@ -568,6 +592,7 @@ fn reconstruct_stack_resource(
         resource_type: type_name.to_string(),
         status: "CREATE_COMPLETE".to_string(),
         service_token: None,
+        properties: None,
         attributes: attributes.clone(),
         // Cloud Control has no CloudFormation DeletionPolicy concept.
         deletion_policy: None,
@@ -679,8 +704,8 @@ pub struct CloudFormationDeps {
 pub struct CloudFormationService {
     pub(crate) state: SharedCloudFormationState,
     pub(crate) deps: CloudFormationDeps,
-    snapshot_store: Option<Arc<dyn SnapshotStore>>,
-    snapshot_lock: Arc<AsyncMutex<()>>,
+    pub(crate) snapshot_store: Option<Arc<dyn SnapshotStore>>,
+    pub(crate) snapshot_lock: Arc<AsyncMutex<()>>,
     /// Fine-grained S3 disk store. CFN bucket create/delete writes through this
     /// (the same path the real `CreateBucket`/`DeleteBucket` use) instead of
     /// only mutating the in-memory map, so a CFN-provisioned bucket survives a
@@ -1208,38 +1233,351 @@ impl ContainerBackingHandles {
     }
 }
 
-/// Drain a provisioner's queued custom-resource Lambda invokes (`Custom::*`),
-/// running each off the request path in a detached task so a cold image pull
-/// never blocks the client or stalls the CFN state lock. Used by the
-/// changeset/update/delete paths (where `defer_custom_invokes` is set).
-pub(crate) fn spawn_custom_invokes(provisioner: &ResourceProvisioner) {
-    let intents = std::mem::take(&mut *provisioner.pending_custom_invokes.lock());
-    if intents.is_empty() {
-        return;
-    }
-    let delivery = provisioner.delivery.clone();
+/// Run a drained batch of custom-resource invokes to completion, reporting the
+/// first failure.
+///
+/// The synchronous arm of `create_custom_resource` checks two things the
+/// deferred arm used to skip entirely: the invoke response, because a handler
+/// that raises still returns 200 with the error in its body, and the
+/// `ResponseURL` signal, because `cfn-response` reports FAILED out of band.
+/// Skipping both is how a changeset-provisioned custom resource that failed
+/// still produced a CREATE_COMPLETE stack.
+///
+/// A `Delete` here is for a resource the new template dropped. CloudFormation
+/// removes those in UPDATE_COMPLETE_CLEANUP_IN_PROGRESS, after the update has
+/// succeeded ("In this state, the stack has been updated and is usable, but
+/// CloudFormation is still deleting the old resources", User Guide, "Stack
+/// status codes", checked 2026-10-16), so its failure is logged and does not
+/// fail the update.
+pub(crate) async fn run_custom_invokes(
+    delivery: &Arc<DeliveryBus>,
+    responses: &SharedCustomResourceResponses,
+    intents: Vec<CustomInvokeIntent>,
+) -> Result<(), String> {
     for intent in intents {
-        let delivery = delivery.clone();
-        tokio::spawn(async move {
-            match delivery
-                .invoke_lambda(&intent.service_token, &intent.payload)
-                .await
+        match run_custom_invoke(delivery, responses, &intent).await {
+            Err(msg) if intent.request_type == "Delete" => tracing::warn!(
+                "Custom resource cleanup delete for {} failed: {msg}",
+                intent.logical_id
+            ),
+            Err(msg) => return Err(msg),
+            Ok(()) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Invoke one queued handler and wait for its `ResponseURL` signal.
+async fn run_custom_invoke(
+    delivery: &Arc<DeliveryBus>,
+    responses: &SharedCustomResourceResponses,
+    intent: &CustomInvokeIntent,
+) -> Result<(), String> {
+    invoke_custom_resource(delivery, intent).await?;
+
+    // The handler PUTs its signal before returning, but the PUT can still
+    // be in flight as the invoke response comes back; wait the same 5s the
+    // synchronous arm does. `wait_for` parks the thread, so it goes to a
+    // blocking pool rather than a tokio worker.
+    let Some(request_id) = intent.signal_request_id.clone() else {
+        return Ok(());
+    };
+    let responses = responses.clone();
+    let signal = tokio::task::spawn_blocking(move || {
+        responses.wait_for(&request_id, std::time::Duration::from_secs(5))
+    })
+    .await
+    .map_err(|e| format!("custom resource signal wait failed: {e}"))?;
+    // No signal is not a failure: a handler that never uses `cfn-response`
+    // never sends one (`await_custom_resource_signal`).
+    match signal {
+        Some(signal) if signal.failed() => Err(format!(
+            "Custom resource failed: {}",
+            signal.failure_reason()
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Everything the custom-resource settle task needs, as an owned struct so it
+/// can move into a detached `tokio::spawn`. Mirrors `CreateStackContext`.
+pub(crate) struct CustomResourceSettleContext {
+    pub state: SharedCloudFormationState,
+    pub snapshot_store: Option<Arc<dyn SnapshotStore>>,
+    pub snapshot_lock: Arc<AsyncMutex<()>>,
+    pub delivery: Arc<DeliveryBus>,
+    pub responses: SharedCustomResourceResponses,
+    pub intents: Vec<CustomInvokeIntent>,
+    pub account_id: String,
+    /// The region the stack lives in.
+    pub region: String,
+    pub stack_id: String,
+    pub stack_name: String,
+    /// The change set being executed, whose `ExecutionStatus` the outcome
+    /// settles. `None` for `UpdateStack`.
+    pub change_set_id: Option<String>,
+    /// SNS topics told the terminal status. Empty for `ExecuteChangeSet`,
+    /// which sends no stack notifications.
+    pub notification_arns: Vec<String>,
+    /// The status the stack op left the stack at. The settle task only
+    /// flips a stack still there, so it cannot clobber a delete or a newer
+    /// execution that moved the stack on while the handlers ran.
+    pub in_progress: &'static str,
+    pub complete: &'static str,
+    pub failed: &'static str,
+}
+
+/// Run a stack op's deferred custom-resource invokes, then flip the stack to
+/// its terminal status.
+///
+/// `ExecuteChangeSet` and `UpdateStack` hold the stack at `*_IN_PROGRESS`
+/// while these are outstanding, because a custom resource's outcome is part of
+/// whether the stack succeeded -- real CloudFormation keeps the stack
+/// `*_IN_PROGRESS` until every custom resource signals, and rolls it back when
+/// one signals FAILED.
+pub(crate) async fn settle_custom_resources(ctx: CustomResourceSettleContext) {
+    let CustomResourceSettleContext {
+        state,
+        snapshot_store,
+        snapshot_lock,
+        delivery,
+        responses,
+        intents,
+        account_id,
+        region,
+        stack_id,
+        stack_name,
+        change_set_id,
+        notification_arns,
+        in_progress,
+        complete,
+        failed,
+    } = ctx;
+
+    let outcome = run_custom_invokes(&delivery, &responses, intents).await;
+    let (status, reason) = match &outcome {
+        Ok(()) => (complete, None),
+        Err(msg) => (failed, Some(msg.as_str())),
+    };
+
+    {
+        let mut accounts = state.write();
+        let Some(st) = accounts.regional_get_mut(&account_id, &region) else {
+            tracing::warn!(
+                "stack {stack_name}'s region {region} is gone before its custom \
+                 resources settled; not recording their outcome ({status})"
+            );
+            return;
+        };
+        let Some(stack) = st
+            .stacks
+            .values_mut()
+            .find(|s| s.stack_id == stack_id && s.status == in_progress)
+        else {
+            tracing::warn!(
+                "stack {stack_name} moved on before its custom resources settled; \
+                 not recording their outcome ({status})"
+            );
+            return;
+        };
+        stack.status = status.to_string();
+        stack.status_reason = reason.map(str::to_string);
+        stack.updated_at = Some(Utc::now());
+        if reason.is_some() {
+            // A rolled-back stack publishes no outputs, so it must not keep
+            // exporting the ones the stack op registered from them.
+            stack.outputs.clear();
+            CloudFormationService::sync_exports_imports(st, &stack_id, &stack_name, &[], &[]);
+        }
+        record_stack_status_event_with_reason(
+            st,
+            &stack_id,
+            &stack_name,
+            "AWS::CloudFormation::Stack",
+            status,
+            reason,
+        );
+        if let Some(e) = change_set_id
+            .as_ref()
+            .and_then(|id| st.extras.get_mut("change_sets").and_then(|m| m.get_mut(id)))
+        {
+            e["ExecutionStatus"] = serde_json::json!(if reason.is_some() {
+                "EXECUTE_FAILED"
+            } else {
+                "EXECUTE_COMPLETE"
+            });
+        }
+    }
+
+    CloudFormationService::send_stack_notification(
+        &delivery,
+        &notification_arns,
+        &stack_name,
+        &stack_id,
+        status,
+    );
+    save_snapshot_static(state, snapshot_store, snapshot_lock).await;
+}
+
+/// Everything a `DeleteStack` of a stack holding custom resources needs, moved
+/// into a detached `tokio::spawn`.
+pub(crate) struct StackDeleteContext {
+    pub state: SharedCloudFormationState,
+    pub snapshot_store: Option<Arc<dyn SnapshotStore>>,
+    pub snapshot_lock: Arc<AsyncMutex<()>>,
+    pub snapshot_hooks: BTreeMap<&'static str, SnapshotHook>,
+    pub provisioner: ResourceProvisioner,
+    pub handles: ContainerBackingHandles,
+    /// The stack's resources, in creation order.
+    pub resources: Vec<StackResource>,
+    pub deleted_types: Vec<String>,
+    pub account_id: String,
+    pub region: String,
+    pub stack_id: String,
+    pub stack_name: String,
+    pub notification_arns: Vec<String>,
+}
+
+/// Delete a stack holding custom resources, awaiting each handler's Delete,
+/// then finish the delete or leave the stack DELETE_FAILED.
+///
+/// Resources go in reverse creation order, so a custom resource's Delete runs
+/// while the handler Lambda it depends on still exists. A Delete that fails
+/// stops the delete there: "DELETE_FAILED: Unsuccessful deletion of one or
+/// more stacks. Because the delete failed, you might have some resources that
+/// are still running" (User Guide, "Stack status codes", checked 2026-10-16).
+/// The stack keeps the failed resource and every one not yet deleted, so a
+/// retried `DeleteStack` picks up where this one stopped.
+pub(crate) async fn delete_stack_resources(ctx: StackDeleteContext) {
+    let StackDeleteContext {
+        state,
+        snapshot_store,
+        snapshot_lock,
+        snapshot_hooks,
+        provisioner,
+        handles,
+        mut resources,
+        deleted_types,
+        account_id,
+        region,
+        stack_id,
+        stack_name,
+        notification_arns,
+    } = ctx;
+
+    let mut failure = None;
+    while let Some(resource) = resources.pop() {
+        let _ = provisioner.delete_resource_respecting_policy(&resource);
+        let intents = std::mem::take(&mut *provisioner.pending_custom_invokes.lock());
+        for intent in intents {
+            if let Err(msg) = run_custom_invoke(
+                &provisioner.delivery,
+                &provisioner.custom_resource_responses,
+                &intent,
+            )
+            .await
             {
-                Some(Ok(_)) => {
-                    tracing::info!(
-                        "Custom resource Lambda {} invoked successfully",
-                        intent.service_token
-                    );
-                }
-                Some(Err(e)) => {
-                    tracing::warn!(
-                        "Custom resource Lambda {} invocation failed: {e}",
-                        intent.service_token
-                    );
-                }
-                None => {}
+                failure = Some(msg);
             }
-        });
+        }
+        if failure.is_some() {
+            resources.push(resource);
+            break;
+        }
+    }
+    // Reap the backing containers of whatever was deleted, as the synchronous
+    // path in `delete_stack` does.
+    handles.spawn_teardown_intents(std::mem::take(
+        &mut *provisioner.pending_container_teardowns.lock(),
+    ));
+    persist_touched_services(&snapshot_hooks, deleted_types).await;
+
+    let status = if failure.is_some() {
+        "DELETE_FAILED"
+    } else {
+        "DELETE_COMPLETE"
+    };
+    {
+        let mut accounts = state.write();
+        let Some(st) = accounts.regional_get_mut(&account_id, &region) else {
+            tracing::warn!(
+                "stack {stack_name}'s region {region} is gone before its delete \
+                 settled; not recording the outcome ({status})"
+            );
+            return;
+        };
+        let Some(stack) = st
+            .stacks
+            .values_mut()
+            .find(|s| s.stack_id == stack_id && s.status == "DELETE_IN_PROGRESS")
+        else {
+            tracing::warn!(
+                "stack {stack_name} moved on before its delete settled; \
+                 not recording the outcome ({status})"
+            );
+            return;
+        };
+        match &failure {
+            None => CloudFormationService::finish_stack_delete(st, &stack_id, &stack_name),
+            Some(reason) => {
+                stack.status = status.to_string();
+                stack.status_reason = Some(reason.clone());
+                stack.resources = resources;
+                record_stack_status_event_with_reason(
+                    st,
+                    &stack_id,
+                    &stack_name,
+                    "AWS::CloudFormation::Stack",
+                    status,
+                    Some(reason),
+                );
+            }
+        }
+    }
+
+    CloudFormationService::send_stack_notification(
+        &provisioner.delivery,
+        &notification_arns,
+        &stack_name,
+        &stack_id,
+        status,
+    );
+    save_snapshot_static(state, snapshot_store, snapshot_lock).await;
+}
+
+/// Invoke one queued handler and turn its response into a resource outcome.
+/// The async twin of `ResourceProvisioner::invoke_lambda_sync`.
+async fn invoke_custom_resource(
+    delivery: &Arc<DeliveryBus>,
+    intent: &CustomInvokeIntent,
+) -> Result<(), String> {
+    match delivery
+        .invoke_lambda(&intent.service_token, &intent.payload)
+        .await
+    {
+        Some(Ok(response)) => {
+            if let Some(reason) = ResourceProvisioner::custom_resource_failure(&response) {
+                tracing::warn!(
+                    "Custom resource Lambda {} failed: {reason}",
+                    intent.service_token
+                );
+                return Err(format!("Custom resource failed: {reason}"));
+            }
+            tracing::info!(
+                "Custom resource Lambda {} invoked successfully",
+                intent.service_token
+            );
+            Ok(())
+        }
+        Some(Err(e)) => {
+            tracing::warn!(
+                "Custom resource Lambda {} invocation failed: {e}",
+                intent.service_token
+            );
+            Err(format!("Lambda invocation failed: {e}"))
+        }
+        // No delivery configured: nothing ran, so nothing failed.
+        None => Ok(()),
     }
 }
 
@@ -1424,6 +1762,8 @@ impl CloudFormationService {
             // flip this on (see `provisioner_deferred`) to queue the invoke and
             // drain it off the request path instead.
             defer_custom_invokes: false,
+            // Only a detached stack op turns this on (`provisions_detached`).
+            wait_for_container_backing: false,
             s3_store: self.s3_store.clone(),
             kms_hook: self.kms_hook.clone(),
             quota_provider: self.quota_provider.clone(),
@@ -1543,12 +1883,42 @@ impl CloudFormationService {
         persist_touched_services(&self.snapshot_hooks, [type_name.to_string()]).await;
     }
 
-    /// Build a provisioner for the changeset/update/delete paths, which run
-    /// inside the request rather than in a detached `CreateStack` task. These
-    /// queue custom-resource Lambda invokes (`defer_custom_invokes`) so a cold
-    /// image pull never blocks the client past its read timeout or stalls every
-    /// other CFN op behind the state write lock; the caller drains and
-    /// `tokio::spawn`s the queued invokes after dropping the lock.
+    /// Whether a stack op provisioning `resource_defs` must run in a detached
+    /// task with `wait_for_container_backing` on, because provisioning waits on
+    /// something that can take minutes:
+    ///
+    /// - a container-backed DB instance is only created once its container is
+    ///   up (see `stabilize_rds_db_instance`);
+    /// - a custom resource's handler is invoked, and awaited, before any
+    ///   resource that depends on it, so `Fn::GetAtt` reads its response
+    ///   `Data` (see `send_custom_resource_event`). The invoke can cold-pull an
+    ///   image for minutes.
+    ///
+    /// Only on a multi-thread runtime (the server); unit tests run
+    /// current-thread.
+    pub(crate) fn provisions_detached(
+        &self,
+        resource_defs: &[template::ResourceDefinition],
+    ) -> bool {
+        let waits = resource_defs.iter().any(|r| {
+            crate::resource_provisioner::is_custom_resource_type(&r.resource_type)
+                || (r.resource_type == "AWS::RDS::DBInstance" && self.deps.rds_runtime.is_some())
+        });
+        waits
+            && matches!(
+                tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
+                Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+            )
+    }
+
+    /// Build a provisioner for the changeset/update/delete paths, which can run
+    /// inside the request rather than in a detached task. These queue
+    /// custom-resource Lambda invokes (`defer_custom_invokes`) so a cold image
+    /// pull never blocks the client past its read timeout or stalls every other
+    /// CFN op behind the state write lock; the caller drains and `tokio::spawn`s
+    /// the queued invokes after dropping the lock. A changeset/update holding a
+    /// custom resource runs detached (`provisions_detached`), where only
+    /// Deletes stay queued.
     pub(crate) fn provisioner_deferred(
         &self,
         stack_id: &str,
@@ -2163,7 +2533,7 @@ impl CloudFormationService {
             );
         }
 
-        let ctx = CreateStackContext {
+        let mut ctx = CreateStackContext {
             state: self.state.clone(),
             delivery: self.deps.delivery.clone(),
             snapshot_store: self.snapshot_store.clone(),
@@ -2194,17 +2564,10 @@ impl CloudFormationService {
         // we keep provisioning inline for them: CreateStack returns with the
         // stack already CREATE_COMPLETE, matching long-standing client
         // expectations that the stack's resources/outputs are queryable as
-        // soon as CreateStack returns. The async branch only triggers on a
-        // multi-thread runtime (the server); unit tests run current-thread.
-        let has_custom_resource = ctx.resource_defs.iter().any(|r| {
-            r.resource_type.starts_with("Custom::")
-                || r.resource_type == "AWS::CloudFormation::CustomResource"
-        });
-        let multi_thread = matches!(
-            tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
-            Ok(tokio::runtime::RuntimeFlavor::MultiThread)
-        );
-        if has_custom_resource && multi_thread {
+        // soon as CreateStack returns. See `provisions_detached`.
+        if self.provisions_detached(&ctx.resource_defs) {
+            // Off the request path, so provisioning may wait for containers.
+            ctx.provisioner.wait_for_container_backing = true;
             // Emit the IN_PROGRESS lifecycle notification only on the async
             // path — AWS sends it before the terminal CREATE_COMPLETE. The
             // inline path provisions instantly and sends only CREATE_COMPLETE,
@@ -2257,6 +2620,7 @@ impl CloudFormationService {
         // into spawn_blocking, so the post-provision drain (below) can back
         // freshly-inserted container resources with REAL containers.
         let container_spawns = provisioner.pending_container_spawns.clone();
+        let container_teardowns = provisioner.pending_container_teardowns.clone();
         let backing_handles = ContainerBackingHandles::from_provisioner(&provisioner)
             .with_snapshot_hooks(&snapshot_hooks);
 
@@ -2294,6 +2658,11 @@ impl CloudFormationService {
         let resources = match provisioned {
             Ok(resources) => resources,
             Err(reason) => {
+                // The rollback removed the records; reap any containers that
+                // were already started for them (a DB instance that failed to
+                // stabilize, or one created before the failing resource).
+                backing_handles
+                    .spawn_teardown_intents(std::mem::take(&mut *container_teardowns.lock()));
                 Self::mark_create_failed(
                     &state,
                     &delivery,
@@ -2489,6 +2858,15 @@ impl CloudFormationService {
             let stack = state.live_stack_mut(&stack_name);
 
             if let Some(stack) = stack {
+                // A delete still waiting on its custom resources is already
+                // under way; deleting again would send their handlers a second
+                // Delete.
+                if stack.status == "DELETE_IN_PROGRESS" {
+                    return Ok(AwsResponse::xml(
+                        StatusCode::OK,
+                        xml_responses::delete_stack_response(&req.request_id),
+                    ));
+                }
                 let stack_id = stack.stack_id.clone();
                 let stack_name_for_notif = stack.name.clone();
                 let notification_arns = stack.notification_arns.clone();
@@ -2571,76 +2949,77 @@ impl CloudFormationService {
                 let provisioner =
                     self.provisioner_deferred(&stack_id, &req.account_id, &req.region);
 
-                // Delete resources in reverse order, honoring each resource's
-                // DeletionPolicy (Retain/Snapshot leaves the physical resource
-                // in place instead of destroying it).
-                for resource in resources.iter().rev() {
-                    let _ = provisioner.delete_resource_respecting_policy(resource);
-                }
+                let handles = ContainerBackingHandles::from_provisioner(&provisioner)
+                    .with_snapshot_hooks(&self.snapshot_hooks);
 
-                // Reap the REAL backing containers for the deleted container
-                // resources (RDS / ElastiCache / ECS / ASG-EC2) off the request
-                // path, so a stack delete does not leak running containers (the
-                // create-side #2031-#2034 hardening reaching the delete path).
-                // Each delete_resource above only removed the in-memory record.
-                // The snapshot hooks let the detached teardown persist the EC2
-                // records it terminates, which this stack op has already
-                // serialized as still running.
-                ContainerBackingHandles::from_provisioner(&provisioner)
-                    .with_snapshot_hooks(&self.snapshot_hooks)
-                    .spawn_teardown_intents(std::mem::take(
+                // A custom resource's Delete runs its handler, which decides
+                // whether the stack is deleted at all and can take minutes on a
+                // cold image pull, and the handler Lambda (usually in this same
+                // stack) must outlive it. So such a stack is deleted in a
+                // detached task that awaits each handler in turn, and stays
+                // DELETE_IN_PROGRESS until it settles.
+                if resources.iter().any(|r| r.service_token.is_some()) {
+                    let mut accounts = self.state.write();
+                    if let Some(stack) = accounts
+                        .regional_get_mut(&req.account_id, &req.region)
+                        .and_then(|state| {
+                            state.stacks.values_mut().find(|s| s.stack_id == stack_id)
+                        })
+                    {
+                        stack.status = "DELETE_IN_PROGRESS".to_string();
+                        stack.status_reason = None;
+                    }
+                    drop(accounts);
+                    tokio::spawn(delete_stack_resources(StackDeleteContext {
+                        state: self.state.clone(),
+                        snapshot_store: self.snapshot_store.clone(),
+                        snapshot_lock: self.snapshot_lock.clone(),
+                        snapshot_hooks: self.snapshot_hooks.clone(),
+                        provisioner,
+                        handles,
+                        resources,
+                        deleted_types: std::mem::take(&mut deleted_types),
+                        account_id: req.account_id.clone(),
+                        region: req.region.clone(),
+                        stack_id,
+                        stack_name: stack_name_for_notif,
+                        notification_arns,
+                    }));
+                } else {
+                    // Delete resources in reverse order, honoring each resource's
+                    // DeletionPolicy (Retain/Snapshot leaves the physical resource
+                    // in place instead of destroying it).
+                    for resource in resources.iter().rev() {
+                        let _ = provisioner.delete_resource_respecting_policy(resource);
+                    }
+
+                    // Reap the REAL backing containers for the deleted container
+                    // resources (RDS / ElastiCache / ECS / ASG-EC2) off the request
+                    // path, so a stack delete does not leak running containers (the
+                    // create-side #2031-#2034 hardening reaching the delete path).
+                    // Each delete_resource above only removed the in-memory record.
+                    // The snapshot hooks let the detached teardown persist the EC2
+                    // records it terminates, which this stack op has already
+                    // serialized as still running.
+                    handles.spawn_teardown_intents(std::mem::take(
                         &mut *provisioner.pending_container_teardowns.lock(),
                     ));
-                spawn_custom_invokes(&provisioner);
 
-                // Re-acquire the write lock to update stack status
-                let mut accounts = self.state.write();
-                if let Some(state) = accounts.regional_get_mut(&req.account_id, &req.region) {
-                    if let Some(stack) = state.stacks.values_mut().find(|s| s.stack_id == stack_id)
-                    {
-                        stack.status = "DELETE_COMPLETE".to_string();
-                        // The reason belonged to the previous status (a failed
-                        // create/update); carrying it into DELETE_COMPLETE would
-                        // report a stale failure on a cleanly deleted stack.
-                        stack.status_reason = None;
-                        stack.resources.clear();
-                        stack.outputs.clear();
-                        // A deleted stack's policy goes with it; a later stack
-                        // of the same name starts without one. Only when this
-                        // call deleted the stack: a concurrent delete may have
-                        // finished first and the name been reused since.
-                        state.stack_policies.remove(&stack_name_for_notif);
+                    // Re-acquire the write lock to update stack status
+                    let mut accounts = self.state.write();
+                    if let Some(state) = accounts.regional_get_mut(&req.account_id, &req.region) {
+                        Self::finish_stack_delete(state, &stack_id, &stack_name_for_notif);
                     }
-                    // Drop this stack's exports + import-consumer entries.
-                    let stale_exports: Vec<String> = state
-                        .exports
-                        .iter()
-                        .filter(|(_, e)| e.exporting_stack_name == stack_name_for_notif)
-                        .map(|(k, _)| k.clone())
-                        .collect();
-                    for k in stale_exports {
-                        state.exports.remove(&k);
-                    }
-                    for entries in state.imports.values_mut() {
-                        entries.retain(|s| s != &stack_name_for_notif);
-                    }
-                    state.imports.retain(|_, v| !v.is_empty());
-                    // A stack's change sets go with it. Left behind, they would
-                    // still answer DescribeChangeSet, and a re-created stack of
-                    // the same name would find them by name.
-                    if let Some(change_sets) = state.extras.get_mut("change_sets") {
-                        change_sets.retain(|_, v| v["StackId"].as_str() != Some(stack_id.as_str()));
-                    }
+                    drop(accounts);
+
+                    Self::send_stack_notification(
+                        &self.deps.delivery,
+                        &notification_arns,
+                        &stack_name_for_notif,
+                        &stack_id,
+                        "DELETE_COMPLETE",
+                    );
                 }
-                drop(accounts);
-
-                Self::send_stack_notification(
-                    &self.deps.delivery,
-                    &notification_arns,
-                    &stack_name_for_notif,
-                    &stack_id,
-                    "DELETE_COMPLETE",
-                );
             }
         }
 
@@ -2653,6 +3032,48 @@ impl CloudFormationService {
             StatusCode::OK,
             xml_responses::delete_stack_response(&req.request_id),
         ))
+    }
+
+    /// Mark a stack DELETE_COMPLETE and drop everything that goes with it.
+    pub(crate) fn finish_stack_delete(
+        state: &mut CloudFormationState,
+        stack_id: &str,
+        stack_name: &str,
+    ) {
+        if let Some(stack) = state.stacks.values_mut().find(|s| s.stack_id == stack_id) {
+            stack.status = "DELETE_COMPLETE".to_string();
+            // The reason belonged to the previous status (a failed
+            // create/update); carrying it into DELETE_COMPLETE would
+            // report a stale failure on a cleanly deleted stack.
+            stack.status_reason = None;
+            stack.resources.clear();
+            stack.outputs.clear();
+            // A deleted stack's policy goes with it; a later stack
+            // of the same name starts without one. Only when this
+            // call deleted the stack: a concurrent delete may have
+            // finished first and the name been reused since.
+            state.stack_policies.remove(stack_name);
+        }
+        // Drop this stack's exports + import-consumer entries.
+        let stale_exports: Vec<String> = state
+            .exports
+            .iter()
+            .filter(|(_, e)| e.exporting_stack_name == stack_name)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in stale_exports {
+            state.exports.remove(&k);
+        }
+        for entries in state.imports.values_mut() {
+            entries.retain(|s| s != stack_name);
+        }
+        state.imports.retain(|_, v| !v.is_empty());
+        // A stack's change sets go with it. Left behind, they would
+        // still answer DescribeChangeSet, and a re-created stack of
+        // the same name would find them by name.
+        if let Some(change_sets) = state.extras.get_mut("change_sets") {
+            change_sets.retain(|_, v| v["StackId"].as_str() != Some(stack_id));
+        }
     }
 
     fn describe_stacks(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
@@ -2804,7 +3225,6 @@ impl CloudFormationService {
         } else {
             resolved_stack_name.clone()
         };
-        let resources_before_update: Vec<StackResource>;
 
         let unknown_previous = Self::refill_use_previous_values(
             &Self::get_all_params(req),
@@ -2882,29 +3302,29 @@ impl CloudFormationService {
         // flipping it to UPDATE_COMPLETE would make a stack that was never
         // created look updated, and the later ExecuteChangeSet would then
         // report UPDATE_* where it owes CREATE_*.
-        let in_review = !found_stack_id.is_empty() && {
+        //
+        // The same goes for a stack still being created or updated: an update
+        // applied on top of one in progress would race it. The hold below
+        // checks again under the write lock.
+        let in_progress = if found_stack_id.is_empty() {
+            None
+        } else {
             let accounts = self.state.read();
             accounts
                 .regional(&req.account_id, &req.region)
-                .is_some_and(|s| {
-                    s.stacks.values().any(|st| {
-                        st.stack_id == found_stack_id && st.status == "REVIEW_IN_PROGRESS"
+                .and_then(|s| {
+                    s.stacks.values().find(|st| {
+                        st.stack_id == found_stack_id && st.status.ends_with("_IN_PROGRESS")
                     })
                 })
+                .map(|st| st.status.clone())
         };
-        if in_review {
+        if let Some(status) = in_progress {
             // Skipping the metadata branch is not enough: the normal path
             // would also land on UPDATE_COMPLETE, since the shell has no
             // resources to diff. A stack that only ever existed as a change-set
             // shell has not been created, so an update on it is invalid.
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "ValidationError",
-                format!(
-                    "Stack [{}] is in REVIEW_IN_PROGRESS state and can not be updated.",
-                    input.stack_name
-                ),
-            ));
+            return Err(stack_in_progress_error(&input.stack_name, &status));
         }
         // Only for a stack that actually reached a successful state. A stack
         // left in a failure state would otherwise report UPDATE_COMPLETE and
@@ -3136,12 +3556,14 @@ impl CloudFormationService {
             )?;
         }
 
-        // `provisioner_deferred`: apply_resource_updates runs inside the state
-        // write lock below; a synchronous custom-resource Lambda invoke there
-        // would stall every other CFN op behind the lock and could block the
-        // client past its read timeout. Queue those invokes and drain them off
-        // the request path after the lock is dropped.
-        let provisioner = self.provisioner_deferred(&found_stack_id, &req.account_id, &req.region);
+        // `provisioner_deferred`: an inline update provisions inside the
+        // request, where a synchronous custom-resource Lambda invoke could block
+        // the client past its read timeout. Queue those invokes and settle them
+        // off the request path.
+        let mut provisioner =
+            self.provisioner_deferred(&found_stack_id, &req.account_id, &req.region);
+        let detached = self.provisions_detached(&parsed.resources);
+        provisioner.wait_for_container_backing = detached;
 
         // Cross-stack exports for `Fn::ImportValue` in resource properties (1.5).
         // Computed before the write lock (collect_account_imports takes a read
@@ -3153,13 +3575,153 @@ impl CloudFormationService {
             Some(&input.stack_name),
         );
 
+        let stack_name = input.stack_name.clone();
+        let parsed_resources = parsed.resources;
+        let run = UpdateStackRun {
+            account_id: req.account_id.clone(),
+            region: req.region.clone(),
+            request_id: req.request_id.clone(),
+            input,
+            description: parsed.description,
+            provisioner: Arc::new(provisioner),
+            found_stack_id,
+            export_owner_name,
+            previous_template,
+            previous_parameters,
+            imported_names,
+        };
+        // Real CloudFormation returns at once and updates in the background:
+        // "After the call completes successfully, the stack update starts. You
+        // can check the status of the stack through the DescribeStacks action."
+        // (UpdateStack, CloudFormation API Reference,
+        // https://docs.aws.amazon.com/AWSCloudFormation/latest/APIReference/API_UpdateStack.html,
+        // checked 2026-10-19). A DB instance's container or a custom resource's
+        // handler can take minutes, so hold the stack at UPDATE_IN_PROGRESS and
+        // provision in a detached task.
+        //
+        // Inline or detached, provisioning runs on a copy of the stack without
+        // the state lock: the nested-stack provisioner takes that lock to
+        // record its child stack, so provisioning under it never returned.
+        let held = self
+            .state
+            .write()
+            .regional_get_mut(&req.account_id, &req.region)
+            .and_then(|state| {
+                let stack = state.live_stack_mut(&stack_name)?;
+                // Another update or change set took the stack since the check
+                // above.
+                if stack.status.ends_with("_IN_PROGRESS") {
+                    return Some(Err(stack_in_progress_error(&stack_name, &stack.status)));
+                }
+                stack.status = "UPDATE_IN_PROGRESS".to_string();
+                stack.status_reason = None;
+                let stack = stack.clone();
+                record_stack_status_event(
+                    state,
+                    &stack.stack_id,
+                    &stack.name,
+                    "AWS::CloudFormation::Stack",
+                    "UPDATE_IN_PROGRESS",
+                );
+                Some(Ok(stack))
+            })
+            .transpose()?;
+        // Gone since the checks above: answer as for a stack that was never
+        // there (see the synthetic-success note in `finish_update_stack`).
+        let Some(stack) = held else {
+            return Ok(missing_stack_update_response(
+                &run.found_stack_id,
+                &run.account_id,
+                &run.region,
+                &run.input.stack_name,
+                &run.request_id,
+            ));
+        };
+        let resource_defs = parsed_resources;
+        if !detached {
+            let applied = apply_resource_updates_unlocked(
+                stack,
+                run.provisioner.clone(),
+                resource_defs,
+                run.input.template_body.clone(),
+                run.input.parameters.clone(),
+                imports,
+            )
+            .await;
+            return self.finish_update_stack(run, applied).await;
+        }
+        Self::send_stack_notification(
+            &self.deps.delivery,
+            &stack.notification_arns,
+            &stack.name,
+            &stack.stack_id,
+            "UPDATE_IN_PROGRESS",
+        );
+        let stack_id = stack.stack_id.clone();
+        let svc = self.clone();
+        tokio::spawn(async move {
+            let applied = apply_resource_updates_unlocked(
+                stack,
+                run.provisioner.clone(),
+                resource_defs,
+                run.input.template_body.clone(),
+                run.input.parameters.clone(),
+                imports,
+            )
+            .await;
+            if let Err(err) = svc.finish_update_stack(run, applied).await {
+                tracing::warn!(%stack_name, "UpdateStack failed: {}", err.message());
+            }
+            // What the request handler persists after an inline update (see
+            // `handle`).
+            svc.save_snapshot().await;
+        });
+        Ok(AwsResponse::xml(
+            StatusCode::OK,
+            xml_responses::update_stack_response(&stack_id, &req.request_id),
+        ))
+    }
+
+    /// Provision an update into its stack and record the outcome: the stack's
+    /// terminal status, events, container backing, Outputs and Exports, and
+    /// the notification.
+    ///
+    /// `applied` is the result of `apply_resource_updates_unlocked`, run with
+    /// the stack held at UPDATE_IN_PROGRESS.
+    async fn finish_update_stack(
+        &self,
+        run: UpdateStackRun,
+        applied: UnlockedUpdate,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let UpdateStackRun {
+            account_id,
+            region,
+            request_id,
+            input,
+            description,
+            provisioner,
+            found_stack_id,
+            export_owner_name,
+            previous_template,
+            previous_parameters,
+            imported_names,
+        } = run;
+        let resources_before_update: Vec<StackResource>;
+
         // All `RwLockWriteGuard` work happens inside this block so the (non-Send)
         // guard is released before the persist `.await` below, keeping the
         // handler future `Send`. The block yields everything the post-lock tail
         // needs, including the resource types touched by the update.
-        let (touched_types, stack_id, stack_name_for_notif, notification_arns, resources_snapshot) = {
+        let (
+            touched_types,
+            stack_id,
+            stack_name_for_notif,
+            notification_arns,
+            resources_snapshot,
+            deferred,
+        ) = {
             let mut accounts = self.state.write();
-            let state = accounts.regional_get_mut(&req.account_id, &req.region);
+            let state = accounts.regional_get_mut(&account_id, &region);
             // UpdateStack declares only `InsufficientCapabilitiesException` and
             // `TokenAlreadyExistsException` -- neither describes a missing stack.
             // Real AWS returns `ValidationError` for this case, but that wire
@@ -3172,48 +3734,57 @@ impl CloudFormationService {
                 .as_ref()
                 .is_some_and(|state| state.live_stack(&input.stack_name).is_some());
             let Some(state) = state.filter(|_| stack_exists) else {
-                let stack_id = if found_stack_id.is_empty() {
-                    format!(
-                        "arn:{}:cloudformation:{}:{}:stack/{}/{}",
-                        partition_for(&req.region),
-                        req.region,
-                        req.account_id,
-                        input.stack_name,
-                        uuid::Uuid::new_v4()
-                    )
-                } else {
-                    found_stack_id.clone()
-                };
-                return Ok(AwsResponse::xml(
-                    StatusCode::OK,
-                    xml_responses::update_stack_response(&stack_id, &req.request_id),
+                return Ok(missing_stack_update_response(
+                    &found_stack_id,
+                    &account_id,
+                    &region,
+                    &input.stack_name,
+                    &request_id,
                 ));
             };
-            let (update_result, stack_id, stack_name_owned, resources_snapshot, notification_arns) = {
+            let (
+                update_result,
+                stack_id,
+                stack_name_owned,
+                resources_snapshot,
+                notification_arns,
+                deferred,
+            ) = {
                 let stack = state
                     .live_stack_mut(&input.stack_name)
                     .expect("stack existence checked above");
 
-                stack.status = "UPDATE_IN_PROGRESS".to_string();
                 // Captured before the update rewrites it, so the
                 // export-collision rollback below can put back a resource list
                 // that matches the template it restores.
                 resources_before_update = stack.resources.clone();
-                let update_result = apply_resource_updates(
-                    stack,
-                    &parsed.resources,
-                    &input.template_body,
-                    &input.parameters,
-                    &provisioner,
-                    &imports,
-                );
+                // Only a stack still held at the status the request set is
+                // this update's to finish; anything else moved it on (a
+                // delete, say) while the resources provisioned.
+                if stack.status != "UPDATE_IN_PROGRESS" {
+                    return Err(AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "ValidationError",
+                        format!("Stack [{}] moved on during the update", input.stack_name),
+                    ));
+                }
+                let update_result = applied.write_back(stack);
 
                 let stack_id = stack.stack_id.clone();
                 let stack_name_owned = stack.name.clone();
+                // Custom-resource invokes were queued rather than run
+                // (`provisioner_deferred`), so their outcome is not known yet
+                // and it decides whether the update succeeded. Hold the stack
+                // UPDATE_IN_PROGRESS and let the settle task below flip it, as
+                // `ExecuteChangeSet` does. A failed update returns before the
+                // queue is used, so its invokes are dropped.
+                let deferred = std::mem::take(&mut *provisioner.pending_custom_invokes.lock());
                 stack.status = if update_result.is_err() {
                     "UPDATE_ROLLBACK_COMPLETE".to_string()
-                } else {
+                } else if deferred.is_empty() {
                     "UPDATE_COMPLETE".to_string()
+                } else {
+                    "UPDATE_IN_PROGRESS".to_string()
                 };
                 stack.status_reason = update_result.as_ref().err().map(ToString::to_string);
                 stack.updated_at = Some(Utc::now());
@@ -3228,7 +3799,7 @@ impl CloudFormationService {
                     if !input.tags.is_empty() {
                         stack.tags = input.tags;
                     }
-                    stack.description = parsed.description;
+                    stack.description = description;
                     if !input.notification_arns.is_empty() {
                         stack.notification_arns = input.notification_arns.clone();
                     }
@@ -3240,17 +3811,12 @@ impl CloudFormationService {
                     stack_name_owned,
                     stack.resources.clone(),
                     stack.notification_arns.clone(),
+                    deferred,
                 )
             };
 
             // Emit lifecycle events (now that the &mut Stack borrow is dropped).
-            record_stack_status_event(
-                state,
-                &stack_id,
-                &stack_name_owned,
-                "AWS::CloudFormation::Stack",
-                "UPDATE_IN_PROGRESS",
-            );
+            // UPDATE_IN_PROGRESS was recorded when the request held the stack.
             let update_result = match update_result {
                 Ok(changes) => {
                     // Capture every service touched by the update (created,
@@ -3269,13 +3835,15 @@ impl CloudFormationService {
                         );
                     }
                     record_stack_events(state, &stack_id, &stack_name_owned, &changes);
-                    record_stack_status_event(
-                        state,
-                        &stack_id,
-                        &stack_name_owned,
-                        "AWS::CloudFormation::Stack",
-                        "UPDATE_COMPLETE",
-                    );
+                    if deferred.is_empty() {
+                        record_stack_status_event(
+                            state,
+                            &stack_id,
+                            &stack_name_owned,
+                            "AWS::CloudFormation::Stack",
+                            "UPDATE_COMPLETE",
+                        );
+                    }
                     Ok(touched_types)
                 }
                 Err(e) => {
@@ -3301,6 +3869,13 @@ impl CloudFormationService {
                 Ok(types) => types,
                 Err(error_msg) => {
                     drop(accounts);
+                    // Reap the container of a DB instance that failed to
+                    // stabilize (its record is already gone).
+                    ContainerBackingHandles::from_provisioner(&provisioner)
+                        .with_snapshot_hooks(&self.snapshot_hooks)
+                        .spawn_teardown_intents(std::mem::take(
+                            &mut *provisioner.pending_container_teardowns.lock(),
+                        ));
                     Self::send_stack_notification(
                         &self.deps.delivery,
                         &notification_arns,
@@ -3308,10 +3883,15 @@ impl CloudFormationService {
                         &stack_id,
                         "UPDATE_FAILED",
                     );
-                    return Err(AwsServiceError::aws_error(
-                        StatusCode::BAD_REQUEST,
-                        "InsufficientCapabilitiesException",
-                        error_msg,
+                    // The failure is the stack's to report, as
+                    // UPDATE_ROLLBACK_COMPLETE with the reason recorded above:
+                    // the call only starts the update ("You can check the
+                    // status of the stack through the DescribeStacks action.",
+                    // UpdateStack API Reference).
+                    tracing::warn!(stack = %stack_name_for_notif, "UpdateStack failed: {error_msg}");
+                    return Ok(AwsResponse::xml(
+                        StatusCode::OK,
+                        xml_responses::update_stack_response(&stack_id, &request_id),
                     ));
                 }
             };
@@ -3323,14 +3903,15 @@ impl CloudFormationService {
                 stack_name_for_notif,
                 notification_arns,
                 resources_snapshot,
+                deferred,
             )
         };
 
         // The update succeeded (failures returned above). Back any newly-added
         // container resources with REAL containers and reap any removed ones,
         // both off the request path (the #2031-#2034 create-side hardening
-        // reaching the update path), then run any deferred custom-resource
-        // invokes.
+        // reaching the update path). Deferred custom-resource invokes run in
+        // the settle task below, once the outputs are written.
         {
             let handles = ContainerBackingHandles::from_provisioner(&provisioner)
                 .with_snapshot_hooks(&self.snapshot_hooks);
@@ -3340,7 +3921,6 @@ impl CloudFormationService {
             handles.spawn_teardown_intents(std::mem::take(
                 &mut *provisioner.pending_container_teardowns.lock(),
             ));
-            spawn_custom_invokes(&provisioner);
         }
 
         let outputs = Self::resolve_template_outputs(
@@ -3348,8 +3928,8 @@ impl CloudFormationService {
             &input.parameters,
             &resources_snapshot,
             &self.state,
-            &req.account_id,
-            &req.region,
+            &account_id,
+            &region,
         );
         // The stack was already flipped to UPDATE_COMPLETE above, so a
         // collision here would leave it reporting success with no reason while
@@ -3362,15 +3942,15 @@ impl CloudFormationService {
         // provisioners, which this path does not attempt.
         if let Err(err) = Self::ensure_export_uniqueness(
             &self.state,
-            &req.account_id,
-            &req.region,
+            &account_id,
+            &region,
             &export_owner_name,
             &outputs,
         ) {
             let reason = err.message();
             {
                 let mut accounts = self.state.write();
-                if let Some(state) = accounts.regional_get_mut(&req.account_id, &req.region) {
+                if let Some(state) = accounts.regional_get_mut(&account_id, &region) {
                     if let Some(stack) = state
                         .stacks
                         .values_mut()
@@ -3415,7 +3995,7 @@ impl CloudFormationService {
         }
         {
             let mut accounts = self.state.write();
-            if let Some(state) = accounts.regional_get_mut(&req.account_id, &req.region) {
+            if let Some(state) = accounts.regional_get_mut(&account_id, &region) {
                 if let Some(stack) = state
                     .stacks
                     .values_mut()
@@ -3433,13 +4013,35 @@ impl CloudFormationService {
             }
         }
 
-        Self::send_stack_notification(
-            &self.deps.delivery,
-            &notification_arns,
-            &stack_name_for_notif,
-            &stack_id,
-            "UPDATE_COMPLETE",
-        );
+        // Runs after the outputs are written, so a failing custom resource
+        // clears them rather than racing the write.
+        if deferred.is_empty() {
+            Self::send_stack_notification(
+                &self.deps.delivery,
+                &notification_arns,
+                &stack_name_for_notif,
+                &stack_id,
+                "UPDATE_COMPLETE",
+            );
+        } else {
+            tokio::spawn(settle_custom_resources(CustomResourceSettleContext {
+                state: self.state.clone(),
+                snapshot_store: self.snapshot_store.clone(),
+                snapshot_lock: self.snapshot_lock.clone(),
+                delivery: provisioner.delivery.clone(),
+                responses: provisioner.custom_resource_responses.clone(),
+                intents: deferred,
+                account_id: account_id.clone(),
+                region: region.clone(),
+                stack_id: stack_id.clone(),
+                stack_name: stack_name_for_notif,
+                change_set_id: None,
+                notification_arns,
+                in_progress: "UPDATE_IN_PROGRESS",
+                complete: "UPDATE_COMPLETE",
+                failed: "UPDATE_ROLLBACK_COMPLETE",
+            }));
+        }
 
         // Persist every snapshot-backed service the update touched, so created
         // or deleted resources are reflected on disk after a restart.
@@ -3447,7 +4049,7 @@ impl CloudFormationService {
 
         Ok(AwsResponse::xml(
             StatusCode::OK,
-            xml_responses::update_stack_response(&stack_id, &req.request_id),
+            xml_responses::update_stack_response(&stack_id, &request_id),
         ))
     }
 
@@ -3658,6 +4260,62 @@ impl AwsService for CloudFormationService {
             "ValidateTemplate",
         ]
     }
+}
+
+/// What `finish_update_stack` needs from an `UpdateStack` request, owned so
+/// a detached update can move it into its task.
+struct UpdateStackRun {
+    account_id: String,
+    region: String,
+    request_id: String,
+    input: UpdateStackInput,
+    description: Option<String>,
+    provisioner: Arc<ResourceProvisioner>,
+    found_stack_id: String,
+    export_owner_name: String,
+    previous_template: String,
+    previous_parameters: BTreeMap<String, String>,
+    imported_names: Vec<String>,
+}
+
+/// UpdateStack's refusal of a stack still being created, updated or reviewed.
+/// The wording is the REVIEW_IN_PROGRESS refusal this path already used; it
+/// has not been checked against AWS.
+fn stack_in_progress_error(stack_name: &str, status: &str) -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "ValidationError",
+        format!("Stack [{stack_name}] is in {status} state and can not be updated."),
+    )
+}
+
+/// UpdateStack's reply for a stack that does not exist. UpdateStack declares
+/// only `InsufficientCapabilitiesException` and `TokenAlreadyExistsException`
+/// (see `finish_update_stack`), so this echoes the stack id, or a generated
+/// one, as a success.
+fn missing_stack_update_response(
+    found_stack_id: &str,
+    account_id: &str,
+    region: &str,
+    stack_name: &str,
+    request_id: &str,
+) -> AwsResponse {
+    let stack_id = if found_stack_id.is_empty() {
+        format!(
+            "arn:{}:cloudformation:{}:{}:stack/{}/{}",
+            partition_for(region),
+            region,
+            account_id,
+            stack_name,
+            uuid::Uuid::new_v4()
+        )
+    } else {
+        found_stack_id.to_string()
+    };
+    AwsResponse::xml(
+        StatusCode::OK,
+        xml_responses::update_stack_response(&stack_id, request_id),
+    )
 }
 
 /// Parsed + validated inputs for `UpdateStack`.
@@ -3907,8 +4565,21 @@ fn apply_resource_changes(
         })?;
 
         if !old_logical_ids.contains(&resource_def.logical_id) {
-            match provisioner.create_resource(&resolved_def) {
-                Ok(stack_resource) => {
+            match provisioner
+                .resolve_dynamic_references(resolved_def)
+                .and_then(|def| provisioner.create_resource(&def))
+            {
+                Ok(mut stack_resource) => {
+                    // As in `provision_stack_resources`: the resource exists,
+                    // so a failure to stabilize fails the update, and the
+                    // resource is removed rather than left untracked.
+                    if let Err(err) = provisioner.stabilize_resource(&mut stack_resource) {
+                        let _ = provisioner.delete_resource(&stack_resource);
+                        return Err(format!(
+                            "Failed to create resource {}: {err}",
+                            resource_def.logical_id
+                        ));
+                    }
                     changes.push(ResourceChange {
                         action: ResourceChangeAction::Create,
                         logical_id: stack_resource.logical_id.clone(),
@@ -3963,7 +4634,13 @@ fn apply_resource_changes(
                 .find(|r| r.logical_id == resource_def.logical_id)
                 .cloned();
             if let Some(existing) = existing {
-                match provisioner.update_resource(&existing, &resolved_def) {
+                // Dynamic references resolve only now, after the comparison
+                // above ran on their literal text: a changed secret or
+                // parameter alone does not update the resource.
+                match provisioner
+                    .resolve_dynamic_references(resolved_def)
+                    .and_then(|def| provisioner.update_resource(&existing, &def))
+                {
                     Ok(Some(mut updated)) => {
                         changes.push(ResourceChange {
                             action: ResourceChangeAction::Update,
@@ -4013,6 +4690,94 @@ fn apply_resource_changes(
     }
 
     Ok(())
+}
+
+/// The outcome of `apply_resource_updates_unlocked`: the parts of the stack
+/// the update changed on its copy (`None` if the provisioning task panicked,
+/// leaving the stack as it was), and the update's result.
+pub(crate) struct UnlockedUpdate {
+    pub changed: Option<UpdatedStackParts>,
+    pub result: Result<Vec<ResourceChange>, String>,
+}
+
+/// Everything `apply_resource_updates` changes on a stack: its resources, and
+/// the logical ids a failed run leaves to be re-applied by the next update.
+pub(crate) struct UpdatedStackParts {
+    resources: Vec<StackResource>,
+    reapply_logical_ids: BTreeSet<String>,
+}
+
+impl UnlockedUpdate {
+    /// Write the copy's changes back onto the stored stack and return the
+    /// update's result.
+    pub(crate) fn write_back(
+        self,
+        stack: &mut crate::state::Stack,
+    ) -> Result<Vec<ResourceChange>, String> {
+        if let Some(changed) = self.changed {
+            stack.resources = changed.resources;
+            stack.reapply_logical_ids = changed.reapply_logical_ids;
+        }
+        self.result
+    }
+}
+
+/// Run `apply_resource_updates` on a copy of a stack, without the state lock.
+/// The caller has already moved the stack to `*_IN_PROGRESS`; it writes the
+/// returned parts back with `UnlockedUpdate::write_back`. Provisioning must
+/// never hold the lock: the nested-stack provisioner takes it to record its
+/// child stack.
+pub(crate) fn apply_resource_updates_to_copy(
+    mut stack: crate::state::Stack,
+    provisioner: &ResourceProvisioner,
+    resource_defs: &[template::ResourceDefinition],
+    template_body: &str,
+    parameters: &BTreeMap<String, String>,
+    imports: &BTreeMap<String, String>,
+) -> UnlockedUpdate {
+    let result = apply_resource_updates(
+        &mut stack,
+        resource_defs,
+        template_body,
+        parameters,
+        provisioner,
+        imports,
+    );
+    UnlockedUpdate {
+        changed: Some(UpdatedStackParts {
+            resources: stack.resources,
+            reapply_logical_ids: stack.reapply_logical_ids,
+        }),
+        result,
+    }
+}
+
+/// `apply_resource_updates_to_copy` on a blocking thread, so a provisioner
+/// with `wait_for_container_backing` may wait minutes for a container (the
+/// #1539/#1730 timeout lesson).
+pub(crate) async fn apply_resource_updates_unlocked(
+    stack: crate::state::Stack,
+    provisioner: Arc<ResourceProvisioner>,
+    resource_defs: Vec<template::ResourceDefinition>,
+    template_body: String,
+    parameters: BTreeMap<String, String>,
+    imports: BTreeMap<String, String>,
+) -> UnlockedUpdate {
+    tokio::task::spawn_blocking(move || {
+        apply_resource_updates_to_copy(
+            stack,
+            &provisioner,
+            &resource_defs,
+            &template_body,
+            &parameters,
+            &imports,
+        )
+    })
+    .await
+    .unwrap_or_else(|join_err| UnlockedUpdate {
+        changed: None,
+        result: Err(format!("provisioning task failed: {join_err}")),
+    })
 }
 
 /// Pushes a single `StackEvent` row onto the per-stack event log so
@@ -4116,7 +4881,7 @@ pub(crate) fn record_event_with_reason(
 /// `CloudFormationService::save_snapshot` but takes owned handles so it can
 /// run inside the background CreateStack provisioning task (see RDS's
 /// `save_snapshot_static`).
-async fn save_snapshot_static(
+pub(crate) async fn save_snapshot_static(
     state: SharedCloudFormationState,
     store: Option<Arc<dyn SnapshotStore>>,
     lock: Arc<AsyncMutex<()>>,
@@ -4780,8 +5545,10 @@ mod tests {
         let req = make_request("UpdateStack", update_params);
         let result = svc.update_stack(&req).await;
 
-        // Should return an error
-        assert!(result.is_err());
+        // The call only starts the update, so it succeeds; the failure is
+        // reported on the stack ("You can check the status of the stack
+        // through the DescribeStacks action.", UpdateStack API Reference).
+        assert!(result.is_ok());
 
         // Stack status should be UPDATE_ROLLBACK_COMPLETE — matches the
         // terminal status real CloudFormation lands on after a failed
@@ -4826,16 +5593,22 @@ mod tests {
             .clone()
     }
 
+    /// Apply an update and return its outcome. The call itself only starts
+    /// the update and succeeds ("You can check the status of the stack
+    /// through the DescribeStacks action.", UpdateStack API Reference); a
+    /// failure is the stack's rollback status, returned here as its reason.
     async fn firehose_retry_apply(
         svc: &CloudFormationService,
         mut params: HashMap<String, String>,
         change_set: bool,
         name: &str,
-    ) -> Result<AwsResponse, AwsServiceError> {
+    ) -> Result<(), String> {
         if change_set {
             params.insert("ChangeSetName".to_string(), name.to_string());
             params.insert("ChangeSetType".to_string(), "UPDATE".to_string());
-            svc.handle(make_request("CreateChangeSet", params)).await?;
+            svc.handle(make_request("CreateChangeSet", params))
+                .await
+                .expect("CreateChangeSet");
             svc.handle(make_request(
                 "ExecuteChangeSet",
                 HashMap::from([
@@ -4844,9 +5617,17 @@ mod tests {
                 ]),
             ))
             .await
+            .expect("ExecuteChangeSet only starts the execution");
         } else {
-            svc.handle(make_request("UpdateStack", params)).await
+            svc.handle(make_request("UpdateStack", params))
+                .await
+                .expect("UpdateStack only starts the update");
         }
+        let stack = firehose_retry_stack(svc);
+        if stack.status.ends_with("ROLLBACK_COMPLETE") {
+            return Err(stack.status_reason.unwrap_or_default());
+        }
+        Ok(())
     }
 
     async fn firehose_retry_preserves_applied_metadata(change_set: bool) {
@@ -4921,7 +5702,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         for (err, stack, firehose) in attempts {
-            assert!(err.unwrap().message().contains("CompressionFormat"));
+            assert!(err.unwrap().contains("CompressionFormat"));
             assert_eq!(stack.status, "UPDATE_ROLLBACK_COMPLETE");
             assert_eq!(stack.template, before.template);
             assert_eq!(stack.parameters, before.parameters);
@@ -5048,9 +5829,8 @@ mod tests {
         let bad = firehose_drift_template("a2/", "BROTLI");
         let err = firehose_retry_apply(&svc, params(&bad), change_set, "bad-1")
             .await
-            .err()
-            .expect("invalid CompressionFormat must fail");
-        assert!(err.message().contains("CompressionFormat"));
+            .expect_err("invalid CompressionFormat must fail");
+        assert!(err.contains("CompressionFormat"));
         let stack = firehose_retry_stack(&svc);
         assert_eq!(stack.status, "UPDATE_ROLLBACK_COMPLETE");
         assert_eq!(stack.template, original);
@@ -5061,9 +5841,8 @@ mod tests {
         // The identical bad retry still reaches validation.
         let err = firehose_retry_apply(&svc, params(&bad), change_set, "bad-2")
             .await
-            .err()
-            .expect("identical invalid retry must fail");
-        assert!(err.message().contains("CompressionFormat"));
+            .expect_err("identical invalid retry must fail");
+        assert!(err.contains("CompressionFormat"));
 
         // Redeploying the OLD template re-applies A instead of skipping it as
         // unchanged against the stored template.
